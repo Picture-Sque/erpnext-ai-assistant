@@ -31,7 +31,7 @@ export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
 	}, [messages.length, measure, scrollToBottom]);
 
 	return (
-		<main className="app-shell">
+		<div className="app-shell">
 			<section className="chat-page" aria-label="AI assistant chat interface">
 				<div className="chat-panel">
 					<ChatHeader onClose={onClose} />
@@ -60,6 +60,6 @@ export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
 					</div>
 				</div>
 			</section>
-		</main>
+		</div>
 	);
 }

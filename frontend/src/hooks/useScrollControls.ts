@@ -1,6 +1,6 @@
 import { RefObject, useCallback, useEffect, useState } from "react";
 
-export const useScrollControls = (containerRef: RefObject<HTMLDivElement>) => {
+export const useScrollControls = (containerRef: RefObject<HTMLDivElement | null>) => {
 	const [isAtTop, setIsAtTop] = useState(true);
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const [isOverflowing, setIsOverflowing] = useState(false);

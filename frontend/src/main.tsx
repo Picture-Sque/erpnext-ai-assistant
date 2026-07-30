@@ -7,7 +7,10 @@ const ROOT_ID = "root";
 const DESK_ROOT_ID = "ai_assistant-root";
 
 const getMountNode = () => {
-	const existingRoot = document.getElementById(ROOT_ID) ?? document.getElementById(DESK_ROOT_ID);
+	// Check for the dedicated Frappe Desk mount point first.
+	// Falling back to #root only for standalone dev (index.html).
+	// This prevents accidentally mounting inside another framework's root element.
+	const existingRoot = document.getElementById(DESK_ROOT_ID) ?? document.getElementById(ROOT_ID);
 
 	if (existingRoot) {
 		return existingRoot;
