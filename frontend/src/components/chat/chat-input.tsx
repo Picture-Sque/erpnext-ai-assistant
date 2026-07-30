@@ -3,9 +3,10 @@ import { SendIcon } from "./chat-icons";
 
 interface ChatInputProps {
 	onSendMessage: (message: string) => boolean;
+	autoFocus?: boolean;
 }
 
-export function ChatInput({ onSendMessage }: ChatInputProps) {
+export function ChatInput({ onSendMessage, autoFocus = false }: ChatInputProps) {
 	const [draft, setDraft] = useState("");
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -17,6 +18,16 @@ export function ChatInput({ onSendMessage }: ChatInputProps) {
 		textarea.style.height = "0px";
 		textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
 	}, [draft]);
+
+	useEffect(() => {
+		if (!autoFocus) return;
+
+		const timeoutId = window.setTimeout(() => {
+			textareaRef.current?.focus();
+		}, 0);
+
+		return () => window.clearTimeout(timeoutId);
+	}, [autoFocus]);
 
 	const submitMessage = () => {
 		const sent = onSendMessage(draft);
@@ -44,7 +55,7 @@ export function ChatInput({ onSendMessage }: ChatInputProps) {
 				<textarea
 					ref={textareaRef}
 					className="chat-input__textarea"
-					placeholder='Ask anything. Type Enter to send, Shift+Enter for a new line.'
+					placeholder="Ask anything about your ERP..."
 					value={draft}
 					onChange={event => setDraft(event.target.value)}
 					onKeyDown={handleKeyDown}
@@ -60,7 +71,7 @@ export function ChatInput({ onSendMessage }: ChatInputProps) {
 				</button>
 			</div>
 
-			<p className="chat-input__hint">Static demo only. Responses are generated locally.</p>
+			<p className="chat-input__hint">Press Enter to send • Shift+Enter for a newline</p>
 		</form>
 	);
 }

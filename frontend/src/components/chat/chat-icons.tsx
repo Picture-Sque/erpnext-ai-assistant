@@ -58,3 +58,11 @@ export function UserCircleIcon({ size = 28, className }: IconProps) {
 		</svg>
 	);
 }
+
+export function CloseIcon({ size = 16, className }: IconProps) {
+	return (
+		<svg aria-hidden="true" className={className} fill="none" height={size} viewBox="0 0 24 24" width={size}>
+			<path d="M6.75 6.75 17.25 17.25M17.25 6.75 6.75 17.25" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+		</svg>
+	);
+}

@@ -1,6 +1,10 @@
-import { ChatLogoIcon } from "./chat-icons";
+import { ChatLogoIcon, CloseIcon } from "./chat-icons";
 
-export function ChatHeader() {
+interface ChatHeaderProps {
+	onClose?: () => void;
+}
+
+export function ChatHeader({ onClose }: ChatHeaderProps) {
 	return (
 		<header className="chat-header">
 			<div className="chat-header__brand">
@@ -10,13 +14,32 @@ export function ChatHeader() {
 
 				<div>
 					<p className="chat-header__eyebrow">AI Assistant</p>
-					<h1 className="chat-header__title">Chatbot UI-inspired Demo</h1>
+					<h1 className="chat-header__title">Enterprise assistant</h1>
+					<p className="chat-header__subtitle">Connected to ERPNext</p>
 				</div>
 			</div>
 
-			<div className="chat-header__status">
-				<span className="chat-header__status-dot" />
-				<span>Static local messages</span>
+			<div className="chat-header__meta">
+				<div className="chat-header__status">
+					<span className="chat-header__status-dot" />
+					<span>Connected</span>
+				</div>
+
+				<div className="chat-header__user-slot">
+					<span className="chat-header__user-label">ERP User</span>
+					<span className="chat-header__user-value">Future placeholder</span>
+				</div>
+
+				{onClose ? (
+					<button
+						className="chat-header__close"
+						type="button"
+						onClick={onClose}
+						aria-label="Close AI assistant sidebar"
+					>
+						<CloseIcon />
+					</button>
+				) : null}
 			</div>
 		</header>
 	);

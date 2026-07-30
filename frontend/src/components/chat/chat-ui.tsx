@@ -6,7 +6,12 @@ import { ChatHeader } from "./chat-header";
 import { ChatMessages } from "./chat-messages";
 import { ChatScrollButtons } from "./chat-scroll-buttons";
 
-export function ChatUI() {
+interface ChatUIProps {
+	isActive?: boolean;
+	onClose?: () => void;
+}
+
+export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
 	const { messages, sendMessage } = useDemoChat();
 	const messagesContainerRef = useRef<HTMLDivElement>(null);
 
@@ -29,9 +34,10 @@ export function ChatUI() {
 		<main className="app-shell">
 			<section className="chat-page" aria-label="AI assistant chat interface">
 				<div className="chat-panel">
-					<ChatHeader />
+					<ChatHeader onClose={onClose} />
 
 					<div className="chat-panel__body">
+						<div className="chat-panel__spacer" aria-hidden="true" />
 						<div className="chat-stream-wrap">
 							<div
 								ref={messagesContainerRef}
@@ -50,7 +56,7 @@ export function ChatUI() {
 							/>
 						</div>
 
-						<ChatInput onSendMessage={sendMessage} />
+						<ChatInput autoFocus={isActive} onSendMessage={sendMessage} />
 					</div>
 				</div>
 			</section>

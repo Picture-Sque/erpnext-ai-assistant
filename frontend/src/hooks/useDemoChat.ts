@@ -16,20 +16,20 @@ const initialMessages: ChatMessage[] = [
 		id: createId(),
 		role: "assistant",
 		content:
-			"Welcome to the Chatbot UI-inspired demo. This is a static local chat shell ready for future integration.",
+			"Welcome. I can help with ERPNext workflows, operational questions, and account-specific guidance once connected.",
 		timestamp: createTimestamp()
 	},
 	{
 		id: createId(),
 		role: "user",
-		content: "What can this interface do right now?",
+		content: "Show me a quick summary of today’s sales pipeline.",
 		timestamp: createTimestamp()
 	},
 	{
 		id: createId(),
 		role: "assistant",
 		content:
-			"It renders a polished chat window, supports local message entry, and returns canned assistant responses without touching any backend.",
+			"I can surface a concise summary, highlight exceptions, and keep the conversation focused on business context.",
 		timestamp: createTimestamp()
 	}
 ];

@@ -1,5 +1,5 @@
-import { ChatPage } from "./pages/ChatPage";
+import { DeskAssistantShell } from "./components/desk/assistant-shell";
 
 export default function App() {
-	return <ChatPage />;
+	return <DeskAssistantShell />;
 }
