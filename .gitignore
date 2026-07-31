@@ -53,3 +53,9 @@ jspm_packages/
 
 # Aider AI Chat
 .aider*
+
+# Local session credentials
+cookies.txt
+
+# Local mock server
+mock_server.py

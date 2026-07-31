@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatMessage } from "../types/chat";
 
+// Authorization Bearer token placeholder. Customize this as needed.
+export const AUTH_TOKEN = "";
+
+// Configure the backend URL using environment variable VITE_BACKEND_URL or defaulting to localhost.
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string) || "http://localhost:8000/chat";
+
 const createId = () =>
 	globalThis.crypto?.randomUUID?.() ??
 	`message-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -34,26 +40,14 @@ const initialMessages: ChatMessage[] = [
 	}
 ];
 
-const buildFakeAssistantReply = (input: string) => {
-	const normalizedInput = input.trim().replace(/\s+/g, " ");
-	const preview =
-		normalizedInput.length > 96
-			? `${normalizedInput.slice(0, 93)}...`
-			: normalizedInput;
-
-	return `Demo response: I received "${preview}". This is a local placeholder reply for the Chatbot UI integration shell.`;
-};
-
 export const useDemoChat = () => {
 	const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
-	const pendingTimeouts = useRef<number[]>([]);
+	const isMountedRef = useRef(true);
 
 	useEffect(() => {
+		isMountedRef.current = true;
 		return () => {
-			pendingTimeouts.current.forEach(timeoutId => {
-				window.clearTimeout(timeoutId);
-			});
-			pendingTimeouts.current = [];
+			isMountedRef.current = false;
 		};
 	}, []);
 
@@ -69,27 +63,56 @@ export const useDemoChat = () => {
 			timestamp: createTimestamp()
 		};
 
-		const assistantReply = buildFakeAssistantReply(content);
-
+		// Append user's message immediately
 		setMessages(prevMessages => [...prevMessages, userMessage]);
 
-		const timeoutId = window.setTimeout(() => {
-			setMessages(prevMessages => [
-				...prevMessages,
-				{
-					id: createId(),
-					role: "assistant",
-					content: assistantReply,
-					timestamp: createTimestamp()
+		// Prepare headers
+		const headers: HeadersInit = {
+			"Content-Type": "application/json"
+		};
+		if (AUTH_TOKEN) {
+			headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+		}
+
+		// Perform API request
+		fetch(BACKEND_URL, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ message: content })
+		})
+			.then(async response => {
+				if (!response.ok) {
+					throw new Error(`HTTP error! Status: ${response.status}`);
 				}
-			]);
+				const data = await response.json();
+				const replyText = data.response || "No response field returned from backend.";
 
-			pendingTimeouts.current = pendingTimeouts.current.filter(
-				pendingTimeout => pendingTimeout !== timeoutId
-			);
-		}, 450);
-
-		pendingTimeouts.current.push(timeoutId);
+				if (isMountedRef.current) {
+					setMessages(prevMessages => [
+						...prevMessages,
+						{
+							id: createId(),
+							role: "assistant",
+							content: replyText,
+							timestamp: createTimestamp()
+						}
+					]);
+				}
+			})
+			.catch(error => {
+				console.error("Error communicating with chat backend:", error);
+				if (isMountedRef.current) {
+					setMessages(prevMessages => [
+						...prevMessages,
+						{
+							id: createId(),
+							role: "assistant",
+							content: `Error: Unable to connect to the backend server (${error.message}). Please check that your server is running at ${BACKEND_URL}.`,
+							timestamp: createTimestamp()
+						}
+					]);
+				}
+			});
 
 		return true;
 	}, []);
@@ -98,4 +121,4 @@ export const useDemoChat = () => {
 		messages,
 		sendMessage
 	};
-};
+};

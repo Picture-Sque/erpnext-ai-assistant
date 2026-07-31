@@ -27,11 +27,11 @@ graph TD
 
 ### Key Components
 
-- **[`ai_assistant/hooks.py`](file:///c:/Users/krish/Desktop/ai_assistant/erpnext-ai-assistant/ai_assistant/hooks.py)**: Configures global injection of assets into the Desk using `app_include_js` and `app_include_css`.
-- **[`frontend/`](file:///c:/Users/krish/Desktop/ai_assistant/erpnext-ai-assistant/frontend)**: The React + Vite + TypeScript project.
-- **[`frontend/src/main.tsx`](file:///c:/Users/krish/Desktop/ai_assistant/erpnext-ai-assistant/frontend/src/main.tsx)**: Dual-root mounting strategy. Checks for isolated `#ai_assistant-root` mount point first (preventing layout clobbering in multi-framework environments), falling back to `#root` for standalone dev server.
-- **[`frontend/src/components/desk/assistant-shell.tsx`](file:///c:/Users/krish/Desktop/ai_assistant/erpnext-ai-assistant/frontend/src/components/desk/assistant-shell.tsx)**: Handles the sliding transition states, accessibility (ARIA attributes), click-outside-to-close dismissals, ESC key event listener, and a keyboard focus trap.
-- **[`frontend/src/styles/global.css`](file:///c:/Users/krish/Desktop/ai_assistant/erpnext-ai-assistant/frontend/src/styles/global.css)**: Holds all styles. Formatted with strict class scoping (prefixed with `#ai_assistant-root`, `.desk-assistant`, `.chat-`, or `.app-shell`) to prevent styling or CSS reset leaks onto the parent ERPNext Desk UI.
+- **[`ai_assistant/hooks.py`](./ai_assistant/hooks.py)**: Configures global injection of assets into the Desk using `app_include_js` and `app_include_css`.
+- **[`frontend/`](./frontend/)**: The React + Vite + TypeScript project.
+- **[`frontend/src/main.tsx`](./frontend/src/main.tsx)**: Dual-root mounting strategy. Checks for isolated `#ai_assistant-root` mount point first (preventing layout clobbering in multi-framework environments), falling back to `#root` for standalone dev server.
+- **[`frontend/src/components/desk/assistant-shell.tsx`](./frontend/src/components/desk/assistant-shell.tsx)**: Handles the sliding transition states, accessibility (ARIA attributes), click-outside-to-close dismissals, ESC key event listener, and a keyboard focus trap.
+- **[`frontend/src/styles/global.css`](./frontend/src/styles/global.css)**: Holds all styles. Formatted with strict class scoping (prefixed with `#ai_assistant-root`, `.desk-assistant`, `.chat-`, or `.app-shell`) to prevent styling or CSS reset leaks onto the parent ERPNext Desk UI.
 
 ---
 
@@ -73,23 +73,27 @@ npm run build
 ### Step 2: Synchronize assets to the Docker containers
 In multi-container production environments (where backend python processes and frontend nginx proxies run in separate containers), the compiled assets must be synchronized.
 
+> [!NOTE]
+> Replace `<backend_container_name>` and `<frontend_container_name>` with your actual container names (check via `docker ps`).
+
 1. **Deploy to the Backend Container**:
    Copy the assets into the baked application folder inside the container:
    ```bash
-   docker cp ai_assistant/public/desk/assistant.css frappe_docker-backend-1:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.css
-   docker cp ai_assistant/public/desk/assistant.js frappe_docker-backend-1:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.js
+   # Replace <backend_container_name> with your actual backend container name
+   docker cp ai_assistant/public/desk/assistant.css <backend_container_name>:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.css
+   docker cp ai_assistant/public/desk/assistant.js <backend_container_name>:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.js
    ```
 
 2. **Sync the Site Assets Symlink**:
    Frappe links the site public directory to a local bench `assets` folder. Copy the files and update the symlinks inside both containers:
    ```bash
-   # Backend Container Sites Sync
-   docker cp ai_assistant/public/desk/assistant.css frappe_docker-backend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
-   docker cp ai_assistant/public/desk/assistant.js frappe_docker-backend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
+   # Backend Container Sites Sync (Replace <backend_container_name>)
+   docker cp ai_assistant/public/desk/assistant.css <backend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
+   docker cp ai_assistant/public/desk/assistant.js <backend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
    
-   # Frontend Nginx Container Sites Sync
-   docker cp ai_assistant/public/desk/assistant.css frappe_docker-frontend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
-   docker cp ai_assistant/public/desk/assistant.js frappe_docker-frontend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
+   # Frontend Nginx Container Sites Sync (Replace <frontend_container_name>)
+   docker cp ai_assistant/public/desk/assistant.css <frontend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
+   docker cp ai_assistant/public/desk/assistant.js <frontend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
    ```
 
 ### Step 3: Clear Redis and Site Cache
@@ -97,19 +101,22 @@ If the application hooks do not show up immediately, it is because of Redis cach
 
 1. **Append the app to `apps.txt`** (if not already present):
    ```bash
-   docker exec frappe_docker-backend-1 sh -c "echo 'ai_assistant' >> /home/frappe/frappe-bench/sites/apps.txt"
-   docker exec frappe_docker-frontend-1 sh -c "echo 'ai_assistant' >> /home/frappe/frappe-bench/sites/apps.txt"
+   # Replace <backend_container_name> and <frontend_container_name>
+   docker exec <backend_container_name> sh -c "echo 'ai_assistant' >> /home/frappe/frappe-bench/sites/apps.txt"
+   docker exec <frontend_container_name> sh -c "echo 'ai_assistant' >> /home/frappe/frappe-bench/sites/apps.txt"
    ```
 
 2. **Clear the cached Redis keys** inside the backend container console:
    ```bash
-   docker exec frappe_docker-backend-1 bench --site frontend execute "frappe.cache.delete_value" --args "all_apps"
-   docker exec frappe_docker-backend-1 bench --site frontend execute "frappe.cache.delete_value" --args "app_hooks"
+   # Replace <backend_container_name>
+   docker exec <backend_container_name> bench --site frontend execute "frappe.cache.delete_value" --args "all_apps"
+   docker exec <backend_container_name> bench --site frontend execute "frappe.cache.delete_value" --args "app_hooks"
    ```
 
 3. **Clear site configuration and template cache**:
    ```bash
-   docker exec frappe_docker-backend-1 bench --site frontend clear-cache
+   # Replace <backend_container_name>
+   docker exec <backend_container_name> bench --site frontend clear-cache
    ```
 
 ---

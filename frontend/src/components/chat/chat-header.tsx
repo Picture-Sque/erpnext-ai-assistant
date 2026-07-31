@@ -2,9 +2,10 @@ import { ChatLogoIcon, CloseIcon } from "./chat-icons";
 
 interface ChatHeaderProps {
 	onClose?: () => void;
+	currentUser?: string;
 }
 
-export function ChatHeader({ onClose }: ChatHeaderProps) {
+export function ChatHeader({ onClose, currentUser = "Guest" }: ChatHeaderProps) {
 	return (
 		<header className="chat-header">
 			<div className="chat-header__brand">
@@ -27,7 +28,7 @@ export function ChatHeader({ onClose }: ChatHeaderProps) {
 
 				<div className="chat-header__user-slot">
 					<span className="chat-header__user-label">ERP User</span>
-					<span className="chat-header__user-value">Future placeholder</span>
+					<span className="chat-header__user-value">{currentUser}</span>
 				</div>
 
 				{onClose ? (
