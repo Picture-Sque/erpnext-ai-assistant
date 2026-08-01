@@ -26,8 +26,6 @@ app = FastAPI(
 # -----------------------------------------------------------------------------
 # Configuration & Security
 # -----------------------------------------------------------------------------
-DEFAULT_JWT_SECRET = "my_super_secret_shared_jwt_key_2026_erpnext_assistant_secure"
-JWT_SECRET = os.getenv("JWT_SECRET") or DEFAULT_JWT_SECRET
 JWT_ALGORITHM = "HS256"
 
 # Configure CORS dynamically for dev and production origins
@@ -90,9 +88,6 @@ def get_candidate_secrets() -> List[str]:
 		except Exception:
 			pass
 
-	if DEFAULT_JWT_SECRET not in secrets:
-		secrets.append(DEFAULT_JWT_SECRET)
-
 	return secrets
 
 # -----------------------------------------------------------------------------
@@ -103,6 +98,14 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
 	FastAPI dependency that extracts and validates the Authorization: Bearer <token>
 	header sent from the ERPNext Desk React chat widget.
 	"""
+	candidate_secrets = get_candidate_secrets()
+	if not candidate_secrets:
+		logger.error("No JWT secret key configured in environment or site configuration.")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Server security error: JWT secret key is unconfigured.",
+		)
+
 	if not authorization:
 		# Check if running in explicit dev mock mode
 		allow_dev_auth = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1")
@@ -131,8 +134,6 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
 		)
 
 	token = parts[1]
-
-	candidate_secrets = get_candidate_secrets()
 	last_err = None
 
 	for secret in candidate_secrets:

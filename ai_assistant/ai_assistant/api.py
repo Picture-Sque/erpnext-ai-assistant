@@ -3,36 +3,28 @@ import jwt
 import frappe
 from datetime import datetime, timedelta, timezone
 
-DEFAULT_JWT_SECRET = "my_super_secret_shared_jwt_key_2026_erpnext_assistant_secure"
-
-@frappe.whitelist(allow_guest=True)
-def get_auth_token(user: str = None):
+@frappe.whitelist()
+def get_auth_token():
 	"""
 	Whitelisted Frappe API endpoint to generate a short-lived JWT for authenticated users.
 	Used by the floating chat widget to authenticate with an external FastAPI service.
+	Identity is strictly derived from the authenticated Frappe session.
 	"""
 	session_user = frappe.session.user if hasattr(frappe, "session") and frappe.session else None
 
-	# Resolve user identity: prioritize frappe.session.user if logged in, then explicit user param
-	active_user = None
-	if session_user and session_user != "Guest":
-		active_user = session_user
-	elif user and user != "Guest":
-		active_user = user
+	if not session_user or session_user == "Guest":
+		frappe.throw("Authentication required to obtain AI Assistant token.", frappe.PermissionError)
 
-	# Fallback for local development / Desk integration when session is Guest
-	if not active_user or active_user == "Guest":
-		active_user = "Administrator"
+	jwt_secret = frappe.conf.get("jwt_secret") or os.getenv("JWT_SECRET")
+	if not jwt_secret:
+		frappe.throw("AI Assistant authentication failed: JWT_SECRET is not configured in site_config or environment.", frappe.ValidationError)
 
-	jwt_secret = frappe.conf.get("jwt_secret") or os.getenv("JWT_SECRET") or DEFAULT_JWT_SECRET
-	full_name = frappe.utils.get_fullname(active_user) or active_user
-	if not full_name or full_name == "Guest":
-		full_name = active_user
-	roles = frappe.get_roles(active_user) or ["System Manager"]
+	full_name = frappe.utils.get_fullname(session_user) or session_user
+	roles = frappe.get_roles(session_user) or []
 
 	now = datetime.now(timezone.utc)
 	payload = {
-		"sub": active_user,
+		"sub": session_user,
 		"full_name": full_name,
 		"roles": roles,
 		"iat": now,
@@ -46,19 +38,18 @@ def get_auth_token(user: str = None):
 	if isinstance(token, bytes):
 		token = token.decode("utf-8")
 
-	frappe.log_error(message=f"get_auth_token success. active_user={active_user!r}, full_name={full_name!r}, roles={roles}", title="auth_debug")
-
 	return {
 		"token": token,
-		"user": active_user,
+		"user": session_user,
 		"full_name": full_name,
 		"roles": roles,
 		"expires_in_seconds": 86400
 	}
 
-@frappe.whitelist(allow_guest=True)
-def get_chat_token(user: str = None):
+@frappe.whitelist()
+def get_chat_token():
 	"""Alias endpoint for get_auth_token."""
-	return get_auth_token(user=user)
+	return get_auth_token()
+
 
 

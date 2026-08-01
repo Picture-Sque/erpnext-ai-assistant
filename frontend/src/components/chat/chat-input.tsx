@@ -2,7 +2,7 @@ import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import { SendIcon } from "./chat-icons";
 
 interface ChatInputProps {
-	onSendMessage: (message: string) => boolean;
+	onSendMessage: (message: string) => boolean | Promise<boolean>;
 	autoFocus?: boolean;
 }
 
@@ -29,8 +29,8 @@ export function ChatInput({ onSendMessage, autoFocus = false }: ChatInputProps) 
 		return () => window.clearTimeout(timeoutId);
 	}, [autoFocus]);
 
-	const submitMessage = () => {
-		const sent = onSendMessage(draft);
+	const submitMessage = async () => {
+		const sent = await onSendMessage(draft);
 
 		if (sent) {
 			setDraft("");
