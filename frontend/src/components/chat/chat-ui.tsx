@@ -12,7 +12,7 @@ interface ChatUIProps {
 }
 
 export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
-	const { messages, sendMessage } = useDemoChat();
+	const { messages, sendMessage, currentUser } = useDemoChat();
 	const messagesContainerRef = useRef<HTMLDivElement>(null);
 
 	const {
@@ -34,7 +34,7 @@ export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
 		<div className="app-shell">
 			<section className="chat-page" aria-label="AI assistant chat interface">
 				<div className="chat-panel">
-					<ChatHeader onClose={onClose} />
+					<ChatHeader onClose={onClose} currentUser={currentUser} />
 
 					<div className="chat-panel__body">
 						<div className="chat-panel__spacer" aria-hidden="true" />
