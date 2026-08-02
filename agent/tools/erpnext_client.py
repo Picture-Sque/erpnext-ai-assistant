@@ -17,6 +17,15 @@ ERPNEXT_BASE_URL = os.getenv("ERPNEXT_BASE_URL", "http://localhost:8081").rstrip
 ERPNEXT_API_KEY = os.getenv("ERPNEXT_API_KEY", "")
 ERPNEXT_API_SECRET = os.getenv("ERPNEXT_API_SECRET", "")
 
+class UnauthorizedError(Exception):
+    pass
+
+class ItemNotFoundError(Exception):
+    pass
+
+class CustomerNotFoundError(Exception):
+    pass
+
 def get_auth_headers() -> dict:
     """
     Constructs authorization headers for ERPNext REST API.
@@ -53,11 +62,17 @@ def get_customer(customer_name: str) -> dict:
                     "error": None
                 }
             else:
+                if response.status_code == 401:
+                    raise UnauthorizedError()
+                if response.status_code == 404 or "not found" in response.text.lower() or "doesnotexisterror" in response.text.lower():
+                    raise CustomerNotFoundError()
                 return {
                     "success": False,
                     "data": None,
                     "error": f"HTTP {response.status_code}: {response.text}"
                 }
+    except (UnauthorizedError, CustomerNotFoundError, ItemNotFoundError):
+        raise
     except Exception as e:
         logger.exception("Exception in get_customer")
         return {
@@ -92,17 +107,30 @@ def check_stock(item_code: str) -> dict:
             
             if response.status_code == 200:
                 data = response.json()
+                bins = data.get("data", [])
+                if not bins:
+                    # Check if the Item actually exists in ERPNext
+                    item_url = f"{ERPNEXT_BASE_URL}/api/resource/Item/{item_code}"
+                    item_resp = client.get(item_url, headers=headers, timeout=10.0)
+                    if item_resp.status_code == 404 or "not found" in item_resp.text.lower() or "doesnotexisterror" in item_resp.text.lower():
+                        raise ItemNotFoundError()
                 return {
                     "success": True,
-                    "data": data.get("data", []),
+                    "data": bins,
                     "error": None
                 }
             else:
+                if response.status_code == 401:
+                    raise UnauthorizedError()
+                if response.status_code == 404 or "not found" in response.text.lower() or "doesnotexisterror" in response.text.lower():
+                    raise ItemNotFoundError()
                 return {
                     "success": False,
                     "data": None,
                     "error": f"HTTP {response.status_code}: {response.text}"
                 }
+    except (UnauthorizedError, CustomerNotFoundError, ItemNotFoundError):
+        raise
     except Exception as e:
         logger.exception("Exception in check_stock")
         return {
@@ -170,11 +198,20 @@ def create_sales_order(customer: str, items: list[dict], delivery_date: str = No
                     "error": None
                 }
             else:
+                if response.status_code == 401:
+                    raise UnauthorizedError()
+                err_text = response.text.lower()
+                if "customer" in err_text and ("not found" in err_text or "does not exist" in err_text or "doesnotexisterror" in err_text):
+                    raise CustomerNotFoundError()
+                if ("item" in err_text or "item_code" in err_text) and ("not found" in err_text or "does not exist" in err_text or "doesnotexisterror" in err_text):
+                    raise ItemNotFoundError()
                 return {
                     "success": False,
                     "data": None,
                     "error": f"HTTP {response.status_code}: {response.text}"
                 }
+    except (UnauthorizedError, CustomerNotFoundError, ItemNotFoundError):
+        raise
     except Exception as e:
         logger.exception("Exception in create_sales_order")
         return {

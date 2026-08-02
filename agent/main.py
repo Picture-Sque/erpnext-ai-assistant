@@ -109,7 +109,17 @@ async def chat_endpoint(request: ChatRequest, authorized: bool = Depends(verify_
         
         # If the sales order creation successfully completes, or falls back, we can clear slots for the next order
         final_resp = updated_state.get("final_response", "")
-        if "Successfully created" in final_resp or "Failed to create" in final_resp or "How can I help you today?" in final_resp:
+        if (
+            "Successfully created" in final_resp or 
+            "Failed to create" in final_resp or 
+            "Inventory status for item" in final_resp or
+            "No inventory bins found" in final_resp or
+            "Failed to check inventory" in final_resp or
+            "Customer details for" in final_resp or
+            "was not found in ERPNext" in final_resp or
+            "Failed to look up customer" in final_resp or
+            "How can I help you today?" in final_resp
+        ):
             # Reset workflow slots so subsequent queries start fresh
             session_store[session_id]["collected_fields"] = {}
             session_store[session_id]["detected_intent"] = ""
