@@ -1,0 +1,8 @@
+{
+	"desk/assistant.js": [
+		"public/desk/assistant.js"
+	],
+	"desk/assistant.css": [
+		"public/desk/assistant.css"
+	]
+}

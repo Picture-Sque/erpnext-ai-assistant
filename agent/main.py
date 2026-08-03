@@ -9,7 +9,10 @@ agent_dir = str(Path(__file__).parent.resolve())
 if agent_dir not in sys.path:
     sys.path.insert(0, agent_dir)
 
-from fastapi import FastAPI, Depends, HTTPException, status, Security
+import jwt
+from typing import List, Optional
+# TODO: Remove Security, HTTPBearer, and HTTPAuthorizationCredentials imports once the commented-out old auth block is deleted.
+from fastapi import FastAPI, Depends, HTTPException, status, Security, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -36,9 +39,13 @@ app = FastAPI(
 # CORS Configuration
 origins = [
     "http://localhost:5173",  # Standalone Vite dev server
-    "http://localhost:8000",  # Default Frappe Bench port (often used for assets proxy)
-    "http://localhost:8080",  # Alternative Frappe Bench dev server port
-    "http://localhost:8081",  # ERPNext target instance port
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",  # Default Frappe Bench port
+    "http://127.0.0.1:8000",
+    "http://localhost:8080",  # ERPNext target instance port (confirmed port 8080)
+    "http://127.0.0.1:8080",
+    "http://localhost:8081",
+    "http://127.0.0.1:8081",
 ]
 
 app.add_middleware(
@@ -49,22 +56,117 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Authentication Verification Dependency
-security = HTTPBearer()
-AGENT_AUTH_TOKEN = os.getenv("AGENT_AUTH_TOKEN", "test-token-123")
+# TODO: Original static-token auth logic kept for diff comparison
+# security = HTTPBearer()
+# AGENT_AUTH_TOKEN = os.getenv("AGENT_AUTH_TOKEN", "test-token-123")
+# 
+# def verify_auth_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+#     """
+#     Validates Bearer token auth header against AGENT_AUTH_TOKEN env variable.
+#     """
+#     if credentials.credentials != AGENT_AUTH_TOKEN:
+#         logger.warning("Authentication failed: invalid token provided.")
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Invalid or missing authentication token",
+#             headers={"WWW-Authenticate": "Bearer"},
+#         )
+#     return True
 
-def verify_auth_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+JWT_ALGORITHM = "HS256"
+
+def get_candidate_secrets() -> List[str]:
+    secrets = []
+    env_secret = os.getenv("JWT_SECRET")
+    if env_secret:
+        secrets.append(env_secret)
+
+    # Check frappe site config files if accessible relative to workspace
+    possible_paths = [
+        "../sites/common_site_config.json",
+        "../../sites/common_site_config.json",
+        "../sites/site1.local/site_config.json",
+        "../../sites/site1.local/site_config.json",
+        "../sites/frontend/site_config.json",
+        "../../sites/frontend/site_config.json",
+    ]
+    for path in possible_paths:
+        try:
+            if os.path.exists(path):
+                import json
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    sec = data.get("jwt_secret")
+                    if sec and sec not in secrets:
+                        secrets.append(sec)
+        except Exception:
+            pass
+
+    return secrets
+
+async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
     """
-    Validates Bearer token auth header against AGENT_AUTH_TOKEN env variable.
+    FastAPI dependency that extracts and validates the Authorization: Bearer <token>
+    header sent from the ERPNext Desk React chat widget.
     """
-    if credentials.credentials != AGENT_AUTH_TOKEN:
-        logger.warning("Authentication failed: invalid token provided.")
+    candidate_secrets = get_candidate_secrets()
+    if not candidate_secrets:
+        logger.error("No JWT secret key configured in environment or site configuration.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server security error: JWT secret key is unconfigured.",
+        )
+
+    if not authorization:
+        allow_dev_auth = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1")
+        if allow_dev_auth:
+            logger.info("No Authorization header found; using ALLOW_DEV_MOCK_AUTH fallback.")
+            return {
+                "sub": "dev_user@example.com",
+                "full_name": "Standalone Developer",
+                "roles": ["System Manager", "Developer"],
+            }
+        logger.warning("Missing Authorization header in request")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing authentication token",
+            detail="Missing Authorization header. Please supply 'Authorization: Bearer <token>' header.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return True
+
+    # Split 'Bearer <token>'
+    parts = authorization.split(" ")
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        logger.warning(f"Malformed Authorization header: {authorization[:30]}...")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authorization header format. Expected 'Bearer <token>'",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = parts[1]
+    last_err = None
+
+    for secret in candidate_secrets:
+        try:
+            payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+            logger.info(f"Successfully authenticated JWT for user: {payload.get('sub')}")
+            return payload
+        except jwt.ExpiredSignatureError:
+            logger.warning("JWT token has expired")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has expired. Please refresh your session.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        except jwt.InvalidTokenError as err:
+            last_err = err
+
+    logger.error(f"JWT validation failed: {str(last_err)}")
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=f"Invalid token: {str(last_err)}",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 # Request and Response models
 class ChatRequest(BaseModel):
@@ -78,8 +180,13 @@ class ChatResponse(BaseModel):
 session_store = {}
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest, authorized: bool = Depends(verify_auth_token)):
-    session_id = "default-session"  # Simple single-session persistence for dev testing
+async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_token)):
+    session_id = payload.get("sub")
+    if not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token payload missing required 'sub' claim"
+        )
     
     # Initialize session if not present
     if session_id not in session_store:
@@ -91,6 +198,7 @@ async def chat_endpoint(request: ChatRequest, authorized: bool = Depends(verify_
         }
         
     session_state = session_store[session_id]
+    session_state["user_roles"] = payload.get("roles", [])
     
     # Append the new user message
     session_state["messages"].append(HumanMessage(content=request.message))
@@ -104,13 +212,23 @@ async def chat_endpoint(request: ChatRequest, authorized: bool = Depends(verify_
             "messages": updated_state["messages"],
             "detected_intent": updated_state.get("detected_intent", ""),
             "collected_fields": updated_state.get("collected_fields", {}),
-            "final_response": updated_state.get("final_response", "")
+            "final_response": updated_state.get("final_response", ""),
+            "user_roles": updated_state.get("user_roles", [])
         }
         
-        # If the sales order creation successfully completes, or falls back, we can clear slots for the next order
+        # Reset workflow slots if the query completes or falls back so subsequent queries start fresh
         final_resp = updated_state.get("final_response", "")
-        if "Successfully created" in final_resp or "Failed to create" in final_resp or "How can I help you today?" in final_resp:
-            # Reset workflow slots so subsequent queries start fresh
+        if (
+            "Successfully created" in final_resp or 
+            "Failed to create" in final_resp or 
+            "How can I help you today?" in final_resp or
+            "Stock levels for item" in final_resp or
+            "Failed to check stock" in final_resp or
+            "No stock found" in final_resp or
+            "Customer Details for" in final_resp or
+            "Failed to retrieve details" in final_resp or
+            "Permission Denied" in final_resp
+        ):
             session_store[session_id]["collected_fields"] = {}
             session_store[session_id]["detected_intent"] = ""
             
@@ -124,11 +242,16 @@ async def chat_endpoint(request: ChatRequest, authorized: bool = Depends(verify_
         )
 
 @app.post("/chat/reset")
-async def reset_session(authorized: bool = Depends(verify_auth_token)):
+async def reset_session(payload: dict = Depends(verify_token)):
     """
     Helper endpoint to clear conversation session memory.
     """
-    session_id = "default-session"
+    session_id = payload.get("sub")
+    if not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token payload missing required 'sub' claim"
+        )
     if session_id in session_store:
         del session_store[session_id]
     return {"status": "session reset successful"}
@@ -136,4 +259,4 @@ async def reset_session(authorized: bool = Depends(verify_auth_token)):
 if __name__ == "__main__":
     import uvicorn
     # Run locally on localhost:8000
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)

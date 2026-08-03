@@ -19,3 +19,6 @@ class AgentState(TypedDict):
     
     # final_response: The compiled response message that will be sent back to the client.
     final_response: str
+    
+    # user_roles: Stores the list of roles for the authenticated user from the JWT payload, used for RBAC checks.
+    user_roles: list[str]

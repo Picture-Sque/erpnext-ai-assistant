@@ -5,7 +5,9 @@ interface ChatHeaderProps {
 	currentUser?: string;
 }
 
-export function ChatHeader({ onClose, currentUser = "Guest" }: ChatHeaderProps) {
+export function ChatHeader({ onClose, currentUser = "Administrator" }: ChatHeaderProps) {
+	const displayUser = !currentUser || currentUser === "Guest" ? "Administrator" : currentUser;
+
 	return (
 		<header className="chat-header">
 			<div className="chat-header__brand">
@@ -28,7 +30,7 @@ export function ChatHeader({ onClose, currentUser = "Guest" }: ChatHeaderProps) 
 
 				<div className="chat-header__user-slot">
 					<span className="chat-header__user-label">ERP User</span>
-					<span className="chat-header__user-value">{currentUser}</span>
+					<span className="chat-header__user-value">{displayUser}</span>
 				</div>
 
 				{onClose ? (

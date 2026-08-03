@@ -4,11 +4,19 @@ authors = [
     { name = "Lorem Internship Team", email = "krishnadasps2004@gmail.com"}
 ]
 description = "AI Assistant for ERPNext"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
-    # "frappe~=16.0.0" # Installed and managed by bench.
+    "PyJWT>=2.8.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.1",
+    "langgraph>=0.0.30",
+    "langchain-google-genai>=1.0.0",
+    "langchain-core>=0.1.30",
+    "httpx>=0.27.0"
 ]
 
 [build-system]
