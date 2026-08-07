@@ -56,17 +56,32 @@ export function useDemoChat() {
 
         if (frappe) {
             user = frappe.session?.user || frappe.boot?.user?.name || frappe.boot?.user?.email || frappe.user?.name || "";
-            fullName = frappe.boot?.user?.full_name || frappe.session?.user_fullname || frappe.user_info?.[user]?.full_name || user;
+            fullName =
+                frappe.boot?.user?.full_name ||
+                frappe.session?.user_fullname ||
+                frappe.user_info?.[user]?.full_name ||
+                frappe.user_info?.[user]?.fullname ||
+                "";
         }
 
-        // Fallback: check document.cookie for user_id e.g. user_id=Administrator
-        if ((!user || user === "Guest") && typeof document !== "undefined") {
-            const cookieMatch = document.cookie.match(/(?:^|; )user_id=([^;]*)/);
-            if (cookieMatch && cookieMatch[1]) {
-                const decodedUser = decodeURIComponent(cookieMatch[1]);
-                if (decodedUser && decodedUser !== "Guest") {
-                    user = decodedUser;
-                    fullName = decodedUser;
+        // Fallback: check document.cookie for user_id and full_name
+        if (typeof document !== "undefined") {
+            if (!user || user === "Guest") {
+                const cookieUser = document.cookie.match(/(?:^|; )user_id=([^;]*)/);
+                if (cookieUser && cookieUser[1]) {
+                    const decodedUser = decodeURIComponent(cookieUser[1]);
+                    if (decodedUser && decodedUser !== "Guest") {
+                        user = decodedUser;
+                    }
+                }
+            }
+            if (!fullName || fullName === "Guest") {
+                const cookieName = document.cookie.match(/(?:^|; )full_name=([^;]*)/);
+                if (cookieName && cookieName[1]) {
+                    const decodedName = decodeURIComponent(cookieName[1]);
+                    if (decodedName && decodedName !== "Guest") {
+                        fullName = decodedName;
+                    }
                 }
             }
         }
@@ -113,12 +128,10 @@ export function useDemoChat() {
             }
 
             const currentSession = getFrappeSessionUser();
-            const userParam = currentSession.username !== "Guest" ? currentSession.username : undefined;
 
-            console.log("[Chat Widget] Fetching fresh token on-demand from Frappe for user:", userParam);
+            console.log("[Chat Widget] Fetching fresh token on-demand from Frappe...");
             frappe.call({
                 method: "ai_assistant.ai_assistant.api.get_chat_token",
-                args: userParam ? { user: userParam } : {},
                 callback: (r: any) => {
                     if (r && r.message && r.message.token) {
                         const rawUser = r.message.user;
@@ -128,7 +141,7 @@ export function useDemoChat() {
                             : (currentSession.username !== "Guest" ? currentSession.username : "Guest");
                         const resolvedFullName = (rawFullName && rawFullName !== "Guest")
                             ? rawFullName
-                            : resolvedUser;
+                            : (resolvedUser !== "Guest" ? resolvedUser : "Guest");
 
                         const userObj = {
                             username: resolvedUser,
@@ -164,18 +177,23 @@ export function useDemoChat() {
                 username: sessionUser.username,
                 fullName: sessionUser.fullName,
             }));
+        } else {
+            setAuthUser({
+                username: "Guest",
+                fullName: "Guest",
+                roles: [],
+                token: "",
+            });
         }
 
         // Step 2: Fetch JWT token via frappe.call
         if (frappe && frappe.call) {
-            const userParam = sessionUser.username !== "Guest" ? sessionUser.username : undefined;
-            console.log("[Chat Widget] Calling ai_assistant.ai_assistant.api.get_chat_token with user:", userParam);
+            console.log("[Chat Widget] Calling ai_assistant.ai_assistant.api.get_chat_token");
             frappe.call({
                 method: "ai_assistant.ai_assistant.api.get_chat_token",
-                args: userParam ? { user: userParam } : {},
                 callback: (r: any) => {
                     console.log("[Chat Widget] frappe.call callback response:", r);
-                    if (r && r.message) {
+                    if (r && r.message && r.message.token) {
                         console.log("[Chat Widget] Successfully authenticated user:", r.message.user);
                         const rawUser = r.message.user;
                         const rawFullName = r.message.full_name;
@@ -184,7 +202,7 @@ export function useDemoChat() {
                             : (sessionUser.username !== "Guest" ? sessionUser.username : "Guest");
                         const resolvedFullName = (rawFullName && rawFullName !== "Guest")
                             ? rawFullName
-                            : resolvedUser;
+                            : (resolvedUser !== "Guest" ? resolvedUser : "Guest");
 
                         const userObj = {
                             username: resolvedUser,
@@ -196,55 +214,56 @@ export function useDemoChat() {
                         setAuthUser(userObj);
 
                         if (isMountedRef.current) {
-                            setMessages([
-                                {
-                                    id: createId(),
-                                    role: "assistant",
-                                    content: `Welcome, ${userObj.fullName}! Connected to ERPNext. How can I assist you today?`,
-                                    timestamp: createTimestamp()
+                            setMessages(prev => {
+                                if (prev.length === 0) {
+                                    return [
+                                        {
+                                            id: createId(),
+                                            role: "assistant",
+                                            content: `Welcome, ${userObj.fullName}! Connected to ERPNext. How can I assist you today?`,
+                                            timestamp: createTimestamp()
+                                        }
+                                    ];
                                 }
-                            ]);
+                                return prev;
+                            });
                         }
                     } else {
-                        console.warn("[Chat Widget] frappe.call returned empty message. Full response:", r);
-                        if (isMountedRef.current) {
-                            setMessages([
-                                {
-                                    id: createId(),
-                                    role: "assistant",
-                                    content: "Authentication warning: Could not load user identity from ERPNext. Please refresh the page.",
-                                    timestamp: createTimestamp()
-                                }
-                            ]);
-                        }
+                        console.warn("[Chat Widget] frappe.call returned empty or unauthenticated response.");
+                        setAuthUser({
+                            username: "Guest",
+                            fullName: "Guest",
+                            roles: [],
+                            token: "",
+                        });
                     }
                 },
                 error: (err: any) => {
                     console.error("[Chat Widget] frappe.call error fetching token:", err);
-                    const errMsg = extractFrappeErrorMessage(err);
-                    if (isMountedRef.current) {
-                        setMessages([
-                            {
-                                id: createId(),
-                                role: "assistant",
-                                content: `Authentication Error: ${errMsg}. Check browser console and Frappe error log for details.`,
-                                timestamp: createTimestamp()
-                            }
-                        ]);
-                    }
+                    setAuthUser({
+                        username: "Guest",
+                        fullName: "Guest",
+                        roles: [],
+                        token: "",
+                    });
                 }
             });
         } else {
             console.warn("[Chat Widget] frappe.call is not available. Running outside ERPNext Desk.");
             if (isMountedRef.current) {
-                setMessages([
-                    {
-                        id: createId(),
-                        role: "assistant",
-                        content: "Running in standalone mode. Log into ERPNext Desk to enable user identity sync.",
-                        timestamp: createTimestamp()
+                setMessages(prev => {
+                    if (prev.length === 0) {
+                        return [
+                            {
+                                id: createId(),
+                                role: "assistant",
+                                content: "Running in standalone mode. Log into ERPNext Desk to enable user identity sync.",
+                                timestamp: createTimestamp()
+                            }
+                        ];
                     }
-                ]);
+                    return prev;
+                });
             }
         }
     }, []);

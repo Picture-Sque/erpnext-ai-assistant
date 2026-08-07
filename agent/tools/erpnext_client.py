@@ -142,6 +142,8 @@ def create_sales_order(customer: str, items: list[dict], delivery_date: str = No
         processed_item = dict(item)
         if "delivery_date" not in processed_item:
             processed_item["delivery_date"] = delivery_date
+        if "warehouse" not in processed_item:
+            processed_item["warehouse"] = "Stores - LSD"
         processed_items.append(processed_item)
         
     # Structure the document payload

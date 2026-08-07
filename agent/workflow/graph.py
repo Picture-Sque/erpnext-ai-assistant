@@ -90,13 +90,21 @@ def classify_intent_node(state: AgentState):
     if not messages:
         return {"detected_intent": "fallback"}
         
+    current_intent = state.get("detected_intent", "")
+    collected = state.get("collected_fields", {}) or {}
+    
+    # Preserve in-progress intent if slot filling is incomplete
+    if current_intent == "create_sales_order" and (not collected.get("customer") or not collected.get("items")):
+        logger.info(f"Retaining in-progress intent: {current_intent}")
+        return {"detected_intent": current_intent}
+        
     last_msg = messages[-1].content
     intent = heuristic_classify(last_msg)
     
     api_key = os.getenv("GOOGLE_API_KEY", "")
     if api_key and api_key != "mock_google_api_key":
         try:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0, max_retries=1)
             structured_llm = llm.with_structured_output(IntentClassification)
             res = structured_llm.invoke([{"role": "user", "content": last_msg}])
             if res and res.intent in ["create_sales_order", "fallback"]:
@@ -118,7 +126,7 @@ def collect_sales_order_info_node(state: AgentState):
     api_key = os.getenv("GOOGLE_API_KEY", "")
     if api_key and api_key != "mock_google_api_key":
         try:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0, max_retries=1)
             structured_llm = llm.with_structured_output(SalesOrderExtraction)
             
             prompt = (
@@ -250,7 +258,7 @@ def collect_stock_check_info_node(state: AgentState):
     api_key = os.getenv("GOOGLE_API_KEY", "")
     if api_key and api_key != "mock_google_api_key":
         try:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0, max_retries=1)
             structured_llm = llm.with_structured_output(StockCheckExtraction)
             
             prompt = (
@@ -309,7 +317,7 @@ def collect_customer_lookup_info_node(state: AgentState):
     api_key = os.getenv("GOOGLE_API_KEY", "")
     if api_key and api_key != "mock_google_api_key":
         try:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0, max_retries=1)
             structured_llm = llm.with_structured_output(CustomerLookupExtraction)
             
             prompt = (

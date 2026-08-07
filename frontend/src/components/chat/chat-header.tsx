@@ -5,8 +5,8 @@ interface ChatHeaderProps {
 	currentUser?: string;
 }
 
-export function ChatHeader({ onClose, currentUser = "Administrator" }: ChatHeaderProps) {
-	const displayUser = !currentUser || currentUser === "Guest" ? "Administrator" : currentUser;
+export function ChatHeader({ onClose, currentUser }: ChatHeaderProps) {
+	const displayUser = currentUser && currentUser.trim() !== "" ? currentUser : "Guest";
 
 	return (
 		<header className="chat-header">
