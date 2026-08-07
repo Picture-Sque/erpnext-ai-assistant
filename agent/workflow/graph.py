@@ -115,9 +115,11 @@ def heuristic_extract(text: str, current_fields: dict, intent: str = "") -> dict
                     elif len(parts[2]) == 4: # DD-MM-YYYY
                         fields["delivery_date"] = f"{parts[2]}-{parts[1]}-{parts[0]}"
                         
-    elif intent == "check_inventory":
-        # Extract item_code (e.g. SKU009 or (SKU009))
+    elif intent in ["check_inventory", "stock_check"]:
+        # Extract item_code (e.g. SKU009 or (SKU009) or ITEM-003)
         item_match = re.search(r"\b(SKU\d+)\b", text, re.IGNORECASE)
+        if not item_match:
+            item_match = re.search(r"(?:stock for|stock of|check stock for|stock check|inventory of|qty of|quantity of) ([\w\-\.]+)", text, re.IGNORECASE)
         if not item_match:
             item_match = re.search(r"\(([\w\-]+)\)", text)
         if item_match:
@@ -222,6 +224,8 @@ def classify_intent_node(state: AgentState):
     if res and res.get("intent"):
         llm_intent = res.get("intent")
         if llm_intent in ["create_sales_order", "check_inventory", "stock_check", "customer_lookup", "fallback"]:
+            if llm_intent == "stock_check":
+                llm_intent = "check_inventory"
             intent = llm_intent
             
     logger.info(f"Classified intent: {intent}")
@@ -363,7 +367,34 @@ def collect_inventory_info_node(state: AgentState):
     current_fields = state.get("collected_fields", {}) or {}
     intent = state.get("detected_intent", "")
     
+    # Run heuristics first
     fields = heuristic_extract(last_msg, current_fields, intent)
+    
+    # Call Groq LLM for natural language entity extraction
+    prompt = (
+        f"Extract inventory check details from the user's message: '{last_msg}'.\n"
+        f"Existing fields: {current_fields}.\n"
+        f"Respond strictly with JSON object containing keys:\n"
+        f"- 'item_code': Item code string (e.g. 'SKU005', 'SKU009') or null\n"
+        f"- 'qty': Target quantity number or null\n"
+        f"- 'warehouse': Warehouse name string or null"
+    )
+    res = invoke_structured_llm(prompt)
+    if res:
+        if res.get("item_code"):
+            raw_code = res["item_code"]
+            m = re.search(r"\(([\w\-]+)\)", raw_code)
+            if m:
+                raw_code = m.group(1).strip()
+            fields["item_code"] = raw_code
+        if res.get("qty") is not None:
+            try:
+                fields["qty"] = float(res["qty"])
+            except (ValueError, TypeError):
+                pass
+        if res.get("warehouse"):
+            fields["warehouse"] = res["warehouse"]
+            
     logger.info(f"Collected inventory fields: {fields}")
     return {"collected_fields": fields}
 
@@ -453,7 +484,19 @@ def collect_customer_lookup_info_node(state: AgentState):
     current_fields = state.get("collected_fields", {}) or {}
     intent = state.get("detected_intent", "")
     
+    # Run heuristics first
     fields = heuristic_extract(last_msg, current_fields, intent)
+    
+    # Call Groq LLM for natural language entity extraction
+    prompt = (
+        f"Extract the customer name or ID to look up from the user's message: '{last_msg}'.\n"
+        f"Existing fields: {current_fields}.\n"
+        f"Respond strictly with JSON object: {{\"customer_name\": \"...\"}}"
+    )
+    res = invoke_structured_llm(prompt)
+    if res and res.get("customer_name"):
+        fields["customer_name"] = res["customer_name"]
+        
     logger.info(f"Collected customer lookup fields: {fields}")
     return {"collected_fields": fields}
 
@@ -584,81 +627,6 @@ def check_stock_missing_info(state: AgentState):
     if not item_code:
         return "ask_for_stock_item"
     return "call_check_stock_tool"
-
-def ask_for_stock_item_node(state: AgentState):
-    return {"final_response": "I'm ready to check stock levels. Please provide the Item Code you would like to check."}
-
-def call_check_stock_tool_node(state: AgentState):
-    collected = state.get("collected_fields", {}) or {}
-    item_code = collected.get("item_code")
-    
-    res = check_stock(item_code)
-    if res["success"]:
-        bins = res["data"]
-        if not bins:
-            response_text = f"No stock found for item '{item_code}' in any warehouse."
-        else:
-            response_text = f"Stock levels for item '{item_code}':\n"
-            for bin_entry in bins:
-                warehouse = bin_entry.get("warehouse", "Unknown")
-                actual = bin_entry.get("actual_qty", 0.0)
-                ordered = bin_entry.get("ordered_qty", 0.0)
-                reserved = bin_entry.get("reserved_qty", 0.0)
-                response_text += f"- Warehouse: {warehouse} | Actual: {actual} | Ordered: {ordered} | Reserved: {reserved}\n"
-    else:
-        response_text = f"Failed to check stock for '{item_code}'. Details:\n{res['error']}"
-    return {"final_response": response_text}
-
-# Customer Lookup Nodes & Routers
-def collect_customer_lookup_info_node(state: AgentState):
-    messages = state.get("messages", [])
-    last_msg = messages[-1].content if messages else ""
-    current_fields = state.get("collected_fields", {}) or {}
-    
-    fields = heuristic_extract_customer(last_msg, current_fields)
-    
-    prompt = (
-        f"Extract the customer name or ID to look up from the user's message: '{last_msg}'.\n"
-        f"Existing fields: {current_fields}.\n"
-        f"Respond strictly with JSON object: {{\"customer_name\": \"...\"}}"
-    )
-    res = invoke_structured_llm(prompt)
-    if res and res.get("customer_name"):
-        fields["customer_name"] = res["customer_name"]
-            
-    logger.info(f"Collected customer fields: {fields}")
-    return {"collected_fields": fields}
-
-def check_customer_missing_info(state: AgentState):
-    collected = state.get("collected_fields", {}) or {}
-    customer_name = collected.get("customer_name")
-    if not customer_name:
-        return "ask_for_customer_name"
-    return "call_customer_lookup_tool"
-
-def ask_for_customer_name_node(state: AgentState):
-    return {"final_response": "I'm ready to look up customer details. Please provide the Customer Name or ID."}
-
-def call_customer_lookup_tool_node(state: AgentState):
-    collected = state.get("collected_fields", {}) or {}
-    customer_name = collected.get("customer_name")
-    
-    res = get_customer(customer_name)
-    if res["success"]:
-        data = res["data"]
-        cust_name = data.get("customer_name", customer_name)
-        group = data.get("customer_group", "Unknown")
-        territory = data.get("territory", "Unknown")
-        status = data.get("status", "Active")
-        response_text = (
-            f"Customer Details for '{cust_name}':\n"
-            f"- Group: {group}\n"
-            f"- Territory: {territory}\n"
-            f"- Status: {status}"
-        )
-    else:
-        response_text = f"Failed to retrieve details for customer '{customer_name}'. Details:\n{res['error']}"
-    return {"final_response": response_text}
 
 # Graph Construction
 workflow = StateGraph(AgentState)
