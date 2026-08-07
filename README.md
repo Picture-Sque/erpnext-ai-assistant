@@ -1,140 +1,184 @@
 # ERPNext AI Assistant
 
-An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, and Vite.
+An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, Vite, LangGraph, and FastAPI.
 
-The assistant is injected globally into the ERPNext Desk UI, providing an interactive sidebar chat interface without modifying any core ERPNext or Frappe files.
+The assistant is injected globally into the ERPNext Desk UI, providing an interactive sidebar chat interface powered by an intelligent agent workflow without modifying any core ERPNext or Frappe files.
 
 ---
 
 ## Architecture Overview
 
-The project is structured as a standard Frappe application containing a custom React frontend.
-
 ```mermaid
 graph TD
     subgraph Host Development Environment
-        A[React Frontend: Vite/TypeScript] -->|npm run build| B[Production Bundle]
+        A[React Frontend: Vite/TypeScript] -->|npm run build| B[Production Assets: assistant.js / assistant.css]
+        G[FastAPI Agent Service: Port 8000] -->|LangGraph + Gemini API| H[ERPNext REST API]
     end
 
     subgraph Docker Container Environment
-        B -->|Deploy: docker cp| C[Backend Container: erpnext-ai-assistant/public/desk/]
-        C -->|bench build| D[Served site assets/ai_assistant/desk/]
-        D -->|docker cp| E[Frontend Container Nginx]
+        B -->|Deploy: docker cp| C[Backend Container: frappe_docker-backend-1]
+        C -->|Sites Assets Symlink| D[Served Site Assets: /assets/ai_assistant/desk/]
+        D -->|docker cp| E[Frontend Container Nginx: frappe_docker-frontend-1]
     end
 
-    E -->|Loads CSS/JS| F[Browser Client: ERPNext Desk]
+    E -->|Loads Widget Assets| F[Browser Client: ERPNext Desk on http://localhost:8081]
+    F -->|JWT Session Auth| G
 ```
 
 ### Key Components
 
-- **[`ai_assistant/hooks.py`](./ai_assistant/hooks.py)**: Configures global injection of assets into the Desk using `app_include_js` and `app_include_css`.
-- **[`frontend/`](./frontend/)**: The React + Vite + TypeScript project.
-- **[`frontend/src/main.tsx`](./frontend/src/main.tsx)**: Dual-root mounting strategy. Checks for isolated `#ai_assistant-root` mount point first (preventing layout clobbering in multi-framework environments), falling back to `#root` for standalone dev server.
-- **[`frontend/src/components/desk/assistant-shell.tsx`](./frontend/src/components/desk/assistant-shell.tsx)**: Handles the sliding transition states, accessibility (ARIA attributes), click-outside-to-close dismissals, ESC key event listener, and a keyboard focus trap.
-- **[`frontend/src/styles/global.css`](./frontend/src/styles/global.css)**: Holds all styles. Formatted with strict class scoping (prefixed with `#ai_assistant-root`, `.desk-assistant`, `.chat-`, or `.app-shell`) to prevent styling or CSS reset leaks onto the parent ERPNext Desk UI.
+- **[`ai_assistant/hooks.py`](./ai_assistant/hooks.py)**: Registers global asset includes (`app_include_js` and `app_include_css`) in Frappe Desk.
+- **[`ai_assistant/ai_assistant/api.py`](./ai_assistant/ai_assistant/api.py)**: Whitelisted Frappe REST endpoint (`get_chat_token`) that signs JWT tokens using the session user's identity.
+- **[`frontend/`](./frontend/)**: React + Vite + TypeScript chat widget embedded into ERPNext Desk.
+- **[`agent/`](./agent/)**: FastAPI service running a multi-turn LangGraph state machine with Gemini LLM intent classification, slot filling, and ERPNext REST API integration.
+- **[`skills/`](./skills/)**: Declarative skill specifications (`check-inventory`, `create-sales-order`, `customer-lookup`).
 
 ---
 
-## Installation & Setup
+## Prerequisites
 
-### 1. Backend Installation (Frappe Bench)
-Add the application to your Frappe bench:
+Before starting, ensure you have the following installed:
+1. **Python 3.10+** (with `pip` and `venv`)
+2. **Node.js 18+** (with `npm`)
+3. **Docker Desktop** running the ERPNext multi-container bench (`frappe_docker-backend-1`, `frappe_docker-frontend-1`, etc.) reachable at `http://localhost:8081`.
+
+---
+
+## Quick Start & Installation Guide
+
+### Step 1: Clone the Integration Branch
+
+Clone the repository specifically on the **`integration-wip`** branch:
+
 ```bash
-bench get-app https://github.com/your-username/erpnext-ai-assistant.git --branch main
-bench --site your-site-name install-app ai_assistant
+git clone -b integration-wip https://github.com/Picture-Sque/erpnext-ai-assistant.git
+cd erpnext-ai-assistant
 ```
 
-### 2. Frontend Development Setup
-Navigate to the frontend folder and install dependencies:
+---
+
+### Step 2: Install Frappe App in Bench
+
+Inside your Frappe bench environment (or container), fetch and install the app onto your site:
+
 ```bash
-cd erpnext-ai-assistant/frontend
+# Get the app on the integration-wip branch
+bench get-app https://github.com/Picture-Sque/erpnext-ai-assistant.git --branch integration-wip
+
+# Install onto your site (e.g. frontend)
+bench --site frontend install-app ai_assistant
+```
+
+---
+
+### Step 3: Configure and Start the FastAPI Agent Backend
+
+Navigate to the `agent` directory, set up your Python virtual environment, install dependencies, configure environment variables, and start the server:
+
+```bash
+cd agent
+
+# Create and activate virtual environment
+python -m venv venv
+
+# Windows PowerShell:
+.\venv\Scripts\activate
+
+# Linux / macOS:
+# source venv/bin/activate
+
+# Install requirements
+pip install -r requirements.txt
+
+# Create environment config from example
+cp .env.example .env
+```
+
+Edit `agent/.env` to configure your credentials:
+
+```env
+# Shared JWT Secret matching Frappe site secret
+JWT_SECRET=your_jwt_secret_here
+
+# Dev Mock Authentication Fallback (set to false for production session auth)
+ALLOW_DEV_MOCK_AUTH=false
+
+# ERPNext REST API Connection
+ERPNEXT_BASE_URL=http://localhost:8081
+ERPNEXT_API_KEY=your_erpnext_api_key
+ERPNEXT_API_SECRET=your_erpnext_api_secret
+
+# Google Gemini API Key
+GOOGLE_API_KEY=your_gemini_api_key
+```
+
+Launch the FastAPI Agent server:
+
+```bash
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+*The agent service runs on `http://127.0.0.1:8000`.*
+
+---
+
+### Step 4: Compile Frontend Assets & Deploy to Docker Containers
+
+From the repository root, build the React frontend production bundle:
+
+```bash
+cd frontend
 npm install
-```
-
-To run the standalone frontend in hot-reload development mode:
-```bash
-npm run dev
-```
-Open `http://localhost:5173` to interact with the static chat workspace.
-
----
-
-## Production Build & Container Deployment
-
-Vite is configured to compile assets directly into the Frappe public folder:
-`../ai_assistant/public/desk/` as `assistant.js` and `assistant.css`.
-
-### Step 1: Compile the production assets
-From the `frontend` directory, run:
-```bash
 npm run build
 ```
 
-### Step 2: Synchronize assets to the Docker containers
-In multi-container production environments (where backend python processes and frontend nginx proxies run in separate containers), the compiled assets must be synchronized.
+This compiles assets into `ai_assistant/public/desk/assistant.js` and `assistant.css`.
 
-> [!NOTE]
-> Replace `<backend_container_name>` and `<frontend_container_name>` with your actual container names (check via `docker ps`).
+Now synchronize the compiled assets to your running Docker containers:
 
-1. **Deploy to the Backend Container**:
-   Copy the assets into the baked application folder inside the container:
-   ```bash
-   # Replace <backend_container_name> with your actual backend container name
-   docker cp ai_assistant/public/desk/assistant.css <backend_container_name>:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.css
-   docker cp ai_assistant/public/desk/assistant.js <backend_container_name>:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.js
-   ```
+```bash
+# 1. Copy assets to Backend container application directory
+docker cp ../ai_assistant/public/desk/assistant.css frappe_docker-backend-1:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.css
+docker cp ../ai_assistant/public/desk/assistant.js frappe_docker-backend-1:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.js
 
-2. **Sync the Site Assets Symlink**:
-   Frappe links the site public directory to a local bench `assets` folder. Copy the files and update the symlinks inside both containers:
-   ```bash
-   # Backend Container Sites Sync (Replace <backend_container_name>)
-   docker cp ai_assistant/public/desk/assistant.css <backend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
-   docker cp ai_assistant/public/desk/assistant.js <backend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
-   
-   # Frontend Nginx Container Sites Sync (Replace <frontend_container_name>)
-   docker cp ai_assistant/public/desk/assistant.css <frontend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
-   docker cp ai_assistant/public/desk/assistant.js <frontend_container_name>:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
-   ```
+# 2. Copy assets to Backend container site assets symlink
+docker cp ../ai_assistant/public/desk/assistant.css frappe_docker-backend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
+docker cp ../ai_assistant/public/desk/assistant.js frappe_docker-backend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
 
-### Step 3: Clear Redis and Site Cache
-If the application hooks do not show up immediately, it is because of Redis caching key hashes:
-
-1. **Append the app to `apps.txt`** (if not already present):
-   ```bash
-   # Replace <backend_container_name> and <frontend_container_name>
-   docker exec <backend_container_name> sh -c "echo 'ai_assistant' >> /home/frappe/frappe-bench/sites/apps.txt"
-   docker exec <frontend_container_name> sh -c "echo 'ai_assistant' >> /home/frappe/frappe-bench/sites/apps.txt"
-   ```
-
-2. **Clear the cached Redis keys** inside the backend container console:
-   ```bash
-   # Replace <backend_container_name>
-   docker exec <backend_container_name> bench --site frontend execute "frappe.cache.delete_value" --args "all_apps"
-   docker exec <backend_container_name> bench --site frontend execute "frappe.cache.delete_value" --args "app_hooks"
-   ```
-
-3. **Clear site configuration and template cache**:
-   ```bash
-   # Replace <backend_container_name>
-   docker exec <backend_container_name> bench --site frontend clear-cache
-   ```
+# 3. Copy assets to Frontend Nginx container site assets
+docker cp ../ai_assistant/public/desk/assistant.css frappe_docker-frontend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
+docker cp ../ai_assistant/public/desk/assistant.js frappe_docker-frontend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
+```
 
 ---
 
-## Contributing & Pre-Commit
+### Step 5: Clear Cache and Refresh Desk
 
-This repository uses `pre-commit` hooks to format and lint code before committing.
-To install pre-commit:
+Run `bench clear-cache` inside the backend container so Frappe links the app hooks:
 
 ```bash
-pip install pre-commit
-pre-commit install
+docker exec frappe_docker-backend-1 bench --site frontend clear-cache
 ```
 
-Pre-commit runs formatting checks using:
-- **ruff** (Python formatting)
-- **eslint** / **prettier** (TypeScript & React formatting)
-- **pyupgrade** (Modern Python syntax verification)
+---
+
+## Verification & Usage
+
+1. Open **`http://localhost:8081`** in your browser.
+2. Log into ERPNext Desk using test user credentials:
+   - **Administrator**: `Administrator` / `admin`
+   - **Employee**: `employee@test.com` / `password123`
+3. Click the floating AI Assistant chat launcher in the bottom-right corner.
+4. **Try test prompts**:
+   - **Customer Lookup**: `"Look up customer West View Software Ltd."`
+   - **Stock Check**: `"Check stock for SKU005"`
+   - **Sales Order Creation**: `"Create a sales order for Grant Plastics Ltd. for 5 units of SKU001"`
+
+---
+
+## Repository Branching Strategy
+
+- **`integration-wip`** *(Main Integration Branch)*: Complete, self-contained MVP branch containing the React Desk widget, FastAPI backend, LangGraph workflow, skills, JWT authentication, and Docker synchronization procedures.
 
 ---
 
