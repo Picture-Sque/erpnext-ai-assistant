@@ -223,10 +223,12 @@ def classify_intent_node(state: AgentState):
     res = invoke_structured_llm(prompt)
     if res and res.get("intent"):
         llm_intent = res.get("intent")
-        if llm_intent in ["create_sales_order", "check_inventory", "stock_check", "customer_lookup", "fallback"]:
+        if llm_intent in ["create_sales_order", "check_inventory", "stock_check", "customer_lookup"]:
             if llm_intent == "stock_check":
                 llm_intent = "check_inventory"
             intent = llm_intent
+        elif llm_intent == "fallback" and intent == "fallback":
+            intent = "fallback"
             
     logger.info(f"Classified intent: {intent}")
     return {"detected_intent": intent}
