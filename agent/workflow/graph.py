@@ -3,10 +3,10 @@ import logging
 import re
 from typing import Optional, List
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import StateGraph, END
+
+from llm import invoke_structured_llm
 
 from workflow.state import AgentState
 from tools.erpnext_client import (
@@ -212,26 +212,17 @@ def classify_intent_node(state: AgentState):
     last_msg = messages[-1].content
     intent = heuristic_classify(last_msg)
     
-    api_key = os.getenv("GOOGLE_API_KEY", "")
-    if api_key and api_key != "mock_google_api_key":
-        try:
-            ai_client = genai.Client(api_key=api_key)
-            response = ai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=last_msg,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=IntentClassification,
-                    temperature=0.0
-                )
-            )
-            import json
-            res = json.loads(response.text)
-            llm_intent = res.get("intent")
-            if llm_intent in ["create_sales_order", "check_inventory", "stock_check", "customer_lookup", "fallback"]:
-                intent = llm_intent
-        except Exception as e:
-            logger.warning(f"LLM Classification failed: {e}. Using heuristic fallback.")
+    prompt = (
+        f"Classify the user message intent into one of the allowed categories.\n"
+        f"Allowed categories: 'create_sales_order', 'check_inventory', 'stock_check', 'customer_lookup', 'fallback'.\n"
+        f"User message: '{last_msg}'\n"
+        f"Respond strictly with JSON object: {{\"intent\": \"<category>\"}}"
+    )
+    res = invoke_structured_llm(prompt)
+    if res and res.get("intent"):
+        llm_intent = res.get("intent")
+        if llm_intent in ["create_sales_order", "check_inventory", "stock_check", "customer_lookup", "fallback"]:
+            intent = llm_intent
             
     logger.info(f"Classified intent: {intent}")
     return {"detected_intent": intent}
@@ -249,47 +240,33 @@ def collect_sales_order_info_node(state: AgentState):
     # Run heuristics first
     fields = heuristic_extract(last_msg, current_fields, intent)
     
-    api_key = os.getenv("GOOGLE_API_KEY", "")
-    if api_key and api_key != "mock_google_api_key":
-        try:
-            ai_client = genai.Client(api_key=api_key)
-            prompt = (
-                f"Extract Sales Order details from the user's message. "
-                f"Existing fields: {current_fields}. "
-                f"Update fields if new info is given. "
-                f"User message: {last_msg}"
-            )
-            response = ai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=SalesOrderExtraction,
-                    temperature=0.0
-                )
-            )
-            import json
-            res = json.loads(response.text)
-            if res:
-                if res.get("customer"):
-                    fields["customer"] = res["customer"]
-                if res.get("delivery_date"):
-                    fields["delivery_date"] = res["delivery_date"]
-                if res.get("items"):
-                    fields["items"] = []
-                    for item in res["items"]:
-                        raw_code = item.get("item_code")
-                        if raw_code:
-                            m = re.search(r"\(([\w\-]+)\)", raw_code)
-                            if m:
-                                raw_code = m.group(1).strip()
-                        fields["items"].append({
-                            "item_code": raw_code,
-                            "qty": item.get("qty"),
-                            "rate": item.get("rate")
-                        })
-        except Exception as e:
-            logger.warning(f"LLM extraction failed: {e}. Using heuristic values.")
+    prompt = (
+        f"Extract Sales Order details from the user message: '{last_msg}'.\n"
+        f"Existing fields: {current_fields}.\n"
+        f"Respond strictly with JSON object containing keys:\n"
+        f"- 'customer': Customer name string or null\n"
+        f"- 'items': List of objects [{{\"item_code\": \"...\", \"qty\": 1.0}}]\n"
+        f"- 'delivery_date': Date string (YYYY-MM-DD) or null"
+    )
+    res = invoke_structured_llm(prompt)
+    if res:
+        if res.get("customer"):
+            fields["customer"] = res["customer"]
+        if res.get("delivery_date"):
+            fields["delivery_date"] = res["delivery_date"]
+        if res.get("items"):
+            fields["items"] = []
+            for item in res["items"]:
+                raw_code = item.get("item_code")
+                if raw_code:
+                    m = re.search(r"\(([\w\-]+)\)", raw_code)
+                    if m:
+                        raw_code = m.group(1).strip()
+                fields["items"].append({
+                    "item_code": raw_code,
+                    "qty": item.get("qty"),
+                    "rate": item.get("rate")
+                })
             
     # Validate delivery date if extracted
     date_val = fields.get("delivery_date")
@@ -589,22 +566,14 @@ def collect_stock_check_info_node(state: AgentState):
     
     fields = heuristic_extract_stock(last_msg, current_fields)
     
-    api_key = os.getenv("GOOGLE_API_KEY", "")
-    if api_key and api_key != "mock_google_api_key":
-        try:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0, max_retries=1)
-            structured_llm = llm.with_structured_output(StockCheckExtraction)
-            
-            prompt = (
-                f"Extract the item code to check stock for from the user's message. "
-                f"Existing fields: {current_fields}. "
-                f"User message: {last_msg}"
-            )
-            res = structured_llm.invoke(prompt)
-            if res and res.item_code:
-                fields["item_code"] = res.item_code
-        except Exception as e:
-            logger.warning(f"LLM stock extraction failed: {e}. Using heuristic values.")
+    prompt = (
+        f"Extract the item code to check stock for from the user's message: '{last_msg}'.\n"
+        f"Existing fields: {current_fields}.\n"
+        f"Respond strictly with JSON object: {{\"item_code\": \"...\"}}"
+    )
+    res = invoke_structured_llm(prompt)
+    if res and res.get("item_code"):
+        fields["item_code"] = res["item_code"]
             
     logger.info(f"Collected stock fields: {fields}")
     return {"collected_fields": fields}
@@ -648,22 +617,14 @@ def collect_customer_lookup_info_node(state: AgentState):
     
     fields = heuristic_extract_customer(last_msg, current_fields)
     
-    api_key = os.getenv("GOOGLE_API_KEY", "")
-    if api_key and api_key != "mock_google_api_key":
-        try:
-            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0, max_retries=1)
-            structured_llm = llm.with_structured_output(CustomerLookupExtraction)
-            
-            prompt = (
-                f"Extract the customer name/ID to look up from the user's message. "
-                f"Existing fields: {current_fields}. "
-                f"User message: {last_msg}"
-            )
-            res = structured_llm.invoke(prompt)
-            if res and res.customer_name:
-                fields["customer_name"] = res.customer_name
-        except Exception as e:
-            logger.warning(f"LLM customer extraction failed: {e}. Using heuristic values.")
+    prompt = (
+        f"Extract the customer name or ID to look up from the user's message: '{last_msg}'.\n"
+        f"Existing fields: {current_fields}.\n"
+        f"Respond strictly with JSON object: {{\"customer_name\": \"...\"}}"
+    )
+    res = invoke_structured_llm(prompt)
+    if res and res.get("customer_name"):
+        fields["customer_name"] = res["customer_name"]
             
     logger.info(f"Collected customer fields: {fields}")
     return {"collected_fields": fields}
