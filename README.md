@@ -1,6 +1,6 @@
 # ERPNext AI Assistant
 
-An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, Vite, LangGraph, and FastAPI.
+An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, Vite, LangGraph, Groq LLM (`llama-3.3-70b-versatile`), and FastAPI.
 
 The assistant is injected globally into the ERPNext Desk UI, providing an interactive sidebar chat interface powered by an intelligent agent workflow without modifying any core ERPNext or Frappe files.
 
@@ -12,7 +12,7 @@ The assistant is injected globally into the ERPNext Desk UI, providing an intera
 graph TD
     subgraph Host Development Environment
         A[React Frontend: Vite/TypeScript] -->|npm run build| B[Production Assets: assistant.js / assistant.css]
-        G[FastAPI Agent Service: Port 8000] -->|LangGraph + Gemini API| H[ERPNext REST API]
+        G[FastAPI Agent Service: Port 8000] -->|LangGraph + Groq API| H[ERPNext REST API]
     end
 
     subgraph Docker Container Environment
@@ -30,7 +30,7 @@ graph TD
 - **[`ai_assistant/hooks.py`](./ai_assistant/hooks.py)**: Registers global asset includes (`app_include_js` and `app_include_css`) in Frappe Desk.
 - **[`ai_assistant/ai_assistant/api.py`](./ai_assistant/ai_assistant/api.py)**: Whitelisted Frappe REST endpoint (`get_chat_token`) that signs JWT tokens using the session user's identity.
 - **[`frontend/`](./frontend/)**: React + Vite + TypeScript chat widget embedded into ERPNext Desk.
-- **[`agent/`](./agent/)**: FastAPI service running a multi-turn LangGraph state machine with Gemini LLM intent classification, slot filling, and ERPNext REST API integration.
+- **[`agent/`](./agent/)**: FastAPI service running a multi-turn LangGraph state machine with Groq LLM (`llama-3.3-70b-versatile`) intent classification, slot filling, unified LLM client (`agent/llm.py`), and ERPNext REST API integration.
 - **[`skills/`](./skills/)**: Declarative skill specifications (`check-inventory`, `create-sales-order`, `customer-lookup`).
 
 ---
@@ -108,8 +108,8 @@ ERPNEXT_BASE_URL=http://localhost:8081
 ERPNEXT_API_KEY=your_erpnext_api_key
 ERPNEXT_API_SECRET=your_erpnext_api_secret
 
-# Google Gemini API Key
-GOOGLE_API_KEY=your_gemini_api_key
+# Groq API Key (llama-3.3-70b-versatile via OpenAI SDK)
+GROQ_API_KEY=your_groq_api_key
 ```
 
 Launch the FastAPI Agent server:
