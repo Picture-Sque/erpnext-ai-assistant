@@ -71,9 +71,9 @@ def heuristic_extract(text: str, current_fields: dict, intent: str = "") -> dict
     if intent == "create_sales_order":
         # Extract Customer (e.g., "for customer Acme", "for Acme")
         if not fields.get("customer"):
-            cust_match = re.search(r"for customer ([\w\s\-\.]+?)(?:,|$|\bitem\b|\bwith\b|\bqty\b)", text, re.IGNORECASE)
+            cust_match = re.search(r"for customer ([\w\s\-\.]+?)(?:,|$|\bitem\b|\bwith\b|\bqty\b|\bfor\b|\bof\b)", text, re.IGNORECASE)
             if not cust_match:
-                cust_match = re.search(r"for ([\w\s\-\.]+?)(?:,|$|\bitem\b|\bwith\b|\bqty\b)", text, re.IGNORECASE)
+                cust_match = re.search(r"for ([\w\s\-\.]+?)(?:,|$|\bitem\b|\bwith\b|\bqty\b|\bfor\b|\bof\b)", text, re.IGNORECASE)
             if cust_match:
                 fields["customer"] = cust_match.group(1).strip()
                 
