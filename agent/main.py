@@ -223,10 +223,16 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             "Failed to create" in final_resp or 
             "How can I help you today?" in final_resp or
             "Stock levels for item" in final_resp or
+            "Inventory status for item" in final_resp or
+            "No inventory bins found" in final_resp or
+            "Failed to check inventory" in final_resp or
             "Failed to check stock" in final_resp or
             "No stock found" in final_resp or
             "Customer Details for" in final_resp or
+            "Customer details for" in final_resp or
+            "was not found in ERPNext" in final_resp or
             "Failed to retrieve details" in final_resp or
+            "Failed to look up customer" in final_resp or
             "Permission Denied" in final_resp
         ):
             session_store[session_id]["collected_fields"] = {}
