@@ -28,6 +28,7 @@ logger = logging.getLogger("agent_main")
 
 # Import compiled graph and states
 from workflow.graph import compiled_graph
+import chat_store
 
 # Setup FastAPI App
 app = FastAPI(
@@ -35,6 +36,10 @@ app = FastAPI(
     description="FastAPI service hosting LangGraph workflows for ERPNext integrations.",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+def on_startup():
+    chat_store.init_db()
 
 # CORS Configuration
 origins = [
@@ -188,38 +193,31 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             detail="Token payload missing required 'sub' claim"
         )
     
-    # Initialize session if not present
-    if session_id not in session_store:
-        session_store[session_id] = {
-            "messages": [],
-            "detected_intent": "",
-            "collected_fields": {},
-            "final_response": ""
-        }
-        
-    session_state = session_store[session_id]
-    session_state["user_roles"] = payload.get("roles", [])
+    user_id = payload.get("full_name") or payload.get("sub") or ""
+    # Ensure conversation record exists and load persistent session state from SQLite
+    chat_store.get_or_create_conversation(session_id, user_id=user_id)
+    session_state = chat_store.load_session_state(session_id, user_roles=payload.get("roles", []))
     
-    # Append the new user message
+    # Save user message to SQLite message history
+    chat_store.save_message(session_id, "user", request.message)
     session_state["messages"].append(HumanMessage(content=request.message))
     
     try:
         # Run state machine iteration
         updated_state = compiled_graph.invoke(session_state)
+        final_resp = updated_state.get("final_response", "")
         
-        # Persist updated values back to session store
-        session_store[session_id] = {
-            "messages": updated_state["messages"],
-            "detected_intent": updated_state.get("detected_intent", ""),
-            "collected_fields": updated_state.get("collected_fields", {}),
-            "final_response": updated_state.get("final_response", ""),
-            "user_roles": updated_state.get("user_roles", [])
-        }
+        # Save assistant message to SQLite message history
+        chat_store.save_message(
+            session_id,
+            "assistant",
+            final_resp,
+            intent=updated_state.get("detected_intent", "")
+        )
         
         # Reset workflow slots if the query completes a WRITE operation or falls back
         # For READ operations (customer lookup, inventory) keep intent/fields so
         # follow-up questions like "What is their customer group?" still work.
-        final_resp = updated_state.get("final_response", "")
         target_tool = updated_state.get("target_tool", "")
         is_write_op = target_tool in ("add_doctype", "update_doctype", "delete_doctype")
         
@@ -230,9 +228,21 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             "How can I help you today?" in final_resp or
             "Permission Denied" in final_resp
         )
+        
         if should_reset:
-            session_store[session_id]["collected_fields"] = {}
-            session_store[session_id]["detected_intent"] = ""
+            chat_store.update_session_state(
+                session_id,
+                detected_intent="",
+                collected_fields={},
+                is_complete=True
+            )
+        else:
+            chat_store.update_session_state(
+                session_id,
+                detected_intent=updated_state.get("detected_intent", ""),
+                collected_fields=updated_state.get("collected_fields", {}),
+                is_complete=updated_state.get("is_workflow_complete", False)
+            )
             
         return ChatResponse(response=final_resp)
         
@@ -254,8 +264,7 @@ async def reset_session(payload: dict = Depends(verify_token)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Token payload missing required 'sub' claim"
         )
-    if session_id in session_store:
-        del session_store[session_id]
+    chat_store.reset_session_state(session_id)
     return {"status": "session reset successful"}
 
 
