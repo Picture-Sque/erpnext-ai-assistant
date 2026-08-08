@@ -219,14 +219,21 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
         # Reset workflow slots if the query completes or falls back so subsequent queries start fresh
         final_resp = updated_state.get("final_response", "")
         if (
+            updated_state.get("is_workflow_complete") or
             "Successfully created" in final_resp or 
             "Failed to create" in final_resp or 
             "How can I help you today?" in final_resp or
             "Stock levels for item" in final_resp or
+            "Inventory status for item" in final_resp or
+            "No inventory bins found" in final_resp or
+            "Failed to check inventory" in final_resp or
             "Failed to check stock" in final_resp or
             "No stock found" in final_resp or
             "Customer Details for" in final_resp or
+            "Customer details for" in final_resp or
+            "was not found in ERPNext" in final_resp or
             "Failed to retrieve details" in final_resp or
+            "Failed to look up customer" in final_resp or
             "Permission Denied" in final_resp
         ):
             session_store[session_id]["collected_fields"] = {}
@@ -256,7 +263,37 @@ async def reset_session(payload: dict = Depends(verify_token)):
         del session_store[session_id]
     return {"status": "session reset successful"}
 
+
+# Standalone endpoints for Generic CRUD Tools
+from tools.generic_tools import add_doctype, list_doctype, update_doctype, delete_doctype
+
+class GenericToolRequest(BaseModel):
+    doctype_name: str
+    id: Optional[str] = None
+    parameters: Optional[dict] = None
+
+@app.post("/api/tools/list")
+async def list_doctype_endpoint(request: GenericToolRequest):
+    return list_doctype(request.doctype_name, request.parameters or {})
+
+@app.post("/api/tools/add")
+async def add_doctype_endpoint(request: GenericToolRequest):
+    return add_doctype(request.doctype_name, request.parameters or {})
+
+@app.put("/api/tools/update")
+async def update_doctype_endpoint(request: GenericToolRequest):
+    if not request.id:
+        raise HTTPException(status_code=400, detail="Missing record 'id' for update")
+    return update_doctype(request.doctype_name, request.id, request.parameters or {})
+
+@app.delete("/api/tools/delete")
+async def delete_doctype_endpoint(request: GenericToolRequest):
+    if not request.id:
+        raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
+    return delete_doctype(request.doctype_name, request.id)
+
 if __name__ == "__main__":
     import uvicorn
     # Run locally on localhost:8000
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
+
