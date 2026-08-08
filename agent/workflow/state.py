@@ -1,7 +1,7 @@
 from typing import Annotated, TypedDict
 from langgraph.graph.message import add_messages
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     """
     Defines the state structure for our LangGraph conversation flow.
     """
@@ -10,15 +10,21 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     
     # detected_intent: Tracks what intent the LLM has classified for the user's input.
-    # Used for routing decisions (e.g. "create_sales_order", "fallback").
     detected_intent: str
     
     # collected_fields: A dictionary representing slots/entity fields extracted so far.
-    # For a sales order, this stores keys like "customer" and "items".
     collected_fields: dict
     
     # final_response: The compiled response message that will be sent back to the client.
     final_response: str
     
-    # user_roles: Stores the list of roles for the authenticated user from the JWT payload, used for RBAC checks.
+    # user_roles: Stores the list of roles for the authenticated user from the JWT payload.
     user_roles: list[str]
+    
+    # Workflow completion and tool execution state
+    is_workflow_complete: bool
+    all_required_filled: bool
+    missing_parameters: list
+    tool_raw_response: dict
+    target_tool: str
+    target_doctype: str

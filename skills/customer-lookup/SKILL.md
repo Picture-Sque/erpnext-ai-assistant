@@ -1,6 +1,63 @@
 ---
 name: customer-lookup
-description: Look up an ERPNext customer record by name, ID, or partial match. Use when the user asks "find customer X", "who is X", needs customer details, or when another skill (like Create Sales Order) needs to confirm a customer exists.
+intent: customer-lookup
+description: Look up an ERPNext customer record by name, ID, or partial match. Use when the user asks "find customer X", "who is X", needs customer details, or when another skill needs to confirm a customer exists.
+allowed_roles:
+  - Sales User
+  - Sales Manager
+  - Accounts User
+  - Accounts Manager
+  - System Manager
+  - Administrator
+tool: list_doctype
+doctype: Customer
+required_fields:
+  - customer_name
+optional_fields: []
+query_parameters:
+  filters:
+    - ["customer_name", "like", "%{customer_name}%"]
+  fields:
+    - customer_name
+    - customer_group
+    - territory
+    - email_id
+    - mobile_no
+defaults: []
+validation_rules: []
+keywords:
+  - "look up customer"
+  - "lookup customer"
+  - "find customer"
+  - "customer details"
+  - "search customer"
+  - "customer group"
+  - "customer info"
+  - "customer"
+  - details of
+  - details for
+  - their customer group
+  - their group
+  - their territory
+  - their email
+  - their contact
+  - who is their
+  - what is their
+  - what group
+context_pronouns:
+  entity_field: customer_name
+  triggers: ["their", "they", "group", "details", "contact", "who", "what"]
+response_template: |
+  **Customer Details: {customer_name}**
+  - **Customer Group**: {customer_group}
+  - **Territory**: {territory}
+  - **Email**: {email_id}
+  - **Mobile**: {mobile_no}
+not_found_message: "Customer Lookup Result:\n\nUnfortunately, we were unable to find any information on the customer \"{customer_name}\" in our database."
+examples:
+  - "Look up customer West View Software Ltd."
+  - "Show me details of West View Software Ltd."
+  - "Find customer Acme"
 ---
 
 # Customer Lookup
@@ -17,19 +74,9 @@ Trigger this skill when the user wants to find or confirm details about a custom
 - Related doctype for contact details: `Contact` (linked via Dynamic Link)
 
 ## Tool
-Tool name: `get_customer` (schema and handler defined separately in the tools registry — this skill does not define its schema)
+Tool name: `list_doctype` with DocType `Customer`.
 
 ## Steps
-1. Call `get_customer` with the search term (partial name match, case-insensitive).
-2. If exactly one match, return it with key details (name, group, territory, contact info).
-3. If multiple matches, list them briefly and ask the user which one they mean.
-4. If no matches, say so clearly — don't guess or fabricate a customer.
-5. If called from another skill (e.g. Create Sales Order), return just the resolved customer ID/name so the calling skill can proceed.
-
-## Example
-User: "Find customer Acme"
-Response: Call get_customer with "Acme" → if "Acme Corp" and "Acme Industries" both match, list both and ask which one.
-
-## Edge cases
-- Disabled customers (disabled=1) should still show up in search but flag that they're disabled.
-- Don't expose sensitive fields (e.g. internal credit limits) unless explicitly asked.
+1. Call `list_doctype` with `customer_name` filter.
+2. If match found, return formatted customer details.
+3. If no match, state that no customer record was found.

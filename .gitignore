@@ -64,3 +64,9 @@ mock_server.py
 agent/.env
 agent/venv/
 agent/.venv/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+

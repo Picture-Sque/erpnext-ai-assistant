@@ -28,6 +28,7 @@ logger = logging.getLogger("agent_main")
 
 # Import compiled graph and states
 from workflow.graph import compiled_graph
+import chat_store
 
 # Setup FastAPI App
 app = FastAPI(
@@ -35,6 +36,10 @@ app = FastAPI(
     description="FastAPI service hosting LangGraph workflows for ERPNext integrations.",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+def on_startup():
+    chat_store.init_db()
 
 # CORS Configuration
 origins = [
@@ -188,55 +193,56 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             detail="Token payload missing required 'sub' claim"
         )
     
-    # Initialize session if not present
-    if session_id not in session_store:
-        session_store[session_id] = {
-            "messages": [],
-            "detected_intent": "",
-            "collected_fields": {},
-            "final_response": ""
-        }
-        
-    session_state = session_store[session_id]
-    session_state["user_roles"] = payload.get("roles", [])
+    user_id = payload.get("full_name") or payload.get("sub") or ""
+    # Ensure conversation record exists and load persistent session state from SQLite
+    chat_store.get_or_create_conversation(session_id, user_id=user_id)
+    session_state = chat_store.load_session_state(session_id, user_roles=payload.get("roles", []))
     
-    # Append the new user message
+    # Save user message to SQLite message history
+    chat_store.save_message(session_id, "user", request.message)
     session_state["messages"].append(HumanMessage(content=request.message))
     
     try:
         # Run state machine iteration
         updated_state = compiled_graph.invoke(session_state)
-        
-        # Persist updated values back to session store
-        session_store[session_id] = {
-            "messages": updated_state["messages"],
-            "detected_intent": updated_state.get("detected_intent", ""),
-            "collected_fields": updated_state.get("collected_fields", {}),
-            "final_response": updated_state.get("final_response", ""),
-            "user_roles": updated_state.get("user_roles", [])
-        }
-        
-        # Reset workflow slots if the query completes or falls back so subsequent queries start fresh
         final_resp = updated_state.get("final_response", "")
-        if (
-            "Successfully created" in final_resp or 
-            "Failed to create" in final_resp or 
+        
+        # Save assistant message to SQLite message history
+        chat_store.save_message(
+            session_id,
+            "assistant",
+            final_resp,
+            intent=updated_state.get("detected_intent", "")
+        )
+        
+        # Reset workflow slots if the query completes a WRITE operation or falls back
+        # For READ operations (customer lookup, inventory) keep intent/fields so
+        # follow-up questions like "What is their customer group?" still work.
+        target_tool = updated_state.get("target_tool", "")
+        is_write_op = target_tool in ("add_doctype", "update_doctype", "delete_doctype")
+        
+        should_reset = (
+            (updated_state.get("is_workflow_complete") and is_write_op) or
+            "Successfully created" in final_resp or
+            "Failed to create" in final_resp or
             "How can I help you today?" in final_resp or
-            "Stock levels for item" in final_resp or
-            "Inventory status for item" in final_resp or
-            "No inventory bins found" in final_resp or
-            "Failed to check inventory" in final_resp or
-            "Failed to check stock" in final_resp or
-            "No stock found" in final_resp or
-            "Customer Details for" in final_resp or
-            "Customer details for" in final_resp or
-            "was not found in ERPNext" in final_resp or
-            "Failed to retrieve details" in final_resp or
-            "Failed to look up customer" in final_resp or
             "Permission Denied" in final_resp
-        ):
-            session_store[session_id]["collected_fields"] = {}
-            session_store[session_id]["detected_intent"] = ""
+        )
+        
+        if should_reset:
+            chat_store.update_session_state(
+                session_id,
+                detected_intent="",
+                collected_fields={},
+                is_complete=True
+            )
+        else:
+            chat_store.update_session_state(
+                session_id,
+                detected_intent=updated_state.get("detected_intent", ""),
+                collected_fields=updated_state.get("collected_fields", {}),
+                is_complete=updated_state.get("is_workflow_complete", False)
+            )
             
         return ChatResponse(response=final_resp)
         
@@ -258,11 +264,40 @@ async def reset_session(payload: dict = Depends(verify_token)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Token payload missing required 'sub' claim"
         )
-    if session_id in session_store:
-        del session_store[session_id]
+    chat_store.reset_session_state(session_id)
     return {"status": "session reset successful"}
+
+
+# Standalone endpoints for Generic CRUD Tools
+from tools.generic_tools import add_doctype, list_doctype, update_doctype, delete_doctype
+
+class GenericToolRequest(BaseModel):
+    doctype_name: str
+    id: Optional[str] = None
+    parameters: Optional[dict] = None
+
+@app.post("/api/tools/list")
+async def list_doctype_endpoint(request: GenericToolRequest):
+    return list_doctype(request.doctype_name, request.parameters or {})
+
+@app.post("/api/tools/add")
+async def add_doctype_endpoint(request: GenericToolRequest):
+    return add_doctype(request.doctype_name, request.parameters or {})
+
+@app.put("/api/tools/update")
+async def update_doctype_endpoint(request: GenericToolRequest):
+    if not request.id:
+        raise HTTPException(status_code=400, detail="Missing record 'id' for update")
+    return update_doctype(request.doctype_name, request.id, request.parameters or {})
+
+@app.delete("/api/tools/delete")
+async def delete_doctype_endpoint(request: GenericToolRequest):
+    if not request.id:
+        raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
+    return delete_doctype(request.doctype_name, request.id)
 
 if __name__ == "__main__":
     import uvicorn
     # Run locally on localhost:8000
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
+
