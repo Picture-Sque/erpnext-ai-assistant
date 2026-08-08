@@ -216,26 +216,21 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             "user_roles": updated_state.get("user_roles", [])
         }
         
-        # Reset workflow slots if the query completes or falls back so subsequent queries start fresh
+        # Reset workflow slots if the query completes a WRITE operation or falls back
+        # For READ operations (customer lookup, inventory) keep intent/fields so
+        # follow-up questions like "What is their customer group?" still work.
         final_resp = updated_state.get("final_response", "")
-        if (
-            updated_state.get("is_workflow_complete") or
-            "Successfully created" in final_resp or 
-            "Failed to create" in final_resp or 
+        target_tool = updated_state.get("target_tool", "")
+        is_write_op = target_tool in ("add_doctype", "update_doctype", "delete_doctype")
+        
+        should_reset = (
+            (updated_state.get("is_workflow_complete") and is_write_op) or
+            "Successfully created" in final_resp or
+            "Failed to create" in final_resp or
             "How can I help you today?" in final_resp or
-            "Stock levels for item" in final_resp or
-            "Inventory status for item" in final_resp or
-            "No inventory bins found" in final_resp or
-            "Failed to check inventory" in final_resp or
-            "Failed to check stock" in final_resp or
-            "No stock found" in final_resp or
-            "Customer Details for" in final_resp or
-            "Customer details for" in final_resp or
-            "was not found in ERPNext" in final_resp or
-            "Failed to retrieve details" in final_resp or
-            "Failed to look up customer" in final_resp or
             "Permission Denied" in final_resp
-        ):
+        )
+        if should_reset:
             session_store[session_id]["collected_fields"] = {}
             session_store[session_id]["detected_intent"] = ""
             

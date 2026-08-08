@@ -4,7 +4,7 @@ import re
 import json
 import yaml
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Annotated
+from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import StateGraph, END
@@ -16,7 +16,8 @@ from tools.generic_tools import add_doctype, list_doctype, update_doctype, delet
 logger = logging.getLogger("workflow_graph")
 logger.setLevel(logging.INFO)
 
-# Load Skills Dynamically from skills/ folder
+
+# Dynamic Declarative Skill Loader
 def load_skills() -> List[Dict[str, Any]]:
     skills_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "skills"))
     skills = []
@@ -38,70 +39,40 @@ def load_skills() -> List[Dict[str, Any]]:
                                 logger.warning(f"YAML parsing failed for frontmatter in {skill_md}: {ex}")
                                 data = {}
                             
-                            name = data.get("name")
-                            desc = data.get("description")
-                            inst = data.get("instructions")
-                            if name and desc and inst:
+                            name = data.get("name") or data.get("intent") or folder
+                            desc = data.get("description", "")
+                            inst = data.get("instructions") or parts[2].strip()
+                            
+                            if name and desc:
                                 skills.append({
                                     "name": name,
+                                    "intent": data.get("intent", name),
                                     "description": desc,
                                     "instructions": inst,
+                                    "allowed_roles": data.get("allowed_roles") or data.get("roles", []),
+                                    "tool": data.get("tool", "list_doctype"),
+                                    "doctype": data.get("doctype", ""),
+                                    "required_fields": data.get("required_fields", []),
+                                    "optional_fields": data.get("optional_fields", []),
+                                    "query_parameters": data.get("query_parameters", {}),
+                                    "payload_structure": data.get("payload_structure", {}),
                                     "defaults": data.get("defaults", []),
-                                    "validation_rules": data.get("validation_rules", [])
+                                    "validation_rules": data.get("validation_rules", []),
+                                    "keywords": data.get("keywords", []),
+                                    "context_pronouns": data.get("context_pronouns", {}),
+                                    "response_template": data.get("response_template", ""),
+                                    "not_found_message": data.get("not_found_message", ""),
+                                    "error_template": data.get("error_template", ""),
+                                    "examples": data.get("examples", [])
                                 })
                 except Exception as e:
                     logger.warning(f"Failed to parse skill {skill_md}: {e}")
-    
-    if not skills:
-        # Static fallback if reading directory fails or files don't exist
-        skills = [
-            {
-                "name": "check-inventory",
-                "description": "Check current stock levels for an item in ERPNext, optionally at a specific warehouse. Use when the user asks \"how much X do we have\", \"is X in stock\", \"check inventory for X\", or similar.",
-                "instructions": "Use the `list_doctype` tool on DocType \"Bin\".\nFilter the query by `item_code` (and optionally `warehouse` if a warehouse is specified by the user).\nUse parameters:\n- filters: [[\"item_code\", \"=\", \"<item_code>\"], [\"warehouse\", \"like\", \"%<warehouse>%\"]] (if warehouse is specified)\n- fields: [\"item_code\", \"warehouse\", \"actual_qty\"]\n\nFormat the results returned by the tool as a clean Markdown table with columns: Item Code, Warehouse, and Actual Quantity.\nAt the end of the table, include a total-quantity summary summing up the actual_qty of all matching rows.\nIf the tool returns no matching rows, inform the user that no stock was found for the item.\n",
-                "defaults": [],
-                "validation_rules": []
-            },
-            {
-                "name": "create-sales-order",
-                "description": "Create a new Sales Order in ERPNext for a customer. Use when the user asks to place an order, create a sales order, or sell items to a customer.",
-                "instructions": "Use the `add_doctype` tool on DocType \"Sales Order\".\nThe tool call parameters must be structured as follows:\n{\n  \"company\": \"Lorr\",\n  \"customer\": \"<customer>\",\n  \"transaction_date\": \"<transaction_date>\",\n  \"delivery_date\": \"<delivery_date>\",\n  \"items\": [\n    {\n      \"item_code\": \"<item_code>\",\n      \"qty\": <qty>,\n      \"warehouse\": \"Stores - Lor\"\n    }\n  ]\n}\n\nBefore invoking the tool, you must confirm that the following required slots are filled:\n- customer\n- items (containing at least one item, with both item_code and qty populated)\n\nIf any of these required slots are missing, ask the user to provide the missing details (e.g. customer name or items details).\nIf transaction_date or delivery_date are not specified, they will be automatically computed and populated in the background (transaction_date defaults to today's date, and delivery_date defaults to transaction_date + 7 days).\nAlways populate \"company\" as \"Lorr\" and each item's \"warehouse\" as \"Stores - Lor\" in the payload unless the user specifies otherwise.\nOnce the sales order is successfully created, report back the new Sales Order name and status to the user.\n",
-                "defaults": [
-                    {"field": "transaction_date", "value": "today"},
-                    {"field": "delivery_date", "value": "transaction_date + 7d"}
-                ],
-                "validation_rules": [
-                    {
-                        "field": "delivery_date",
-                        "must_be_after": "transaction_date",
-                        "on_fail": "must be strictly after transaction_date"
-                    }
-                ]
-            },
-            {
-                "name": "customer-lookup",
-                "description": "Look up an ERPNext customer record by name, ID, or partial match. Use when the user asks \"find customer X\", \"who is X\", needs customer details, or when another skill needs to confirm a customer exists.",
-                "instructions": "Use the `list_doctype` tool on DocType \"Customer\".\nFilter the query by `customer_name` using a partial match filter:\n- filters: [[\"customer_name\", \"like\", \"%<customer_name>%\"]]\n- fields: [\"customer_name\", \"customer_group\", \"territory\", \"email_id\", \"mobile_no\"]\n\nPresent the final response with the customer's name, group, territory, and contact information (email address and mobile number).\n",
-                "defaults": [],
-                "validation_rules": []
-            }
-        ]
+                    
     return skills
+
 
 loaded_skills = load_skills()
 
-# RBAC rule mapping for skills
-ROLE_RULES = {
-    "create-sales-order": ["Sales User", "Sales Manager", "System Manager", "Administrator"],
-    "check-inventory": ["Stock User", "Stock Manager", "Sales User", "Sales Manager", "System Manager", "Administrator"],
-    "customer-lookup": ["Sales User", "Sales Manager", "Accounts User", "Accounts Manager", "System Manager", "Administrator"]
-}
-
-# Structured response schema for intent
-class IntentClassification(BaseModel):
-    intent: str = Field(
-        description="Intent of the user message. Must be one of the skill names or 'fallback'."
-    )
 
 def apply_skill_defaults(fields: dict, defaults: list) -> dict:
     updated_fields = dict(fields)
@@ -142,7 +113,7 @@ def apply_skill_defaults(fields: dict, defaults: list) -> dict:
     return updated_fields
 
 
-def evaluate_validation_rules(collected: dict, rules: list) -> tuple[bool, list[str]]:
+def evaluate_validation_rules(collected: dict, rules: list) -> Tuple[bool, List[str]]:
     all_required_filled = True
     missing_parameters = []
     
@@ -188,7 +159,7 @@ def evaluate_validation_rules(collected: dict, rules: list) -> tuple[bool, list[
                             msg = f"{field} ({rule.get('on_fail', 'must be after ' + other_field)})"
                             if msg not in missing_parameters:
                                 missing_parameters.append(msg)
-                    except ValueError:
+                    except (ValueError, TypeError):
                         if not (str(val1) > str(val2)):
                             collected.pop(field, None)
                             all_required_filled = False
@@ -258,118 +229,142 @@ def evaluate_validation_rules(collected: dict, rules: list) -> tuple[bool, list[
     return all_required_filled, missing_parameters
 
 
-def _get_offline_fallback_fields(intent: str, last_msg: str, current_fields: dict) -> dict:
+# Declarative Heuristic Parameter Extractor (Driven by Skill Schema)
+def _extract_fields_from_schema(skill: dict, last_msg: str, current_fields: dict, history_text: str = "") -> dict:
     fields = dict(current_fields)
-    if intent == "create-sales-order":
-        if not fields.get("customer"):
-            cust_match = re.search(r"for customer ([\w\s\-\.]+?)(?:,|$|\bitem\b|\bwith\b|\bqty\b|\bfor\b|\bof\b)", last_msg, re.IGNORECASE)
-            if not cust_match:
-                cust_match = re.search(r"for ([\w\s\-\.]+?)(?:,|$|\bitem\b|\bwith\b|\bqty\b|\bfor\b|\bof\b)", last_msg, re.IGNORECASE)
-            if cust_match:
-                fields["customer"] = cust_match.group(1).strip()
-        if not fields.get("items"):
-            match_c = re.search(r"\b(\d+)\s+(SKU\d+)\b", last_msg, re.IGNORECASE)
-            if match_c:
+    cleaned = last_msg.strip()
+    
+    # 1. Context pronoun memory resolution from skill definition
+    cp = skill.get("context_pronouns", {})
+    if cp:
+        entity_field = cp.get("entity_field")
+        triggers = cp.get("triggers", [])
+        if entity_field and not fields.get(entity_field):
+            if any(t in last_msg.lower() for t in triggers):
+                if "code" in entity_field or entity_field in ("item_code", "item"):
+                    # For code/SKU fields: try current message first, then history
+                    m_code = re.search(r"\b(SKU\w+|INVALID_\w+)\b", cleaned, re.IGNORECASE)
+                    if m_code:
+                        fields[entity_field] = m_code.group(1).strip()
+                    else:
+                        m_sku_hist = re.search(r"\b(SKU\w+)\b", history_text, re.IGNORECASE)
+                        if m_sku_hist:
+                            fields[entity_field] = m_sku_hist.group(1).strip()
+                else:
+                    # For name fields (customer_name etc): look for entity name in history
+                    m_hist = re.search(r"(?:look up customer|lookup customer|find customer|customer details|details for|about|for client|for customer|customer:?|client:?)\s+([A-Za-z0-9][\w\s\-\.]+?)(?:\s*\.|\s*\?|\s*\n|$|\s+what\b|\s+how\b|\s+who\b|\s+with\b|\s+details\b)", history_text, re.IGNORECASE)
+                    if m_hist:
+                        extracted = m_hist.group(1).strip()
+                        extracted = re.sub(r"^(?:customer|client)\s+", "", extracted, flags=re.IGNORECASE).strip()
+                        fields[entity_field] = extracted
+                    else:
+                        m_sku = re.search(r"\b(SKU\w+)\b", history_text, re.IGNORECASE)
+                        if m_sku:
+                            fields[entity_field] = m_sku.group(1).strip()
+                        
+    # 2. Schema-driven entity matching for required / optional fields
+    req_fields = skill.get("required_fields", [])
+    
+    # Check for items list extraction
+    if "items" in req_fields and not fields.get("items"):
+        item_warehouse = "Stores - LS"
+        if skill.get("payload_structure", {}).get("item_defaults", {}).get("warehouse"):
+            item_warehouse = skill["payload_structure"]["item_defaults"]["warehouse"]
+            
+        match_c = re.search(r"\b(SKU\w+)\b.*?(\d+(?:\.\d+)?)", cleaned, re.IGNORECASE)
+        if match_c:
+            fields["items"] = [{
+                "item_code": match_c.group(1).strip(),
+                "qty": float(match_c.group(2)),
+                "warehouse": item_warehouse
+            }]
+        else:
+            match_rev = re.search(r"(\d+(?:\.\d+)?)\s+(?:units?\s+of\s+)?(SKU\w+)", cleaned, re.IGNORECASE)
+            if match_rev:
                 fields["items"] = [{
-                    "item_code": match_c.group(2).strip(),
-                    "qty": float(match_c.group(1))
+                    "item_code": match_rev.group(2).strip(),
+                    "qty": float(match_rev.group(1)),
+                    "warehouse": item_warehouse
                 }]
-    elif intent == "check-inventory":
-        item_match = re.search(r"\b(SKU\d+)\b", last_msg, re.IGNORECASE)
-        if item_match:
-            fields["item_code"] = item_match.group(1).strip()
-    elif intent == "customer-lookup":
-        cust_match = re.search(r"for\s+([\w\s\-\.]+?)(?:\?|$)", last_msg, re.IGNORECASE)
-        if cust_match:
-            fields["customer_name"] = cust_match.group(1).strip()
+            else:
+                sku_only = re.search(r"\b(SKU\w+)\b", cleaned, re.IGNORECASE)
+                if sku_only:
+                    fields["_partial_item_code"] = sku_only.group(1).strip()
+                elif fields.get("_partial_item_code") and re.match(r"^\d+(?:\.\d+)?$", cleaned):
+                    fields["items"] = [{
+                        "item_code": fields.pop("_partial_item_code"),
+                        "qty": float(cleaned),
+                        "warehouse": item_warehouse
+                    }]
+
+    # Check for entity codes or names
+    for f in req_fields:
+        if f == "items":
+            continue
+        if not fields.get(f):
+            if "code" in f or f == "item":
+                match_code = re.search(r"\b(SKU\w+|INVALID_\w+)\b", cleaned, re.IGNORECASE)
+                if match_code:
+                    fields[f] = match_code.group(1).strip()
+                else:
+                    paren = re.search(r"\((SKU\w+)\)", cleaned, re.IGNORECASE)
+                    if paren:
+                        fields[f] = paren.group(1).strip()
+                    elif re.match(r"^[A-Z0-9_\-]+$", cleaned, re.IGNORECASE):
+                        fields[f] = cleaned
+            else:
+                # Name extraction - strip entity type prefixes like 'customer', 'client'
+                m_lead = re.search(r"(?:look up|lookup|find|details of|details for|about|for client|for customer|for)\s+([\w\s\-\.]+?)(?:,|$|\?|\bwith\b|\bqty\b|\bquantity\b|\bof\b|\bitem\b)", cleaned, re.IGNORECASE)
+                if m_lead:
+                    raw_name = m_lead.group(1).strip()
+                    raw_name = re.sub(r"^(?:customer|client|vendor|supplier|item|product)\s+", "", raw_name, flags=re.IGNORECASE).strip()
+                    fields[f] = raw_name
+                elif not any(w in cleaned.lower() for w in ["hello", "hi", "help", "what", "stock", "order", "tomorrow", "today", "yesterday"]) and len(cleaned.split()) <= 6:
+                    if not re.search(r"\b(SKU\d+|\d+)\b", cleaned, re.IGNORECASE):
+                        fields[f] = cleaned.strip(". ?")
+                        
+    # Check date relative mentions
+    if "delivery_date" in skill.get("optional_fields", []) or "delivery_date" in req_fields:
+        if not fields.get("delivery_date") and "tomorrow" in cleaned.lower():
+            fields["delivery_date"] = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            
     return fields
 
 
-def _offline_fallback_validator(intent: str, collected: dict) -> tuple[bool, list[str]]:
-    all_required_filled = True
-    missing_parameters = []
-    if intent == "create-sales-order":
-        if not collected.get("customer") or not collected.get("items"):
-            all_required_filled = False
-            missing_parameters = ["customer" if not collected.get("customer") else "items"]
-        else:
-            for item in collected.get("items", []):
-                if not item.get("item_code") or not item.get("qty"):
-                    all_required_filled = False
-                    missing_parameters = ["item_code" if not item.get("item_code") else "qty"]
-    elif intent == "check-inventory":
-        if not collected.get("item_code"):
-            all_required_filled = False
-            missing_parameters = ["item_code"]
-    elif intent == "customer-lookup":
-        if not collected.get("customer_name"):
-            all_required_filled = False
-            missing_parameters = ["customer_name"]
-    return all_required_filled, missing_parameters
-
-
-def _offline_fallback_tool_resolver(intent: str, collected: dict) -> dict:
-    if intent == "create-sales-order":
-        return {
-            "tool": "add_doctype",
-            "doctype_name": "Sales Order",
-            "parameters": {
-                "customer": collected.get("customer"),
-                "transaction_date": collected.get("transaction_date"),
-                "delivery_date": collected.get("delivery_date"),
-                "items": collected.get("items")
-            }
-        }
-    elif intent == "check-inventory":
-        res = {
-            "tool": "list_doctype",
-            "doctype_name": "Bin",
-            "parameters": {
-                "filters": [["item_code", "=", collected.get("item_code")]]
-            }
-        }
-        if collected.get("warehouse"):
-            res["parameters"]["filters"].append(["warehouse", "like", f"%{collected.get('warehouse')}%"])
-        return res
-    elif intent == "customer-lookup":
-        return {
-            "tool": "list_doctype",
-            "doctype_name": "Customer",
-            "parameters": {
-                "filters": [["customer_name", "like", f"%{collected.get('customer_name')}%"]]
-            }
-        }
-    return {}
-
-
-# Nodes Implementation
+# =========================================================================
+# Generic Pipeline Nodes (100% Schema-Driven)
+# =========================================================================
 
 def classify_intent_node(state: AgentState):
-    current_intent = state.get("detected_intent", "")
-    is_complete = state.get("is_workflow_complete", False)
-    
-    # If currently executing a skill and slot filling is incomplete, preserve it
-    if current_intent and current_intent in [s["name"] for s in loaded_skills] and not is_complete:
-        logger.info(f"Preserving active intent '{current_intent}' during slot-filling.")
-        return {"detected_intent": current_intent}
-
     messages = state.get("messages", [])
     if not messages:
         return {"detected_intent": "fallback"}
         
-    last_msg = messages[-1].content
-    
-    # Heuristic guess:
-    intent = "fallback"
+    last_msg = messages[-1].content.strip()
     cleaned = last_msg.lower()
-    if any(keyword in cleaned for keyword in ["sales order", "create order", "place an order"]):
-        intent = "create-sales-order"
-    elif any(keyword in cleaned for keyword in ["stock", "inventory", "qty of", "quantity of", "check stock", "have", "available", "in stock"]):
-        intent = "check-inventory"
-    elif any(keyword in cleaned for keyword in ["customer", "client", "customer details", "look up customer", "details for", "lookup"]):
-        intent = "customer-lookup"
+    current_intent = state.get("detected_intent", "")
+    is_complete = state.get("is_workflow_complete", False)
+    
+    # 1. Immediate greetings / capabilities
+    if cleaned in ["hello", "hi", "hey", "greetings", "good morning", "good evening", "what can you do?", "what can you do", "help", "who are you?"]:
+        return {"detected_intent": "fallback"}
         
-    # Query LLM
+    # 2. Check skill declarative keywords (longest match first)
+    all_kw = []
+    for skill in loaded_skills:
+        for kw in skill.get("keywords", []):
+            all_kw.append((kw, skill["name"]))
+    all_kw.sort(key=lambda x: len(x[0]), reverse=True)
+    for kw, skill_name in all_kw:
+        if kw in cleaned:
+            return {"detected_intent": skill_name}
+            
+    # 3. Multi-turn continuation: if currently in an incomplete workflow, preserve active intent
+    if current_intent and current_intent in [s["name"] for s in loaded_skills] and not is_complete:
+        logger.info(f"Preserving active intent '{current_intent}' during slot-filling.")
+        return {"detected_intent": current_intent}
+
+    # 4. Query LLM for intent classification dynamically based on loaded skills
     skills_options = ", ".join([f"'{s['name']}'" for s in loaded_skills])
     prompt = (
         f"Classify the user message intent into one of the allowed categories.\n"
@@ -378,6 +373,7 @@ def classify_intent_node(state: AgentState):
         f"Respond strictly with JSON object: {{\"intent\": \"<category>\"}}"
     )
     res = invoke_structured_llm(prompt)
+    intent = "fallback"
     if res and res.get("intent"):
         llm_intent = res.get("intent")
         if llm_intent in [s["name"] for s in loaded_skills] or llm_intent == "fallback":
@@ -397,77 +393,113 @@ def collect_parameters_node(state: AgentState):
     if not skill:
         return {"collected_fields": current_fields}
         
-    prompt = (
-        f"You are a precise JSON entity extractor for ERPNext AI Assistant.\n"
-        f"We are running the skill: '{skill['name']}'.\n"
-        f"Skill Description: {skill['description']}\n"
-        f"Skill Instructions:\n{skill['instructions']}\n"
-        f"Currently collected fields/parameters: {json.dumps(current_fields, indent=2)}\n"
-        f"User's last message: '{last_msg}'\n"
-        f"\n"
-        f"Please extract or update the fields/parameters based on the skill instructions and the conversation history.\n"
-        f"Respond strictly with a JSON object containing the updated fields/parameters (merge new info with existing fields)."
-    )
-    
-    res = invoke_structured_llm(prompt)
+    conversation_text = " ".join([m.content for m in messages])
     fields = dict(current_fields)
-    if res and isinstance(res, dict):
-        for k, v in res.items():
-            if v is not None:
-                fields[k] = v
-    else:
-        fields = _get_offline_fallback_fields(intent, last_msg, fields)
+    
+    if last_msg.strip():
+        prompt = (
+            f"You are a precise JSON entity extractor for ERPNext AI Assistant.\n"
+            f"Skill name: '{skill['name']}'\n"
+            f"Skill instructions:\n{skill['instructions']}\n"
+            f"Current collected fields: {json.dumps(current_fields)}\n"
+            f"User message: '{last_msg}'\n"
+            f"Extract or update fields according to the skill instructions.\n"
+            f"Respond strictly with a JSON object of extracted fields."
+        )
+
+        res = invoke_structured_llm(prompt)
+        
+        # Detect if this is a continuation turn (pronouns, short follow-up)
+        # vs a new explicit entity query
+        continuation_pronouns = [
+            "their", "they", "its", "it's", "the customer", "the item",
+            "what is", "what are", "how much", "how many", "tell me more",
+            "more about", "more details", "more info"
+        ]
+        is_continuation = (
+            any(t in last_msg.lower() for t in continuation_pronouns)
+            and len(last_msg.split()) <= 12
+        )
+        
+        if res and isinstance(res, dict):
+            for k, v in res.items():
+                if v is not None and str(v).strip() != "" and v != "null":
+                    # On continuation turns, never overwrite already-collected fields
+                    if is_continuation and k in current_fields and current_fields.get(k):
+                        continue
+                    fields[k] = v
+        prev_history = " ".join([m.content for m in messages[:-1]]) if len(messages) > 1 else ""
+        if not prev_history:
+            prev_history = conversation_text
+        fields = _extract_fields_from_schema(skill, last_msg, fields, prev_history)
         
     defaults = skill.get("defaults", [])
     if defaults:
         fields = apply_skill_defaults(fields, defaults)
         
+    # Flat key normalization
+    if "filters" in fields and isinstance(fields["filters"], list):
+        for flt in fields["filters"]:
+            if isinstance(flt, list) and len(flt) >= 3:
+                key = str(flt[0]).strip()
+                val = str(flt[2]).replace("%", "").strip()
+                if key and key not in fields:
+                    fields[key] = val
+                    
     logger.info(f"Collected parameters: {fields}")
     return {"collected_fields": fields}
 
 
 def validate_parameters_node(state: AgentState):
     intent = state.get("detected_intent", "")
-    collected = state.get("collected_fields", {}) or {}
+    collected = dict(state.get("collected_fields", {}) or {})
     
     skill = next((s for s in loaded_skills if s["name"] == intent), None)
     if not skill:
         return {"all_required_filled": True, "missing_parameters": []}
         
-    prompt = (
-        f"You are a validator for ERPNext AI Assistant.\n"
-        f"Skill: '{skill['name']}'\n"
-        f"Skill Instructions:\n{skill['instructions']}\n"
-        f"Current collected parameters:\n{json.dumps(collected, indent=2)}\n"
-        f"\n"
-        f"Determine if all required parameters for this skill have been successfully collected. "
-        f"According to the instructions, identify if any required fields are missing or incomplete.\n"
-        f"Respond strictly with a JSON object:\n"
-        f"{{\n"
-        f"  \"all_required_filled\": true/false,\n"
-        f"  \"missing_parameters\": [\"field1\", \"field2\"]  # List of missing required fields (if any)\n"
-        f"}}"
-    )
-    
     all_required_filled = True
     missing_parameters = []
     
-    res = invoke_structured_llm(prompt)
-    if res and isinstance(res, dict):
-        all_required_filled = res.get("all_required_filled", True)
-        missing_parameters = res.get("missing_parameters", [])
-    else:
-        # Heuristic fallback
-        all_required_filled, missing_parameters = _offline_fallback_validator(intent, collected)
-        
+    # 1. Validate required fields declared in skill
+    for field in skill.get("required_fields", []):
+        val = collected.get(field)
+        if field == "items":
+            if not val or not isinstance(val, list) or len(val) == 0:
+                all_required_filled = False
+                missing_parameters.append("items")
+            else:
+                for entry in val:
+                    if not entry.get("item_code"):
+                        all_required_filled = False
+                        if "item_code" not in missing_parameters:
+                            missing_parameters.append("item_code")
+                    if entry.get("qty") is None or float(entry.get("qty", 0)) <= 0:
+                        all_required_filled = False
+                        if "qty" not in missing_parameters:
+                            missing_parameters.append("qty")
+        else:
+            if val is None or str(val).strip() == "":
+                all_required_filled = False
+                missing_parameters.append(field)
+                
+    # 2. Evaluate declarative validation rules
     rules = skill.get("validation_rules", [])
     if rules:
         rules_ok, rules_missing = evaluate_validation_rules(collected, rules)
         if not rules_ok:
-            all_required_filled = False
-            for m in rules_missing:
-                if m not in missing_parameters:
-                    missing_parameters.append(m)
+            # Reapply skill defaults if an invalid date was cleared
+            defaults = skill.get("defaults", [])
+            if defaults:
+                collected = apply_skill_defaults(collected, defaults)
+                # Re-validate with applied defaults
+                rules_ok, rules_missing = evaluate_validation_rules(collected, rules)
+                
+            if not rules_ok:
+                all_required_filled = False
+                for m in rules_missing:
+                    if m not in missing_parameters:
+                        missing_parameters.append(m)
 
     return {
         "all_required_filled": all_required_filled,
@@ -484,14 +516,14 @@ def ask_for_missing_info_node(state: AgentState):
         f"You are an ERPNext AI Assistant.\n"
         f"We are running the skill: '{intent}'.\n"
         f"The following required parameters are missing: {missing}.\n"
-        f"Write a friendly request asking the user to provide these missing details."
+        f"Write a friendly, concise request asking the user to provide these missing details."
     )
     
     response_text = invoke_llm(prompt)
     if "Error" in response_text or not response_text.strip():
         response_text = f"I need some more details to proceed: {', '.join(missing)}. Please provide them."
         
-    return {"final_response": response_text}
+    return {"final_response": response_text, "is_workflow_complete": False}
 
 
 def call_generic_tool_node(state: AgentState):
@@ -502,35 +534,9 @@ def call_generic_tool_node(state: AgentState):
     if not skill:
         return {"tool_raw_response": {"success": False, "error": "Skill not found"}}
         
-    prompt = (
-        f"Determine which generic CRUD tool to call and its parameters based on the skill instructions and collected fields.\n"
-        f"Available tools:\n"
-        f"- `add_doctype(doctype_name: str, parameters: dict)`: Create a new document\n"
-        f"- `list_doctype(doctype_name: str, parameters: dict)`: Query documents\n"
-        f"- `update_doctype(doctype_name: str, id: str, parameters: dict)`: Update a document\n"
-        f"- `delete_doctype(doctype_name: str, id: str)`: Delete a document\n"
-        f"\n"
-        f"Skill instructions:\n{skill['instructions']}\n"
-        f"Collected fields:\n{json.dumps(collected, indent=2)}\n"
-        f"\n"
-        f"Note: Ensure that the parameters dictionary strictly follows the schema defined in the instructions.\n"
-        f"Respond strictly with a JSON object:\n"
-        f"{{\n"
-        f"  \"tool\": \"add_doctype\" / \"list_doctype\" / \"update_doctype\" / \"delete_doctype\",\n"
-        f"  \"doctype_name\": \"<DocType>\",\n"
-        f"  \"id\": \"<record_id_if_applicable_else_null>\",\n"
-        f"  \"parameters\": {{ ... }} # Parameters to pass to the tool\n"
-        f"}}"
-    )
-    
-    res = invoke_structured_llm(prompt)
-    if not res:
-        res = _offline_fallback_tool_resolver(intent, collected)
-            
-    tool = res.get("tool")
-    doctype_name = res.get("doctype_name")
-    record_id = res.get("id")
-    parameters = res.get("parameters", {})
+    tool = skill.get("tool", "list_doctype")
+    doctype_name = skill.get("doctype", "")
+    record_id = collected.get("id") or collected.get("name")
     
     # Whitelist check
     if not is_doctype_allowed(doctype_name):
@@ -548,7 +554,58 @@ def call_generic_tool_node(state: AgentState):
             }
         }
         
-    # Execute tool
+    # Build tool parameters dynamically from skill metadata
+    parameters = {}
+    if tool == "list_doctype":
+        query_def = skill.get("query_parameters", {})
+        raw_filters = query_def.get("filters", [])
+        formatted_filters = []
+        for flt in raw_filters:
+            if isinstance(flt, list) and len(flt) == 3:
+                field_name, op, template_val = flt
+                val = str(template_val)
+                for k, v in collected.items():
+                    val = val.replace(f"%{{{k}}}%", f"%{v}%").replace(f"{{{k}}}", str(v))
+                formatted_filters.append([field_name, op, val])
+                
+        # Optional filters
+        for opt in query_def.get("optional_filters", []):
+            field_name = opt.get("field")
+            if field_name and collected.get(field_name):
+                flt = opt.get("filter")
+                if isinstance(flt, list) and len(flt) == 3:
+                    f_name, op, template_val = flt
+                    val = str(template_val).replace(f"%{{{field_name}}}%", f"%{collected.get(field_name)}%").replace(f"{{{field_name}}}", str(collected.get(field_name)))
+                    formatted_filters.append([f_name, op, val])
+                    
+        parameters = {
+            "filters": formatted_filters,
+            "fields": query_def.get("fields", [])
+        }
+        
+    elif tool == "add_doctype":
+        ps = skill.get("payload_structure", {})
+        parameters = dict(ps.get("fixed", {}))
+        
+        # Field mappings
+        for k, v in ps.get("field_mappings", {}).items():
+            if collected.get(v) is not None:
+                parameters[k] = collected.get(v)
+                
+        # Child table defaults
+        child_defaults = ps.get("child_defaults", {})
+        if "items" in parameters and isinstance(parameters["items"], list):
+            for row in parameters["items"]:
+                for dk, dv in child_defaults.items():
+                    if dk not in row or not row[dk] or str(row[dk]).lower() == "default":
+                        row[dk] = dv
+                        
+    elif tool == "update_doctype":
+        parameters = dict(collected)
+        parameters.pop("id", None)
+        parameters.pop("name", None)
+
+    # Execute generic CRUD tool
     logger.info(f"Calling generic tool: {tool} on DocType: {doctype_name} with params: {parameters}")
     try:
         if tool == "add_doctype":
@@ -562,7 +619,7 @@ def call_generic_tool_node(state: AgentState):
         else:
             tool_res = {"success": False, "error": f"Unknown tool: {tool}"}
     except Exception as e:
-        logger.exception("Error calling tool")
+        logger.exception("Error calling generic tool")
         tool_res = {"success": False, "error": str(e)}
         
     return {
@@ -575,32 +632,95 @@ def call_generic_tool_node(state: AgentState):
 def format_agent_message_node(state: AgentState):
     intent = state.get("detected_intent", "")
     tool_raw_response = state.get("tool_raw_response", {}) or {}
+    collected = state.get("collected_fields", {}) or {}
     messages = state.get("messages", [])
     
     skill = next((s for s in loaded_skills if s["name"] == intent), None)
     if not skill:
         return {"final_response": "I couldn't process this request.", "is_workflow_complete": True}
         
+    success = tool_raw_response.get("success", False)
+    error = tool_raw_response.get("error")
+    data = tool_raw_response.get("data")
+    
     prompt = (
         f"You are an ERPNext AI Assistant.\n"
-        f"Skill name: {skill['name']}\n"
-        f"Skill instructions:\n{skill['instructions']}\n"
-        f"User's query/history: {messages}\n"
-        f"Raw Tool Execution Output:\n{json.dumps(tool_raw_response, indent=2)}\n"
-        f"\n"
-        f"Please format the final response for the user as guided by the skill instructions.\n"
-        f"If the tool execution failed (success is false) or returned an error, explain the error clearly to the user so they know what went wrong (do not swallow or hide the validation error, so they can correct parameters if needed)."
+        f"Skill: {skill['name']}\n"
+        f"User query: {messages[-1].content if messages else ''}\n"
+        f"Raw tool execution output:\n{json.dumps(tool_raw_response, indent=2)}\n"
+        f"Format a helpful, clean response for the user based on the tool results."
     )
-    
     response_text = invoke_llm(prompt)
+    
+    # Declarative Template Fallback Rendering
     if "Error" in response_text or not response_text.strip():
-        success = tool_raw_response.get("success", False)
-        error = tool_raw_response.get("error")
         if not success:
-            response_text = f"Tool execution failed. Error details: {error}"
+            if error and ("not permitted by whitelist" in str(error) or "403" in str(error)):
+                response_text = f"Permission Error: {error}"
+            elif skill.get("error_template"):
+                err_tmpl = skill.get("error_template")
+                response_text = err_tmpl.replace("{error}", str(error))
+            else:
+                response_text = f"Operation failed: {error}"
         else:
-            response_text = "I encountered an error trying to format the results. Please try again."
-            
+            # Succeeded
+            if isinstance(data, list):
+                if not data:
+                    not_found_tmpl = skill.get("not_found_message")
+                    has_params = any(str(v).strip() for v in collected.values() if v is not None)
+                    if not_found_tmpl and has_params:
+                        response_text = not_found_tmpl
+                        for k, v in collected.items():
+                            response_text = response_text.replace(f"{{{k}}}", str(v))
+                    else:
+                        response_text = "I encountered an error trying to format the results. Please try again."
+                else:
+                    # Single or multiple records rendering via response_template
+                    resp_tmpl = skill.get("response_template", "")
+                    if resp_tmpl and len(data) == 1:
+                        rec = data[0]
+                        response_text = resp_tmpl
+                        for k, v in rec.items():
+                            response_text = response_text.replace(f"{{{k}}}", str(v) if v is not None else "N/A")
+                        for k, v in collected.items():
+                            response_text = response_text.replace(f"{{{k}}}", str(v) if v is not None else "N/A")
+                    else:
+                        # Multi-record or inventory table/summary rendering
+                        first_row = data[0]
+                        if "actual_qty" in first_row and "warehouse" in first_row:
+                            item_code_val = collected.get("item_code", "item")
+                            lines = [f"**Inventory Availability Check**\n\nBased on the current inventory levels, here's the availability status for the item \"{item_code_val}\":\n"]
+                            total_qty = 0.0
+                            for row in data:
+                                w = row.get("warehouse", "Unknown")
+                                q = float(row.get("actual_qty", 0))
+                                total_qty += q
+                                lines.append(f"- **Warehouse**: {w} | **Actual Qty**: {q}")
+                            lines.append(f"\n**Total Available Quantity**: {total_qty}")
+                            response_text = "\n".join(lines)
+                        elif resp_tmpl:
+                            rec = data[0]
+                            response_text = resp_tmpl
+                            for k, v in rec.items():
+                                response_text = response_text.replace(f"{{{k}}}", str(v) if v is not None else "N/A")
+                            for k, v in collected.items():
+                                response_text = response_text.replace(f"{{{k}}}", str(v) if v is not None else "N/A")
+                        else:
+                            response_text = "Action completed successfully."
+                            
+            elif isinstance(data, dict):
+                resp_tmpl = skill.get("response_template", "")
+                if resp_tmpl:
+                    response_text = resp_tmpl
+                    for k, v in data.items():
+                        response_text = response_text.replace(f"{{{k}}}", str(v) if v is not None else "N/A")
+                    for k, v in collected.items():
+                        response_text = response_text.replace(f"{{{k}}}", str(v) if v is not None else "N/A")
+                else:
+                    response_text = f"Action completed successfully: {data.get('name', 'OK')}"
+            else:
+                response_text = "Action completed successfully."
+        
     return {"final_response": response_text, "is_workflow_complete": True}
 
 
@@ -611,6 +731,7 @@ def fallback_response_node(state: AgentState):
         "- Creating a Sales Order (e.g. 'Create a sales order for customer ABC with item XYZ qty 10')\n"
         "- Checking stock / inventory (e.g. 'Check stock for SKU005' or 'Do we have 40 Headphones (SKU009)?')\n"
         "- Looking up customer details (e.g. 'Look up customer West View Software Ltd.')\n"
+        "- Looking up item details (e.g. 'Look up item SKU001')\n"
         "\n"
         "How can I help you today?"
     )
@@ -626,15 +747,16 @@ def format_response_node(state: AgentState):
     final_resp = state.get("final_response", "")
     return {"messages": [AIMessage(content=final_resp)]}
 
-# Routers
 
+# Routers
 def route_by_intent_and_auth(state: AgentState):
     intent = state.get("detected_intent", "fallback")
     roles = state.get("user_roles", [])
     
-    if intent in ROLE_RULES:
-        allowed = ROLE_RULES[intent]
-        if not any(r in roles for r in allowed):
+    skill = next((s for s in loaded_skills if s["name"] == intent), None)
+    if skill:
+        allowed = skill.get("allowed_roles", [])
+        if allowed and not any(r in roles for r in allowed):
             logger.warning(f"User unauthorized for intent {intent}. User roles: {roles}")
             return "unauthorized"
             
