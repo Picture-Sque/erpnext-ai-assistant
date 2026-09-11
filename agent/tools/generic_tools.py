@@ -14,20 +14,21 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(ch)
 
-# Import shared ERPNext client settings and auth headers
 try:
     from agent.tools.erpnext_client import get_auth_headers, ERPNEXT_BASE_URL
 except ImportError:
     from tools.erpnext_client import get_auth_headers, ERPNEXT_BASE_URL
 
-DEFAULT_WHITELIST = ["Customer", "Item", "Sales Order", "Bin"]
-
+DEFAULT_WHITELIST = [
+    "Customer", "Item", "Sales Order", "Bin",
+    "Quotation", "Sales Invoice", "Purchase Order",
+    # Added for new skills (Batch A-C, September 2026):
+    "Supplier",              # create-purchase-order entity resolution
+    "Sales Order Item",      # sales-analytics-report aggregate on child table
+    "Purchase Order Item",   # purchase-order-lookup item-based PO check
+]
 
 def get_allowed_doctypes() -> List[str]:
-    """
-    Retrieves the list of whitelisted DocTypes from environment or configuration.
-    Defaults to ["Customer", "Item", "Sales Order", "Bin"].
-    """
     env_val = os.getenv("DOCTYPE_WHITELIST") or os.getenv("ALLOWED_DOCTYPES")
     if env_val:
         items = [item.strip() for item in env_val.split(",") if item.strip()]
@@ -35,23 +36,14 @@ def get_allowed_doctypes() -> List[str]:
             return items
     return DEFAULT_WHITELIST
 
-
 def is_doctype_allowed(doctype_name: str) -> bool:
-    """
-    Checks if a given DocType name is present in the whitelist (case-insensitive).
-    """
     if not doctype_name:
         return False
     allowed = get_allowed_doctypes()
     allowed_lower = {dt.lower() for dt in allowed}
     return doctype_name.strip().lower() in allowed_lower
 
-
 def extract_erpnext_error(response: httpx.Response) -> str:
-    """
-    Extracts human-readable error details from ERPNext HTTP responses.
-    Handles Frappe _server_messages, exception strings, message fields, or raw text.
-    """
     try:
         body = response.json()
         if isinstance(body, dict):
@@ -85,268 +77,262 @@ def extract_erpnext_error(response: httpx.Response) -> str:
         pass
     return f"HTTP {response.status_code}: {response.text}"
 
-
-def add_doctype(doctype_name: str, parameters: dict) -> dict:
+def _format_result(status: str, data: Any = None, error: Optional[str] = None, has_more: bool = False) -> dict:
     """
-    Creates a new document of type <doctype_name> via POST /api/resource/<doctype_name>.
-    Body = parameters (passed through as-is).
+    Format standard tool response.
+    status must be one of: "success", "empty", "permission_denied", "not_found", "system_error"
     """
-    if not is_doctype_allowed(doctype_name):
-        allowed = get_allowed_doctypes()
-        msg = f"DocType '{doctype_name}' is not permitted by whitelist. Allowed DocTypes: {', '.join(allowed)}"
-        logger.warning(msg)
-        return {
-            "status_code": 403,
-            "success": False,
-            "data": None,
-            "error": msg
-        }
+    return {
+        "status": status,
+        "data": data,
+        "error": error,
+        "has_more": has_more,
+        "success": status in ("success", "empty")
+    }
 
-    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype_name}"
+def get_list(doctype: str, filters: Optional[dict] = None, fields: Optional[list] = None, limit: Optional[int] = None) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist. Allowed DocTypes: {', '.join(get_allowed_doctypes())}")
+
+    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}"
     headers = get_auth_headers()
-    body_payload = parameters if isinstance(parameters, dict) else {}
-
-    logger.info(f"REST Call: POST {url}")
-    logger.info(f"Payload: {body_payload}")
-
-    try:
-        with httpx.Client() as client:
-            response = client.post(url, headers=headers, json=body_payload, timeout=60.0)
-            logger.info(f"Response Status: {response.status_code}")
-
-            if response.is_success:
-                try:
-                    resp_json = response.json()
-                    data = resp_json.get("data", resp_json)
-                except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": True,
-                    "data": data,
-                    "error": None
-                }
-            else:
-                error_msg = extract_erpnext_error(response)
-                try:
-                    data = response.json()
-                except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": False,
-                    "data": data,
-                    "error": error_msg
-                }
-    except Exception as e:
-        logger.exception(f"Exception in add_doctype for '{doctype_name}'")
-        return {
-            "status_code": 500,
-            "success": False,
-            "data": None,
-            "error": str(e)
-        }
-
-
-def list_doctype(doctype_name: str, parameters: Optional[dict] = None) -> dict:
-    """
-    Queries documents of type <doctype_name> via GET /api/resource/<doctype_name>.
-    Encodes filters, fields, limit/limit_page_length, limit_start, order_by into query string.
-    """
-    if not is_doctype_allowed(doctype_name):
-        allowed = get_allowed_doctypes()
-        msg = f"DocType '{doctype_name}' is not permitted by whitelist. Allowed DocTypes: {', '.join(allowed)}"
-        logger.warning(msg)
-        return {
-            "status_code": 403,
-            "success": False,
-            "data": None,
-            "error": msg
-        }
-
-    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype_name}"
-    headers = get_auth_headers()
-    raw_params = dict(parameters) if isinstance(parameters, dict) else {}
-
-    # Build ERPNext expected query params dictionary
-    query_params: Dict[str, Any] = {}
-
-    for key, val in raw_params.items():
-        if key == "filters":
-            if isinstance(val, (list, dict)):
-                query_params["filters"] = json.dumps(val)
-            else:
-                query_params["filters"] = str(val)
-        elif key == "fields":
-            if isinstance(val, list):
-                query_params["fields"] = json.dumps(val)
-            else:
-                query_params["fields"] = str(val)
-        elif key == "limit" and "limit_page_length" not in raw_params:
-            query_params["limit_page_length"] = str(val)
-        elif isinstance(val, (list, dict)):
-            query_params[key] = json.dumps(val)
+    
+    query_params = {}
+    if filters:
+        if isinstance(filters, list) or isinstance(filters, dict):
+            query_params["filters"] = json.dumps(filters)
         else:
-            query_params[key] = str(val)
-
-    logger.info(f"REST Call: GET {url}")
-    logger.info(f"Query Params: {query_params}")
+            query_params["filters"] = str(filters)
+    if fields:
+        if isinstance(fields, list):
+            query_params["fields"] = json.dumps(fields)
+        else:
+            query_params["fields"] = str(fields)
+    
+    # We fetch limit + 1 to determine if has_more is true
+    actual_limit = limit if limit else 20
+    query_params["limit_page_length"] = str(actual_limit + 1)
 
     try:
         with httpx.Client() as client:
             response = client.get(url, headers=headers, params=query_params, timeout=60.0)
-            logger.info(f"Response Status: {response.status_code}")
-
             if response.is_success:
                 try:
                     resp_json = response.json()
-                    data = resp_json.get("data", resp_json)
+                    data = resp_json.get("data", [])
+                    has_more = len(data) > actual_limit
+                    if has_more:
+                        data = data[:actual_limit]
+                    return _format_result("success" if data else "empty", data=data, has_more=has_more)
                 except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": True,
-                    "data": data,
-                    "error": None
-                }
+                    return _format_result("system_error", error="Invalid JSON response from ERPNext")
+            elif response.status_code == 404:
+                return _format_result("not_found", error=extract_erpnext_error(response))
+            elif response.status_code in (401, 403):
+                return _format_result("permission_denied", error=extract_erpnext_error(response))
             else:
-                error_msg = extract_erpnext_error(response)
-                try:
-                    data = response.json()
-                except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": False,
-                    "data": data,
-                    "error": error_msg
-                }
+                return _format_result("system_error", error=extract_erpnext_error(response))
     except Exception as e:
-        logger.exception(f"Exception in list_doctype for '{doctype_name}'")
-        return {
-            "status_code": 500,
-            "success": False,
-            "data": None,
-            "error": str(e)
-        }
+        return _format_result("system_error", error=str(e))
 
+def create_document(doctype: str, fields: dict) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-def update_doctype(doctype_name: str, id: str, parameters: dict) -> dict:
-    """
-    Updates an existing document of type <doctype_name> via PUT /api/resource/<doctype_name>/<id>.
-    Body = parameters (passed through as-is).
-    """
-    if not is_doctype_allowed(doctype_name):
-        allowed = get_allowed_doctypes()
-        msg = f"DocType '{doctype_name}' is not permitted by whitelist. Allowed DocTypes: {', '.join(allowed)}"
-        logger.warning(msg)
-        return {
-            "status_code": 403,
-            "success": False,
-            "data": None,
-            "error": msg
-        }
-
-    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype_name}/{id}"
+    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}"
     headers = get_auth_headers()
-    body_payload = parameters if isinstance(parameters, dict) else {}
-
-    logger.info(f"REST Call: PUT {url}")
-    logger.info(f"Payload: {body_payload}")
-
     try:
         with httpx.Client() as client:
-            response = client.put(url, headers=headers, json=body_payload, timeout=60.0)
-            logger.info(f"Response Status: {response.status_code}")
-
+            response = client.post(url, headers=headers, json=fields, timeout=60.0)
             if response.is_success:
                 try:
                     resp_json = response.json()
                     data = resp_json.get("data", resp_json)
+                    return _format_result("success", data=data)
                 except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": True,
-                    "data": data,
-                    "error": None
-                }
+                    return _format_result("system_error", error="Invalid JSON response")
+            elif response.status_code == 404:
+                return _format_result("not_found", error=extract_erpnext_error(response))
+            elif response.status_code in (401, 403):
+                return _format_result("permission_denied", error=extract_erpnext_error(response))
             else:
-                error_msg = extract_erpnext_error(response)
-                try:
-                    data = response.json()
-                except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": False,
-                    "data": data,
-                    "error": error_msg
-                }
+                return _format_result("system_error", error=extract_erpnext_error(response))
     except Exception as e:
-        logger.exception(f"Exception in update_doctype for '{doctype_name}/{id}'")
-        return {
-            "status_code": 500,
-            "success": False,
-            "data": None,
-            "error": str(e)
-        }
+        return _format_result("system_error", error=str(e))
 
+def update_document(doctype: str, name: str, fields: dict) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-def delete_doctype(doctype_name: str, id: str) -> dict:
-    """
-    Deletes a document of type <doctype_name> via DELETE /api/resource/<doctype_name>/<id>.
-    """
-    if not is_doctype_allowed(doctype_name):
-        allowed = get_allowed_doctypes()
-        msg = f"DocType '{doctype_name}' is not permitted by whitelist. Allowed DocTypes: {', '.join(allowed)}"
-        logger.warning(msg)
-        return {
-            "status_code": 403,
-            "success": False,
-            "data": None,
-            "error": msg
-        }
-
-    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype_name}/{id}"
+    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}/{name}"
     headers = get_auth_headers()
+    try:
+        with httpx.Client() as client:
+            response = client.put(url, headers=headers, json=fields, timeout=60.0)
+            if response.is_success:
+                try:
+                    resp_json = response.json()
+                    data = resp_json.get("data", resp_json)
+                    return _format_result("success", data=data)
+                except Exception:
+                    return _format_result("system_error", error="Invalid JSON response")
+            elif response.status_code == 404:
+                return _format_result("not_found", error=extract_erpnext_error(response))
+            elif response.status_code in (401, 403):
+                return _format_result("permission_denied", error=extract_erpnext_error(response))
+            else:
+                return _format_result("system_error", error=extract_erpnext_error(response))
+    except Exception as e:
+        return _format_result("system_error", error=str(e))
 
-    logger.info(f"REST Call: DELETE {url}")
+def delete_document(doctype: str, name: str) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
+    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}/{name}"
+    headers = get_auth_headers()
     try:
         with httpx.Client() as client:
             response = client.delete(url, headers=headers, timeout=60.0)
-            logger.info(f"Response Status: {response.status_code}")
+            if response.is_success:
+                return _format_result("success", data="deleted")
+            elif response.status_code == 404:
+                return _format_result("not_found", error=extract_erpnext_error(response))
+            elif response.status_code in (401, 403):
+                return _format_result("permission_denied", error=extract_erpnext_error(response))
+            else:
+                return _format_result("system_error", error=extract_erpnext_error(response))
+    except Exception as e:
+        return _format_result("system_error", error=str(e))
 
+def get_document(doctype: str, name: str) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+
+    url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}/{name}"
+    headers = get_auth_headers()
+    try:
+        with httpx.Client() as client:
+            response = client.get(url, headers=headers, timeout=60.0)
             if response.is_success:
                 try:
                     resp_json = response.json()
                     data = resp_json.get("data", resp_json)
+                    return _format_result("success", data=data)
                 except Exception:
-                    data = response.text or "ok"
-                return {
-                    "status_code": response.status_code,
-                    "success": True,
-                    "data": data,
-                    "error": None
-                }
+                    return _format_result("system_error", error="Invalid JSON response")
+            elif response.status_code == 404:
+                return _format_result("not_found", error=extract_erpnext_error(response))
+            elif response.status_code in (401, 403):
+                return _format_result("permission_denied", error=extract_erpnext_error(response))
             else:
-                error_msg = extract_erpnext_error(response)
-                try:
-                    data = response.json()
-                except Exception:
-                    data = response.text
-                return {
-                    "status_code": response.status_code,
-                    "success": False,
-                    "data": data,
-                    "error": error_msg
-                }
+                return _format_result("system_error", error=extract_erpnext_error(response))
     except Exception as e:
-        logger.exception(f"Exception in delete_doctype for '{doctype_name}/{id}'")
-        return {
-            "status_code": 500,
-            "success": False,
-            "data": None,
-            "error": str(e)
-        }
+        return _format_result("system_error", error=str(e))
+
+def search_document(doctype: str, query: str) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+
+    search_fields_map = {
+        "Customer": "customer_name",
+        "Item": "item_name",
+        "Sales Order": "name",
+        "Bin": "item_code",
+        "Quotation": "name",
+        "Sales Invoice": "name",
+        "Purchase Order": "name",
+        "Supplier": "supplier_name"
+    }
+    display_fields_map = {
+        "Customer": ["name", "customer_name", "customer_group", "territory"],
+        "Item": ["name", "item_code", "item_name", "item_group"],
+        "Sales Order": ["name", "customer", "status"],
+        "Bin": ["name", "item_code", "warehouse", "actual_qty"],
+        "Quotation": ["name", "customer", "status"],
+        "Sales Invoice": ["name", "customer", "status"],
+        "Purchase Order": ["name", "supplier", "status"],
+        "Supplier": ["name", "supplier_name", "supplier_group"]
+    }
+    
+    primary_field = search_fields_map.get(doctype, "name")
+    display_fields = display_fields_map.get(doctype, ["name"])
+    
+    filters = [[primary_field, "like", f"%{query}%"]]
+    
+    return get_list(doctype, filters=filters, fields=display_fields, limit=10)
+
+def get_count(doctype: str, filters: Optional[dict] = None) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+    
+    # Fetching name to keep payload size minimal
+    res = get_list(doctype, filters=filters, fields=["name"], limit=999999)
+    if res["status"] in ("success", "empty"):
+        data_list = res.get("data", [])
+        count = len(data_list)
+        return _format_result("empty" if count == 0 else "success", data=count)
+    return res
+
+def aggregate(doctype: str, group_by: str, metric: str, aggregation_fn: str, filters: Optional[dict] = None, sort: Optional[str] = None, limit: Optional[int] = None) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+    
+    # We compute aggregation tool-level, fetching all required fields first.
+    fields = ["name", group_by, metric]
+    res = get_list(doctype, filters=filters, fields=fields, limit=999999)
+    if res["status"] not in ("success", "empty"):
+        return res
+    
+    data = res.get("data", [])
+    if not data:
+        return _format_result("empty", data=[])
+    
+    agg = {}
+    counts = {}
+    
+    for row in data:
+        g_val = str(row.get(group_by, "Unknown"))
+        m_val = float(row.get(metric, 0)) if aggregation_fn != "count" else 1
+        
+        if g_val not in agg:
+            agg[g_val] = 0 if aggregation_fn in ("sum", "avg", "count") else m_val
+            counts[g_val] = 0
+            
+        counts[g_val] += 1
+        if aggregation_fn in ("sum", "avg", "count"):
+            agg[g_val] += m_val
+        elif aggregation_fn == "max":
+            agg[g_val] = max(agg[g_val], m_val)
+        elif aggregation_fn == "min":
+            agg[g_val] = min(agg[g_val], m_val)
+            
+    result_list = []
+    for g_val, val in agg.items():
+        if aggregation_fn == "avg" and counts[g_val] > 0:
+            val = val / counts[g_val]
+        result_list.append({group_by: g_val, metric: val})
+        
+    if sort:
+        parts = sort.split()
+        if len(parts) == 2 and parts[1].lower() == "desc":
+            result_list.sort(key=lambda x: x.get(parts[0], 0), reverse=True)
+        else:
+            result_list.sort(key=lambda x: x.get(parts[0], 0))
+            
+    if limit:
+        result_list = result_list[:limit]
+        
+    return _format_result("success", data=result_list)
+
+def cancel_document(doctype: str, name: str) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+        
+    return update_document(doctype, name, {"docstatus": 2})
+
+def submit_document(doctype: str, name: str) -> dict:
+    if not is_doctype_allowed(doctype):
+        return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+        
+    return update_document(doctype, name, {"docstatus": 1})

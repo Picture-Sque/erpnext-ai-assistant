@@ -70,10 +70,17 @@ def init_db() -> None:
                 current_skill TEXT DEFAULT '',
                 collected_fields TEXT DEFAULT '{}',
                 workflow_complete INTEGER DEFAULT 0,
+                extra_state TEXT DEFAULT '{}',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );
         """)
+
+        # Migration: ensure extra_state column exists in existing databases
+        cursor.execute("PRAGMA table_info(conversation_state);")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "extra_state" not in columns:
+            cursor.execute("ALTER TABLE conversation_state ADD COLUMN extra_state TEXT DEFAULT '{}';")
         
         # Create index on session_id for fast lookup
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversations_session_id ON conversations(session_id);")
@@ -101,7 +108,7 @@ def get_or_create_conversation(session_id: str, user_id: str = "") -> int:
         conversation_id = cursor.lastrowid
         
         cursor.execute(
-            "INSERT OR IGNORE INTO conversation_state (conversation_id, detected_intent, current_skill, collected_fields, workflow_complete, updated_at) VALUES (?, '', '', '{}', 0, ?);",
+            "INSERT OR IGNORE INTO conversation_state (conversation_id, detected_intent, current_skill, collected_fields, workflow_complete, extra_state, updated_at) VALUES (?, '', '', '{}', 0, '{}', ?);",
             (conversation_id, now)
         )
         conn.commit()
@@ -138,7 +145,7 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
             
             # Load state
             cursor.execute(
-                "SELECT detected_intent, current_skill, collected_fields, workflow_complete FROM conversation_state WHERE conversation_id = ?;",
+                "SELECT detected_intent, current_skill, collected_fields, workflow_complete, extra_state FROM conversation_state WHERE conversation_id = ?;",
                 (conversation_id,)
             )
             state_row = cursor.fetchone()
@@ -146,6 +153,7 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
             detected_intent = ""
             collected_fields = {}
             workflow_complete = False
+            extra_state = {}
             
             if state_row:
                 detected_intent = state_row["detected_intent"] or ""
@@ -157,6 +165,14 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
                     except Exception as e:
                         logger.error(f"Error parsing collected_fields JSON for session {session_id}: {e}")
                         collected_fields = {}
+                
+                extra_raw = state_row["extra_state"] if "extra_state" in state_row.keys() else None
+                if extra_raw:
+                    try:
+                        extra_state = json.loads(extra_raw)
+                    except Exception as e:
+                        logger.error(f"Error parsing extra_state JSON for session {session_id}: {e}")
+                        extra_state = {}
             
             return {
                 "messages": messages,
@@ -164,7 +180,13 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
                 "collected_fields": collected_fields,
                 "final_response": "",
                 "user_roles": user_roles,
-                "is_workflow_complete": workflow_complete
+                "is_workflow_complete": workflow_complete,
+                "pending_confirmation": extra_state.get("pending_confirmation"),
+                "ambiguous_candidates": extra_state.get("ambiguous_candidates"),
+                "clarification_target": extra_state.get("clarification_target"),
+                "clarification_attempts": extra_state.get("clarification_attempts") or 0,
+                "resolved_entities": extra_state.get("resolved_entities") or {},
+                "bulk_operation_scope": extra_state.get("bulk_operation_scope"),
             }
     except Exception as e:
         logger.exception(f"Failed to load session state for {session_id}: {e}")
@@ -174,7 +196,13 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
             "collected_fields": {},
             "final_response": "",
             "user_roles": user_roles,
-            "is_workflow_complete": False
+            "is_workflow_complete": False,
+            "pending_confirmation": None,
+            "ambiguous_candidates": None,
+            "clarification_target": None,
+            "clarification_attempts": 0,
+            "resolved_entities": {},
+            "bulk_operation_scope": None,
         }
 
 
@@ -206,7 +234,8 @@ def update_session_state(
     detected_intent: str = "",
     collected_fields: Optional[Dict[str, Any]] = None,
     current_skill: str = "",
-    is_complete: bool = False
+    is_complete: bool = False,
+    extra_state: Optional[Dict[str, Any]] = None
 ) -> None:
     """
     Updates slot filling and workflow state in SQLite for the given session.
@@ -215,6 +244,7 @@ def update_session_state(
         conversation_id = get_or_create_conversation(session_id)
         collected_fields = collected_fields or {}
         fields_json = json.dumps(collected_fields)
+        extra_json = json.dumps(extra_state or {})
         complete_int = 1 if is_complete else 0
         now = datetime.utcnow().isoformat()
         
@@ -222,16 +252,17 @@ def update_session_state(
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO conversation_state (conversation_id, detected_intent, current_skill, collected_fields, workflow_complete, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO conversation_state (conversation_id, detected_intent, current_skill, collected_fields, workflow_complete, extra_state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(conversation_id) DO UPDATE SET
                     detected_intent = excluded.detected_intent,
                     current_skill = excluded.current_skill,
                     collected_fields = excluded.collected_fields,
                     workflow_complete = excluded.workflow_complete,
+                    extra_state = excluded.extra_state,
                     updated_at = excluded.updated_at;
                 """,
-                (conversation_id, detected_intent, current_skill, fields_json, complete_int, now)
+                (conversation_id, detected_intent, current_skill, fields_json, complete_int, extra_json, now)
             )
             cursor.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?;",
@@ -255,7 +286,7 @@ def reset_session_state(session_id: str) -> None:
                 conversation_id = row["id"]
                 cursor.execute("DELETE FROM messages WHERE conversation_id = ?;", (conversation_id,))
                 cursor.execute(
-                    "UPDATE conversation_state SET detected_intent = '', current_skill = '', collected_fields = '{}', workflow_complete = 0, updated_at = ? WHERE conversation_id = ?;",
+                    "UPDATE conversation_state SET detected_intent = '', current_skill = '', collected_fields = '{}', workflow_complete = 0, extra_state = '{}', updated_at = ? WHERE conversation_id = ?;",
                     (datetime.utcnow().isoformat(), conversation_id)
                 )
                 cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?;", (datetime.utcnow().isoformat(), conversation_id))

@@ -9,7 +9,7 @@ allowed_roles:
   - Sales Manager
   - System Manager
   - Administrator
-tool: list_doctype
+tool: get_list
 doctype: Bin
 required_fields:
   - item_code
@@ -64,4 +64,4 @@ Trigger this skill when the user wants to know current stock quantity for one or
 - Source: `Bin` doctype (holds `item_code`, `warehouse`, `actual_qty`)
 
 ## Tool
-Tool name: `list_doctype` with DocType `Bin`.
+Tool name: `get_list` with DocType `Bin`.

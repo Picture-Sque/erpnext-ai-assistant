@@ -176,6 +176,7 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
 # Request and Response models
 class ChatRequest(BaseModel):
     message: str
+    conversation_id: str = None
 
 class ChatResponse(BaseModel):
     response: str
@@ -186,7 +187,7 @@ session_store = {}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_token)):
-    session_id = payload.get("sub")
+    session_id = request.conversation_id or payload.get("sub")
     if not session_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -219,7 +220,7 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
         # For READ operations (customer lookup, inventory) keep intent/fields so
         # follow-up questions like "What is their customer group?" still work.
         target_tool = updated_state.get("target_tool", "")
-        is_write_op = target_tool in ("add_doctype", "update_doctype", "delete_doctype")
+        is_write_op = target_tool in ("create_document", "update_document", "delete_document", "cancel_document", "submit_document")
         
         should_reset = (
             (updated_state.get("is_workflow_complete") and is_write_op) or
@@ -229,19 +230,32 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             "Permission Denied" in final_resp
         )
         
+        extra_state = {}
+        if not updated_state.get("is_workflow_complete"):
+            extra_state = {
+                "pending_confirmation": updated_state.get("pending_confirmation"),
+                "ambiguous_candidates": updated_state.get("ambiguous_candidates"),
+                "clarification_target": updated_state.get("clarification_target"),
+                "clarification_attempts": updated_state.get("clarification_attempts"),
+                "resolved_entities": updated_state.get("resolved_entities"),
+                "bulk_operation_scope": updated_state.get("bulk_operation_scope"),
+            }
+        
         if should_reset:
             chat_store.update_session_state(
                 session_id,
                 detected_intent="",
                 collected_fields={},
-                is_complete=True
+                is_complete=True,
+                extra_state={}
             )
         else:
             chat_store.update_session_state(
                 session_id,
                 detected_intent=updated_state.get("detected_intent", ""),
                 collected_fields=updated_state.get("collected_fields", {}),
-                is_complete=updated_state.get("is_workflow_complete", False)
+                is_complete=updated_state.get("is_workflow_complete", False),
+                extra_state=extra_state
             )
             
         return ChatResponse(response=final_resp)
@@ -269,7 +283,7 @@ async def reset_session(payload: dict = Depends(verify_token)):
 
 
 # Standalone endpoints for Generic CRUD Tools
-from tools.generic_tools import add_doctype, list_doctype, update_doctype, delete_doctype
+from tools.generic_tools import create_document, get_list, update_document, delete_document
 
 class GenericToolRequest(BaseModel):
     doctype_name: str
@@ -278,23 +292,24 @@ class GenericToolRequest(BaseModel):
 
 @app.post("/api/tools/list")
 async def list_doctype_endpoint(request: GenericToolRequest):
-    return list_doctype(request.doctype_name, request.parameters or {})
+    params = request.parameters or {}
+    return get_list(request.doctype_name, filters=params.get("filters"), fields=params.get("fields"), limit=params.get("limit"))
 
 @app.post("/api/tools/add")
 async def add_doctype_endpoint(request: GenericToolRequest):
-    return add_doctype(request.doctype_name, request.parameters or {})
+    return create_document(request.doctype_name, request.parameters or {})
 
 @app.put("/api/tools/update")
 async def update_doctype_endpoint(request: GenericToolRequest):
     if not request.id:
         raise HTTPException(status_code=400, detail="Missing record 'id' for update")
-    return update_doctype(request.doctype_name, request.id, request.parameters or {})
+    return update_document(request.doctype_name, request.id, request.parameters or {})
 
 @app.delete("/api/tools/delete")
 async def delete_doctype_endpoint(request: GenericToolRequest):
     if not request.id:
         raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
-    return delete_doctype(request.doctype_name, request.id)
+    return delete_document(request.doctype_name, request.id)
 
 if __name__ == "__main__":
     import uvicorn

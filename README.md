@@ -108,8 +108,9 @@ ERPNEXT_BASE_URL=http://localhost:8081
 ERPNEXT_API_KEY=your_erpnext_api_key
 ERPNEXT_API_SECRET=your_erpnext_api_secret
 
-# Groq API Key (llama-3.3-70b-versatile via OpenAI SDK)
+# Groq API Key and Model (Standard non-compound model for deterministic JSON extraction)
 GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=openai/gpt-oss-120b
 ```
 
 Launch the FastAPI Agent server:

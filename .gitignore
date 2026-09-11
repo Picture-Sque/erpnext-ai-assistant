@@ -70,3 +70,18 @@ agent/.venv/
 *.db-wal
 *.db-shm
 
+# Scratch & temporary test/validation scripts
+scratch/
+validation_output.txt
+run_validation.py
+test_fail_closed*.py
+test_intent_realistic.py
+test_llm.py
+agent/run_stateless_tests.py
+agent/run_step2_tests.py
+agent/run_verification_final.py
+agent/test_intent_collision.py
+agent/test_new_skills_functional.py
+agent/test_skill_load.py
+
+

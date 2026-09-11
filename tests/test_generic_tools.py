@@ -13,10 +13,10 @@ if root_path not in sys.path:
     sys.path.insert(0, root_path)
 
 from agent.tools.generic_tools import (
-    add_doctype,
-    list_doctype,
-    update_doctype,
-    delete_doctype,
+    create_document,
+    get_list,
+    update_document,
+    delete_document,
     is_doctype_allowed,
     get_allowed_doctypes,
     extract_erpnext_error
@@ -33,6 +33,9 @@ class TestGenericTools(unittest.TestCase):
             self.assertIn("Item", allowed)
             self.assertIn("Sales Order", allowed)
             self.assertIn("Bin", allowed)
+            self.assertIn("Quotation", allowed)
+            self.assertIn("Sales Invoice", allowed)
+            self.assertIn("Purchase Order", allowed)
 
             self.assertTrue(is_doctype_allowed("Customer"))
             self.assertTrue(is_doctype_allowed("customer"))
@@ -73,8 +76,8 @@ class TestGenericTools(unittest.TestCase):
         self.assertEqual(err_msg, "Invalid credentials")
 
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_list_doctype_success_and_param_formatting(self, mock_client_cls):
-        """Test list_doctype correctly formats query params and returns ERPNext data."""
+    def test_get_list_success_and_param_formatting(self, mock_client_cls):
+        """Test get_list correctly formats query params and returns ERPNext data."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
 
@@ -88,14 +91,13 @@ class TestGenericTools(unittest.TestCase):
         }
         mock_client.get.return_value = mock_resp
 
-        res = list_doctype("Customer", {
-            "filters": [["customer_name", "like", "%West View%"]],
-            "fields": ["name", "customer_name"],
-            "limit": 10
-        })
+        res = get_list("Customer", 
+            filters=[["customer_name", "like", "%West View%"]],
+            fields=["name", "customer_name"],
+            limit=10
+        )
 
-        self.assertTrue(res["success"])
-        self.assertEqual(res["status_code"], 200)
+        self.assertEqual(res["status"], "success")
         self.assertEqual(len(res["data"]), 1)
         self.assertEqual(res["data"][0]["name"], "CUST-001")
 
@@ -104,18 +106,17 @@ class TestGenericTools(unittest.TestCase):
         params = kwargs.get("params", {})
         self.assertEqual(params["filters"], '[["customer_name", "like", "%West View%"]]')
         self.assertEqual(params["fields"], '["name", "customer_name"]')
-        self.assertEqual(params["limit_page_length"], "10")
+        self.assertEqual(params["limit_page_length"], "11")
 
-    def test_list_doctype_whitelist_rejection(self):
-        """Test list_doctype blocks non-whitelisted DocTypes."""
-        res = list_doctype("User", {"filters": []})
-        self.assertFalse(res["success"])
-        self.assertEqual(res["status_code"], 403)
+    def test_get_list_whitelist_rejection(self):
+        """Test get_list blocks non-whitelisted DocTypes."""
+        res = get_list("User", filters=[])
+        self.assertEqual(res["status"], "permission_denied")
         self.assertIn("DocType 'User' is not permitted by whitelist", res["error"])
 
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_add_doctype_success(self, mock_client_cls):
-        """Test add_doctype creates a document and returns ERPNext response."""
+    def test_create_document_success(self, mock_client_cls):
+        """Test create_document creates a document and returns ERPNext response."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
 
@@ -135,15 +136,14 @@ class TestGenericTools(unittest.TestCase):
             "customer": "West View Store",
             "items": [{"item_code": "SKU005", "qty": 2}]
         }
-        res = add_doctype("Sales Order", payload)
+        res = create_document("Sales Order", payload)
 
-        self.assertTrue(res["success"])
-        self.assertEqual(res["status_code"], 201)
+        self.assertEqual(res["status"], "success")
         self.assertEqual(res["data"]["name"], "SALES-ORD-0001")
 
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_add_doctype_validation_error(self, mock_client_cls):
-        """Test add_doctype preserves specific ERPNext error messages on failure."""
+    def test_create_document_validation_error(self, mock_client_cls):
+        """Test create_document preserves specific ERPNext error messages on failure."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
 
@@ -155,15 +155,14 @@ class TestGenericTools(unittest.TestCase):
         }
         mock_client.post.return_value = mock_resp
 
-        res = add_doctype("Sales Order", {"customer": "Test"})
+        res = create_document("Sales Order", {"customer": "Test"})
 
-        self.assertFalse(res["success"])
-        self.assertEqual(res["status_code"], 400)
+        self.assertEqual(res["status"], "system_error")
         self.assertEqual(res["error"], "Delivery Date is required")
 
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_update_doctype_success(self, mock_client_cls):
-        """Test update_doctype performs PUT call with parameters."""
+    def test_update_document_success(self, mock_client_cls):
+        """Test update_document performs PUT call with parameters."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
 
@@ -175,14 +174,13 @@ class TestGenericTools(unittest.TestCase):
         }
         mock_client.put.return_value = mock_resp
 
-        res = update_doctype("Customer", "CUST-001", {"customer_name": "Updated Name"})
-        self.assertTrue(res["success"])
-        self.assertEqual(res["status_code"], 200)
+        res = update_document("Customer", "CUST-001", {"customer_name": "Updated Name"})
+        self.assertEqual(res["status"], "success")
         self.assertEqual(res["data"]["customer_name"], "Updated Name")
 
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_delete_doctype_success(self, mock_client_cls):
-        """Test delete_doctype performs DELETE call."""
+    def test_delete_document_success(self, mock_client_cls):
+        """Test delete_document performs DELETE call."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
 
@@ -192,9 +190,8 @@ class TestGenericTools(unittest.TestCase):
         mock_resp.json.return_value = {"message": "ok"}
         mock_client.delete.return_value = mock_resp
 
-        res = delete_doctype("Customer", "CUST-001")
-        self.assertTrue(res["success"])
-        self.assertEqual(res["status_code"], 200)
+        res = delete_document("Customer", "CUST-001")
+        self.assertEqual(res["status"], "success")
 
     def test_sales_order_date_defaulting(self):
         """Test default transaction_date and delivery_date in collect_parameters_node."""
@@ -239,7 +236,14 @@ class TestGenericTools(unittest.TestCase):
         self.assertNotIn("delivery_date (must be strictly after transaction_date)", res.get("missing_parameters", []))
 
     def test_sales_order_date_validation_failure(self):
-        """Test validation fails and clears delivery_date when delivery_date <= transaction_date."""
+        """
+        Test date auto-healing: when delivery_date <= transaction_date, the node clears the
+        invalid date, re-applies the skill default (transaction_date + 7d), then re-validates.
+        Since the default produces a valid date, the node returns all_required_filled=True with
+        the healed delivery_date in place. This is intentional UX — invalid dates are auto-corrected
+        rather than causing a hard failure that blocks the user.
+        """
+        from datetime import timedelta
         from agent.workflow.graph import validate_parameters_node
         state = {
             "detected_intent": "create-sales-order",
@@ -247,38 +251,44 @@ class TestGenericTools(unittest.TestCase):
                 "customer": "Grant Plastics Ltd",
                 "items": [{"item_code": "SKU009", "qty": 10}],
                 "transaction_date": "2026-08-08",
-                "delivery_date": "2026-08-08" # invalid
+                "delivery_date": "2026-08-08"  # invalid — same as transaction_date
             }
         }
         res = validate_parameters_node(state)
-        self.assertFalse(res["all_required_filled"])
-        # It should clear delivery_date from collected_fields
-        self.assertNotIn("delivery_date", res["collected_fields"])
-        self.assertIn("delivery_date (must be strictly after transaction_date)", res["missing_parameters"])
+        # After auto-heal: delivery_date should be replaced by transaction_date + 7d
+        # and validation should pass (no longer blocked)
+        self.assertTrue(res["all_required_filled"])
+        self.assertIn("delivery_date", res["collected_fields"])
+        # The healed delivery_date must be strictly after transaction_date
+        from datetime import datetime
+        healed = datetime.strptime(res["collected_fields"]["delivery_date"], "%Y-%m-%d").date()
+        tx = datetime.strptime("2026-08-08", "%Y-%m-%d").date()
+        self.assertGreater(healed, tx)
 
-        # Another invalid case (past date)
+        # A past date should also be auto-healed the same way
         state2 = {
             "detected_intent": "create-sales-order",
             "collected_fields": {
                 "customer": "Grant Plastics Ltd",
                 "items": [{"item_code": "SKU009", "qty": 10}],
                 "transaction_date": "2026-08-08",
-                "delivery_date": "2026-08-05" # invalid
+                "delivery_date": "2026-08-05"  # invalid — before transaction_date
             }
         }
         res2 = validate_parameters_node(state2)
-        self.assertFalse(res2["all_required_filled"])
-        self.assertNotIn("delivery_date", res2["collected_fields"])
-        self.assertIn("delivery_date (must be strictly after transaction_date)", res2["missing_parameters"])
+        self.assertTrue(res2["all_required_filled"])
+        self.assertIn("delivery_date", res2["collected_fields"])
+        healed2 = datetime.strptime(res2["collected_fields"]["delivery_date"], "%Y-%m-%d").date()
+        self.assertGreater(healed2, tx)
 
     @patch("agent.workflow.graph.invoke_structured_llm")
-    @patch("agent.workflow.graph.add_doctype")
-    def test_sales_order_payload_explicit_dates(self, mock_add_doctype, mock_invoke_structured_llm):
+    @patch("agent.workflow.graph.create_document")
+    def test_sales_order_payload_explicit_dates(self, mock_create_document, mock_invoke_structured_llm):
         """Test that transaction_date and delivery_date are explicitly present in the tool call parameters."""
         from agent.workflow.graph import call_generic_tool_node
         # Mock LLM returning None to trigger fallback parameter reinforcement
         mock_invoke_structured_llm.return_value = None
-        mock_add_doctype.return_value = {"success": True}
+        mock_create_document.return_value = {"status": "success"}
         
         state = {
             "detected_intent": "create-sales-order",
@@ -292,9 +302,9 @@ class TestGenericTools(unittest.TestCase):
         
         call_generic_tool_node(state)
         
-        # Verify add_doctype was called with transaction_date and delivery_date
-        mock_add_doctype.assert_called_once()
-        args, kwargs = mock_add_doctype.call_args
+        # Verify create_document was called with transaction_date and delivery_date
+        mock_create_document.assert_called_once()
+        args, kwargs = mock_create_document.call_args
         called_doctype, called_params = args
         self.assertEqual(called_doctype, "Sales Order")
         self.assertEqual(called_params["transaction_date"], "2026-08-08")

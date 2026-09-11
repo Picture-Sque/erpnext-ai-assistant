@@ -15,6 +15,8 @@ if root_path not in sys.path:
 # Import functions for testing
 import agent.tools.generic_tools as generic_tools
 import agent.workflow.graph as graph
+from agent.audit_logger import init_audit_db
+init_audit_db()
 from agent.workflow.graph import (
     apply_skill_defaults,
     evaluate_validation_rules,
@@ -42,10 +44,10 @@ class TestGenericPipelineGenericity(unittest.TestCase):
 
         # Functions to scan inside generic_tools.py
         tools_functions = [
-            generic_tools.add_doctype,
-            generic_tools.list_doctype,
-            generic_tools.update_doctype,
-            generic_tools.delete_doctype,
+            generic_tools.create_document,
+            generic_tools.get_list,
+            generic_tools.update_document,
+            generic_tools.delete_document,
             generic_tools.is_doctype_allowed
         ]
 
@@ -212,13 +214,14 @@ class TestGenericPipelineGenericity(unittest.TestCase):
                 "customer_name": "Nimbus Traders"
             }
         }
-        with patch("agent.workflow.graph.list_doctype") as mock_list:
-            mock_list.return_value = {"success": True, "data": []}
+        with patch("agent.workflow.graph.get_list") as mock_list:
+            mock_list.return_value = {"status": "success", "data": []}
             res = call_generic_tool_node(state_offline)
             
             mock_list.assert_called_once()
             args, kwargs = mock_list.call_args
-            called_doctype, called_params = args
+            called_doctype = args[0]
+            called_params = kwargs
             self.assertEqual(called_doctype, "Customer")
             filters = called_params.get("filters", [])
             self.assertEqual(filters, [["customer_name", "like", "%Nimbus Traders%"]])
@@ -226,3 +229,215 @@ class TestGenericPipelineGenericity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import unittest
+from unittest.mock import patch, MagicMock
+from langchain_core.messages import AIMessage, HumanMessage
+
+import agent.workflow.graph as graph
+from agent.audit_logger import init_audit_db, get_audit_db_connection, AUDIT_DB_PATH
+
+class TestAuditAndDestructiveSkills(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        init_audit_db()
+
+    def setUp(self):
+        import os
+        if os.path.exists(AUDIT_DB_PATH):
+            try:
+                os.remove(AUDIT_DB_PATH)
+            except Exception:
+                pass
+        init_audit_db()
+        self.conn = get_audit_db_connection()
+        self.conn.execute("DELETE FROM audit_log;")
+        self.conn.commit()
+        
+    def tearDown(self):
+        self.conn.close()
+
+    def _base_state(self, intent, role="Sales Manager", msg="do it"):
+        return {
+            "messages": [HumanMessage(content=msg)],
+            "detected_intent": intent,
+            "user_roles": [role],
+            "collected_fields": {"name": "SO-0001", "delivery_date": "2026-10-15"},
+            "resolved_entities": {"name": {"name": "SO-0001", "match_type": "exact"}},
+            "preconditions_validated": True,
+            "target_doctype": "Sales Order",
+            "write_rbac_operation": None
+        }
+
+    @patch("agent.workflow.graph.get_document")
+    def test_cancel_sales_order_valid(self, mock_get):
+        """(a) cancel-sales-order end-to-end on a valid draft SO."""
+        state = self._base_state("cancel-sales-order")
+        # Step 5
+        res_rbac = graph.write_rbac_gate_node(state)
+        self.assertTrue(res_rbac["write_rbac_passed"])
+        state.update(res_rbac)
+        
+        # Step 6 Ask
+        res_conf = graph.confirmation_node(state)
+        self.assertIn("pending_confirmation", res_conf)
+        state.update(res_conf)
+        
+        # Step 6 Reply
+        state["messages"].append(AIMessage(content=res_conf["final_response"]))
+        state["messages"].append(HumanMessage(content="yes"))
+        res_conf_reply = graph.confirmation_node(state)
+        self.assertEqual(res_conf_reply.get("confirmation_result"), "confirmed")
+        state.update(res_conf_reply)
+        
+        # Step 7 (Simulate tool response)
+        state["tool_raw_response"] = {"success": True, "data": {"name": "SO-0001"}}
+        
+        # Step 8
+        mock_get.return_value = {"status": "success", "data": {"name": "SO-0001", "docstatus": 2}}
+        res_verify = graph.result_validation_node(state)
+        self.assertTrue(res_verify["write_verified"])
+
+        # Check DB (g)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT operation, target_name, outcome FROM audit_log ORDER BY id")
+        rows = cursor.fetchall()
+        # Should have: pending, confirmed, executed
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["outcome"], "pending")
+        self.assertEqual(rows[1]["outcome"], "confirmed")
+        self.assertEqual(rows[2]["outcome"], "executed")
+
+    @patch("agent.workflow.graph.get_document")
+    def test_cancel_already_cancelled(self, mock_get):
+        """(b) cancel attempt on an already-cancelled SO."""
+        state = self._base_state("cancel-sales-order")
+        state.update({"write_rbac_operation": "cancel", "write_rbac_passed": True, "target_doctype": "Sales Order"})
+        mock_get.return_value = {"status": "success", "data": {"name": "SO-0001", "docstatus": 2}}
+        
+        res = graph.precondition_validation_node(state)
+        self.assertFalse(res["preconditions_validated"])
+        self.assertEqual(res["failure_classification"], "validation_error")
+
+    @patch("agent.workflow.graph.get_document")
+    def test_update_sales_order(self, mock_get):
+        """(c) update-sales-order changing delivery_date — no confirmation asked."""
+        state = self._base_state("update-sales-order")
+        res_rbac = graph.write_rbac_gate_node(state)
+        self.assertTrue(res_rbac["write_rbac_passed"])
+        state.update(res_rbac)
+        
+        # Confirmation node should skip
+        res_conf = graph.confirmation_node(state)
+        self.assertEqual(res_conf, {})
+        
+        state["tool_raw_response"] = {"success": True, "data": {"name": "SO-0001"}}
+        mock_get.return_value = {"status": "success", "data": {"name": "SO-0001", "delivery_date": "2026-10-15"}}
+        res_verify = graph.result_validation_node(state)
+        self.assertTrue(res_verify["write_verified"])
+        
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT operation, outcome FROM audit_log ORDER BY id")
+        rows = cursor.fetchall()
+        # Only "executed" because no confirmation ask/reply
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["outcome"], "executed")
+
+    @patch("agent.workflow.graph.get_document")
+    def test_submit_sales_order_valid(self, mock_get):
+        """(d) submit-sales-order with full pipeline including confirmation."""
+        state = self._base_state("submit-sales-order")
+        # Step 5: Write RBAC
+        res_rbac = graph.write_rbac_gate_node(state)
+        self.assertTrue(res_rbac["write_rbac_passed"])
+        state.update(res_rbac)
+
+        # Step 5.5: Precondition Validation (draft SO has docstatus 0)
+        mock_get.return_value = {"status": "success", "data": {"name": "SO-0001", "docstatus": 0}}
+        res_precond = graph.precondition_validation_node(state)
+        self.assertTrue(res_precond["preconditions_validated"])
+        state.update(res_precond)
+
+        # Step 6: Confirmation Ask
+        res_conf = graph.confirmation_node(state)
+        self.assertIn("pending_confirmation", res_conf)
+        self.assertEqual(res_conf["pending_confirmation"]["operation"], "submit")
+        state.update(res_conf)
+
+        # Step 6: Confirmation Reply (User says 'confirm')
+        state["messages"].append(AIMessage(content=res_conf["final_response"]))
+        state["messages"].append(HumanMessage(content="confirm"))
+        res_conf_reply = graph.confirmation_node(state)
+        self.assertEqual(res_conf_reply.get("confirmation_result"), "confirmed")
+        state.update(res_conf_reply)
+
+        # Step 7: Tool Execution
+        state["tool_raw_response"] = {"success": True, "data": {"name": "SO-0001", "docstatus": 1}}
+
+        # Step 8: Write Verification (submitted SO has docstatus 1)
+        mock_get.return_value = {"status": "success", "data": {"name": "SO-0001", "docstatus": 1}}
+        res_verify = graph.result_validation_node(state)
+        self.assertTrue(res_verify["write_verified"])
+
+        # Check DB (g)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT operation, target_name, outcome FROM audit_log ORDER BY id")
+        rows = cursor.fetchall()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["operation"], "submit")
+        self.assertEqual(rows[0]["outcome"], "pending")
+        self.assertEqual(rows[1]["operation"], "submit")
+        self.assertEqual(rows[1]["outcome"], "confirmed")
+        self.assertEqual(rows[2]["operation"], "submit")
+        self.assertEqual(rows[2]["outcome"], "executed")
+
+    def test_submit_unauthorized(self):
+        """(e) user without right role attempting submit — denied at Write RBAC."""
+        state = self._base_state("submit-sales-order", role="Guest")
+        res_rbac = graph.write_rbac_gate_node(state)
+        self.assertFalse(res_rbac["write_rbac_passed"])
+        self.assertEqual(res_rbac["failure_classification"], "permission_denied_write")
+        
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT outcome FROM audit_log")
+        row = cursor.fetchone()
+        self.assertEqual(row["outcome"], "denied")
+
+    @patch("agent.workflow.graph.invoke_structured_llm")
+    def test_intent_classification(self, mock_llm):
+        """(f) intent classification distinguishing all 3 new skills + create-sales-order from natural phrasing."""
+        # 1. Natural phrasing matched by keywords without LLM:
+        # cancel-sales-order keyword: 'cancel sales order'
+        s1 = {"messages": [HumanMessage(content="please cancel sales order SO-0001")]}
+        r1 = graph.classify_intent_node(s1)
+        self.assertEqual(r1["detected_intent"], "cancel-sales-order")
+
+        # submit-sales-order keyword: 'submit sales order'
+        s2 = {"messages": [HumanMessage(content="submit sales order SO-0002 for approval")]}
+        r2 = graph.classify_intent_node(s2)
+        self.assertEqual(r2["detected_intent"], "submit-sales-order")
+
+        # create-sales-order keyword: 'create sales order'
+        s3 = {"messages": [HumanMessage(content="create sales order for customer Acme")]}
+        r3 = graph.classify_intent_node(s3)
+        self.assertEqual(r3["detected_intent"], "create-sales-order")
+
+        # 2. Conversational/colloquial phrasing resolved via LLM fallback:
+        # update-sales-order: "change delivery date"
+        mock_llm.return_value = {"intent": "update-sales-order"}
+        s4 = {"messages": [HumanMessage(content="change delivery to next friday for SO-0003")]}
+        r4 = graph.classify_intent_node(s4)
+        self.assertEqual(r4["detected_intent"], "update-sales-order")
+
+    def test_audit_log_query_order_and_format(self):
+        """(g) direct audit log query showing entries in correct order (pending -> confirmed -> executed)."""
+        # Run cancel end-to-end to generate the full sequence
+        self.test_cancel_sales_order_valid()
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, timestamp, operation, doctype, target_name, outcome, details FROM audit_log ORDER BY id ASC")
+        rows = [dict(r) for r in cursor.fetchall()]
+        self.assertGreaterEqual(len(rows), 3)
+        self.assertEqual(rows[0]["outcome"], "pending")
+        self.assertEqual(rows[1]["outcome"], "confirmed")
+        self.assertEqual(rows[2]["outcome"], "executed")
+

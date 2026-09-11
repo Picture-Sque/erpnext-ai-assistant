@@ -9,7 +9,7 @@ allowed_roles:
   - Sales Manager
   - System Manager
   - Administrator
-tool: list_doctype
+tool: get_list
 doctype: Item
 required_fields:
   - item_code
@@ -60,4 +60,4 @@ Trigger this skill when the user wants to look up or verify details about an ite
 - Fields: `item_code`, `item_name`, `item_group`, `stock_uom`, `is_stock_item`
 
 ## Tool
-Tool name: `list_doctype` with DocType `Item`.
+Tool name: `get_list` with DocType `Item`.

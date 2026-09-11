@@ -1,28 +1,46 @@
 # Tools package initialization
 try:
     from agent.tools.generic_tools import (
-        add_doctype,
-        list_doctype,
-        update_doctype,
-        delete_doctype,
+        create_document,
+        get_list,
+        get_document,
+        search_document,
+        get_count,
+        aggregate,
+        update_document,
+        delete_document,
+        cancel_document,
+        submit_document,
         is_doctype_allowed,
         get_allowed_doctypes
     )
 except ImportError:
     from tools.generic_tools import (
-        add_doctype,
-        list_doctype,
-        update_doctype,
-        delete_doctype,
+        create_document,
+        get_list,
+        get_document,
+        search_document,
+        get_count,
+        aggregate,
+        update_document,
+        delete_document,
+        cancel_document,
+        submit_document,
         is_doctype_allowed,
         get_allowed_doctypes
     )
 
 __all__ = [
-    "add_doctype",
-    "list_doctype",
-    "update_doctype",
-    "delete_doctype",
+    "create_document",
+    "get_list",
+    "get_document",
+    "search_document",
+    "get_count",
+    "aggregate",
+    "update_document",
+    "delete_document",
+    "cancel_document",
+    "submit_document",
     "is_doctype_allowed",
-    "get_allowed_doctypes"
+    "get_allowed_doctypes",
 ]

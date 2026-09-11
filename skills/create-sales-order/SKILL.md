@@ -7,7 +7,7 @@ allowed_roles:
   - Sales Manager
   - System Manager
   - Administrator
-tool: add_doctype
+tool: create_document
 doctype: Sales Order
 required_fields:
   - customer
@@ -63,4 +63,4 @@ Trigger this skill when the user wants to create a new Sales Order document in E
 - Child table: `items` (each row needs `item_code`, `qty`, `warehouse`)
 
 ## Tool
-Tool name: `add_doctype` on DocType `Sales Order`.
+Tool name: `create_document` on DocType `Sales Order`.

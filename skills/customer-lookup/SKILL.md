@@ -9,7 +9,7 @@ allowed_roles:
   - Accounts Manager
   - System Manager
   - Administrator
-tool: list_doctype
+tool: get_list
 doctype: Customer
 required_fields:
   - customer_name
@@ -66,7 +66,7 @@ examples:
 Trigger this skill when the user wants to find or confirm details about a customer, or when another skill needs a customer confirmed before proceeding.
 
 ## Required information
-- **Search term**: customer name (full or partial), or customer ID
+- **customer_name**: customer name (full or partial), or customer ID
 
 ## ERPNext details
 - Doctype: `Customer`
@@ -74,9 +74,9 @@ Trigger this skill when the user wants to find or confirm details about a custom
 - Related doctype for contact details: `Contact` (linked via Dynamic Link)
 
 ## Tool
-Tool name: `list_doctype` with DocType `Customer`.
+Tool name: `get_list` with DocType `Customer`.
 
 ## Steps
-1. Call `list_doctype` with `customer_name` filter.
+1. Call `get_list` with `customer_name` filter.
 2. If match found, return formatted customer details.
 3. If no match, state that no customer record was found.
