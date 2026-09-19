@@ -153,6 +153,74 @@ def _resolve_slot_answer(
     return reply_stripped
 
 
+# ============================================================================
+# Elliptical Pattern Detection
+# ============================================================================
+
+_ELLIPTICAL_PREFIX_RE = re.compile(
+    r"^(?:what\s+about|how\s+about|and(?:\s+what\s+about)?)(?:\s+(.*))?$",
+    re.IGNORECASE,
+)
+
+_MONTHS = (
+    r"(?:january|february|march|april|may|june|july|august|september|october|november|december|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+)
+_YEAR = r"(?:(?:19|20)\d{2}|fy\s*\d{2,4}(?:-\d{2,4})?)"
+_DATE_NUM = r"(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})"
+_DAY_OF_MONTH = r"(?:\d{1,2}(?:st|nd|rd|th)?)"
+_DATE_WORDS = (
+    r"(?:today|yesterday|tomorrow|(?:this|last|next)\s+(?:week|month|quarter|year)|"
+    r"q[1-4](?:\s+(?:19|20)\d{2})?)"
+)
+
+_BARE_DATE_PATTERNS = [
+    re.compile(rf"^(?:for\s+|in\s+)?{_MONTHS}(?:\s+{_YEAR})?$", re.IGNORECASE),
+    re.compile(rf"^(?:for\s+|in\s+)?{_MONTHS}\s+{_DAY_OF_MONTH}(?:,?\s+{_YEAR})?$", re.IGNORECASE),
+    re.compile(rf"^(?:for\s+|in\s+)?{_DAY_OF_MONTH}\s+(?:of\s+)?{_MONTHS}(?:\s+{_YEAR})?$", re.IGNORECASE),
+    re.compile(rf"^(?:for\s+|in\s+)?{_YEAR}$", re.IGNORECASE),
+    re.compile(rf"^(?:for\s+|in\s+)?{_DATE_NUM}$", re.IGNORECASE),
+    re.compile(rf"^(?:for\s+|in\s+)?{_DATE_WORDS}$", re.IGNORECASE),
+]
+
+
+def _detect_elliptical_pattern(text: str) -> tuple[bool, Optional[str]]:
+    """
+    Determines whether a message matches an elliptical follow-up pattern.
+    Returns (is_elliptical, missing_thing).
+
+    Elliptical patterns include:
+      - Starts with "what about", "how about", "and"
+      - Bare month, year, or date (with optional leading "for"/"in")
+    """
+    cleaned = text.strip().rstrip("?.!").strip()
+    if not cleaned:
+        return False, None
+
+    # Elliptical messages must be short
+    words = cleaned.split()
+    if len(words) > FOLLOWUP_SHORT_MSG_WORDS:
+        return False, None
+
+    # 1. Elliptical prefix match
+    prefix_match = _ELLIPTICAL_PREFIX_RE.match(cleaned)
+    if prefix_match:
+        subject = prefix_match.group(1) or ""
+        subject = subject.strip().rstrip("?.!").strip()
+        subject_cleaned = re.sub(r"^(?:for|in)\s+", "", subject, flags=re.IGNORECASE).strip()
+        if not subject_cleaned or subject_cleaned.lower() in {"it", "that", "this"}:
+            return True, None
+        return True, subject_cleaned
+
+    # 2. Bare date / month / year match
+    for pat in _BARE_DATE_PATTERNS:
+        if pat.match(cleaned):
+            subject_cleaned = re.sub(r"^(?:for|in)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+            return True, subject_cleaned
+
+    return False, None
+
+
 def _extract_followup_overrides(
     message: str,
     last_skill_name: str,
@@ -205,7 +273,7 @@ def _extract_followup_overrides(
             failure_classification="llm_unavailable",
             details="LLM unavailable during follow-up slot extraction"
         )
-        return None
+        return "LLM_FAILED"
 
     # Validate schema
     if not isinstance(result, dict):
@@ -280,6 +348,7 @@ def resolve_followup_node(state: AgentState) -> dict:
         resolved_value = _resolve_slot_answer(last_msg, options)
 
         if resolved_value is not None:
+            resolved_slots = {missing_slot: resolved_value}
             logger.info(
                 f"[FollowupRouter] Priority 1: slot clarification resolved — "
                 f"slot='{missing_slot}', value='{resolved_value}', origin_skill='{origin_skill}'"
@@ -289,7 +358,7 @@ def resolve_followup_node(state: AgentState) -> dict:
                 doctype=origin_skill,
                 target_name=missing_slot,
                 outcome="resolved",
-                details=f"value='{resolved_value}', origin_turn_id={asked_turn_id}"
+                details=f"origin_turn_id={asked_turn_id}, resolved_slots={resolved_slots}"
             )
             merged_slots = dict(origin_slots)
             merged_slots[missing_slot] = resolved_value
@@ -346,15 +415,7 @@ def resolve_followup_node(state: AgentState) -> dict:
     # =========================================================================
     # PRIORITY 2: Elliptical follow-up on a fresh last_turn_context
     # =========================================================================
-    if last_turn_context:
-        # Freshness check
-        if not _is_fresh(last_turn_context, current_turn_id):
-            logger.info(
-                f"[FollowupRouter] Priority 2: last_turn_context is stale "
-                f"(turn_id={last_turn_context.get('turn_id')}, now={current_turn_id}) — falling through"
-            )
-            return {"_followup_route": "classify_intent"}
-
+    if last_turn_context and _is_fresh(last_turn_context, current_turn_id):
         # Message must be short to qualify as elliptical
         word_count = len(last_msg.split())
         if word_count > FOLLOWUP_SHORT_MSG_WORDS:
@@ -375,8 +436,28 @@ def resolve_followup_node(state: AgentState) -> dict:
         # LLM extraction (schema-validated)
         overrides = _extract_followup_overrides(last_msg, skill_name, last_slots, follow_up_slots)
 
+        if overrides == "LLM_FAILED":
+            _, missing_thing = _detect_elliptical_pattern(last_msg)
+            final_resp = (
+                f"What would you like me to look up for {missing_thing}?"
+                if missing_thing
+                else "What would you like me to look up for you?"
+            )
+            log_audit_event(
+                operation="unresolvable_short_message",
+                doctype="unknown",
+                target_name="unknown",
+                outcome="rejected",
+                details="LLM failed during follow-up extraction."
+            )
+            return {
+                "_followup_route": "format_response",
+                "final_response": final_resp,
+                "is_workflow_complete": True,
+            }
+
         if overrides is None:
-            # LLM said not a follow-up, or failed
+            # LLM said not a follow-up
             return {"_followup_route": "classify_intent"}
 
         if overrides:
@@ -392,7 +473,7 @@ def resolve_followup_node(state: AgentState) -> dict:
                 doctype=skill_name,
                 target_name="follow_up",
                 outcome="resolved",
-                details=f"overrides={overrides}, origin_turn_id={asked_turn_id}"
+                details=f"origin_turn_id={asked_turn_id}, resolved_slots={overrides}"
             )
             return {
                 "_followup_route": "collect_parameters",
@@ -436,6 +517,27 @@ def resolve_followup_node(state: AgentState) -> dict:
     # =========================================================================
     # PRIORITY 3: Fall through to existing classifier
     # =========================================================================
+    is_elliptical, missing_thing = _detect_elliptical_pattern(last_msg)
+    if is_elliptical:
+        logger.info("[FollowupRouter] Intercepting elliptical message with missing/stale context")
+        log_audit_event(
+            operation="unresolvable_short_message",
+            doctype="unknown",
+            target_name="unknown",
+            outcome="rejected",
+            details="Short message intercepted to avoid fallback capability menu."
+        )
+        final_resp = (
+            f"What would you like me to look up for {missing_thing}?"
+            if missing_thing
+            else "What would you like me to look up for you?"
+        )
+        return {
+            "_followup_route": "format_response",
+            "final_response": final_resp,
+            "is_workflow_complete": True,
+        }
+
     return {"_followup_route": "classify_intent"}
 
 

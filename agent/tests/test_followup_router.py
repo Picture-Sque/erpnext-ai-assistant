@@ -31,7 +31,9 @@ from workflow.followup_router import (
     FOLLOWUP_MAX_TURNS,
     FOLLOWUP_MAX_MINUTES,
     MAX_SLOT_CLARIFICATION_ATTEMPTS,
+    FOLLOWUP_SHORT_MSG_WORDS,
 )
+from workflow.graph import entity_resolution_and_read_rbac_node
 
 
 # ============================================================================
@@ -264,10 +266,10 @@ def test_slot_clarification_reasked():
 # ============================================================================
 
 def test_stale_context_too_many_turns():
-    """Priority 2: last_turn_context is beyond FOLLOWUP_MAX_TURNS → fall through."""
+    """Priority 2: last_turn_context is beyond FOLLOWUP_MAX_TURNS + long msg → fall through."""
     last_slots = {"query_type": "total_sales_period", "date_from": "2026-08-01", "date_to": "2026-08-31"}
     state = _analytics_state(
-        last_msg="What about July?",
+        last_msg="This is a very long message that has more than twelve words so it is not intercepted by the short message check at priority 3",
         last_slots=last_slots,
         turn_id=1,  # completed at turn 1
         extra_messages=FOLLOWUP_MAX_TURNS + 1,  # current turn_id will be > turn_id + MAX
@@ -285,10 +287,10 @@ def test_stale_context_too_many_turns():
 # ============================================================================
 
 def test_stale_context_time_elapsed():
-    """Priority 2: last_turn_context.completed_at is beyond FOLLOWUP_MAX_MINUTES → fall through."""
+    """Priority 2: last_turn_context.completed_at is beyond FOLLOWUP_MAX_MINUTES + long msg → fall through."""
     last_slots = {"query_type": "total_sales_period", "date_from": "2026-08-01", "date_to": "2026-08-31"}
     state = _analytics_state(
-        last_msg="What about July?",
+        last_msg="This is a very long message that has more than twelve words so it is not intercepted by the short message check at priority 3",
         last_slots=last_slots,
         turn_id=2,
         completed_at=_ago_iso(FOLLOWUP_MAX_MINUTES + 5),  # older than the max
@@ -306,26 +308,30 @@ def test_stale_context_time_elapsed():
 # ============================================================================
 
 def test_pending_confirmation_falls_through():
-    """Guard: pending_confirmation present → always fall through to classifier."""
+    """Guard: pending_confirmation present → always fall through to classifier, write NOT executed."""
     last_slots = {"query_type": "total_sales_period", "date_from": "2026-08-01", "date_to": "2026-08-31"}
     state = _analytics_state(
-        last_msg="yes",
+        last_msg="What about July?",
         last_slots=last_slots,
         turn_id=2,
     )
-    state["pending_confirmation"] = {
+    conf_state = {
         "operation": "cancel",
         "doctype": "Sales Order",
         "target_name": "SAL-ORD-2026-00091",
         "scope_description": "Are you sure you want to cancel Sales Order 'SAL-ORD-2026-00091'?",
         "requested_at": 2,
     }
+    state["pending_confirmation"] = dict(conf_state)
 
     with patch("workflow.followup_router.invoke_structured_llm") as mock_llm:
         result = resolve_followup_node(state)
         mock_llm.assert_not_called()
 
+    # Write NOT executed (it falls through to classifier/confirmation node)
     assert result["_followup_route"] == "classify_intent"
+    # state["pending_confirmation"] was not modified
+    assert state["pending_confirmation"] == conf_state
 
 
 # ============================================================================
@@ -349,28 +355,6 @@ def test_llm_says_not_followup():
 
     assert result["_followup_route"] == "classify_intent"
 
-
-# ============================================================================
-# TEST 9: LLM unavailable for follow-up extraction → fall through, log audit
-# ============================================================================
-
-def test_llm_unavailable_falls_through():
-    """Priority 2: LLM returns None (unavailable) → Priority 3 fallthrough + audit log."""
-    last_slots = {"query_type": "total_sales_period", "date_from": "2026-08-01", "date_to": "2026-08-31"}
-    state = _analytics_state(
-        last_msg="What about July?",
-        last_slots=last_slots,
-        turn_id=2,
-    )
-
-    with patch("workflow.followup_router.invoke_structured_llm", return_value=None):
-        with patch("workflow.followup_router.log_audit_event") as mock_audit:
-            result = resolve_followup_node(state)
-            mock_audit.assert_called_once()
-            call_kwargs = mock_audit.call_args
-            assert call_kwargs[1]["outcome"] == "failed" or (call_kwargs[0] and "failed" in str(call_kwargs))
-
-    assert result["_followup_route"] == "classify_intent"
 
 
 # ============================================================================
@@ -486,9 +470,9 @@ def test_build_last_turn_context():
 # ============================================================================
 
 def test_no_context_falls_through():
-    """Priority 3: no prior context at all → always fall through."""
+    """Priority 3: no prior context at all but long message → always fall through."""
     state = {
-        "messages": [HumanMessage(content="What about July?")],
+        "messages": [HumanMessage(content="This is a very long message that has more than twelve words so it is not intercepted by the short message check at priority 3")],
         "detected_intent": "",
         "collected_fields": {},
         "is_workflow_complete": False,
@@ -502,3 +486,173 @@ def test_no_context_falls_through():
         mock_llm.assert_not_called()
 
     assert result["_followup_route"] == "classify_intent"
+
+
+# ============================================================================
+# NEW TESTS
+# ============================================================================
+
+@pytest.mark.parametrize("last_context, llm_return", [
+    (None, None),  # Missing context
+    ("STALE", None),  # Stale context
+    ("FRESH", "LLM_FAILED"),  # Fresh context but LLM fails
+])
+def test_unresolvable_short_message_intercepted(last_context, llm_return):
+    """Targeted message: if the router/LLM fails, or a short elliptical message arrives with stale/missing context."""
+    state = {
+        "messages": [HumanMessage(content="What about July?")],
+        "is_workflow_complete": True,
+        "pending_slot_clarification": None,
+        "pending_confirmation": None,
+    }
+    
+    if last_context == "STALE":
+        state["last_turn_context"] = {
+            "skill": "sales-analytics-report",
+            "slots": {},
+            "turn_id": 1,
+            "completed_at": _ago_iso(FOLLOWUP_MAX_MINUTES + 5),
+            "follow_up_slots": ["date_from"],
+        }
+    elif last_context == "FRESH":
+        state["last_turn_context"] = {
+            "skill": "sales-analytics-report",
+            "slots": {},
+            "turn_id": 1,
+            "completed_at": _now_iso(),
+            "follow_up_slots": ["date_from"],
+        }
+    else:
+        state["last_turn_context"] = None
+        
+    with patch("workflow.followup_router._extract_followup_overrides", return_value=llm_return):
+        with patch("workflow.followup_router.log_audit_event") as mock_audit:
+            result = resolve_followup_node(state)
+            
+    assert result["_followup_route"] == "format_response"
+    assert result["final_response"] == "What would you like me to look up for July?"
+    mock_audit.assert_called_once()
+    assert mock_audit.call_args[1]["operation"] == "unresolvable_short_message"
+
+
+def test_unresolvable_short_message_generic_fallback():
+    """Targeted message: returns generic message if missing thing is not known."""
+    state = {
+        "messages": [HumanMessage(content="what about?")],
+        "is_workflow_complete": True,
+        "pending_slot_clarification": None,
+        "pending_confirmation": None,
+        "last_turn_context": None,
+    }
+    with patch("workflow.followup_router.log_audit_event") as mock_audit:
+        result = resolve_followup_node(state)
+
+    assert result["_followup_route"] == "format_response"
+    assert result["final_response"] == "What would you like me to look up for you?"
+    mock_audit.assert_called_once()
+    assert mock_audit.call_args[1]["operation"] == "unresolvable_short_message"
+
+
+@pytest.mark.parametrize("msg", [
+    "low stock report",
+    "show overdue invoices",
+    "hello",
+])
+def test_no_context_ordinary_short_requests_fall_through(msg):
+    """Priority 3: with NO context, ordinary short requests go to classify_intent unchanged."""
+    state = {
+        "messages": [HumanMessage(content=msg)],
+        "detected_intent": "",
+        "collected_fields": {},
+        "is_workflow_complete": False,
+        "pending_confirmation": None,
+        "pending_slot_clarification": None,
+        "last_turn_context": None,
+    }
+    with patch("workflow.followup_router.invoke_structured_llm") as mock_llm:
+        with patch("workflow.followup_router.log_audit_event") as mock_audit:
+            result = resolve_followup_node(state)
+            mock_llm.assert_not_called()
+            mock_audit.assert_not_called()
+
+    assert result["_followup_route"] == "classify_intent"
+    assert "final_response" not in result
+
+
+@pytest.mark.parametrize("scenario,state_builder,expected_op,expected_origin_id,expected_slots", [
+    (
+        "follow_up",
+        lambda: _analytics_state(
+            last_msg="What about July 2026?",
+            last_slots={"query_type": "total_sales_period", "date_from": "2026-08-01", "date_to": "2026-08-31"},
+            turn_id=2,
+            completed_at=_now_iso(),
+        ),
+        "follow_up_resolved",
+        2,
+        {"date_from": "2026-07-01", "date_to": "2026-07-31"},
+    ),
+    (
+        "clarification",
+        lambda: {
+            "messages": [
+                HumanMessage(content="What's the price of ITEM-CHAIR-002?"),
+                AIMessage(content="Which price list would you like?"),
+                HumanMessage(content="Standard Selling"),
+            ],
+            "detected_intent": "item-lookup",
+            "collected_fields": {"item_code": "ITEM-CHAIR-002"},
+            "is_workflow_complete": True,
+            "pending_confirmation": None,
+            "last_turn_context": None,
+            "pending_slot_clarification": {
+                "origin_skill": "item-lookup",
+                "origin_slots": {"item_code": "ITEM-CHAIR-002"},
+                "missing_slot": "price_list",
+                "question_asked": "Which price list would you like?",
+                "options": ["Standard Selling", "Wholesale"],
+                "asked_turn_id": 3,
+                "attempts": 0,
+            },
+        },
+        "clarification_slot_resolved",
+        3,
+        {"price_list": "Standard Selling"},
+    ),
+])
+def test_audit_entry_on_resolved_followup_and_clarification(scenario, state_builder, expected_op, expected_origin_id, expected_slots):
+    """Write an audit entry whenever a turn resolves as a follow-up or clarification answer (origin turn_id, resolved slots)."""
+    state = state_builder()
+    llm_resp = {"is_followup": True, "overrides": expected_slots} if scenario == "follow_up" else None
+
+    with patch("workflow.followup_router.invoke_structured_llm", return_value=llm_resp):
+        with patch("workflow.followup_router.log_audit_event") as mock_audit:
+            result = resolve_followup_node(state)
+
+    assert result["_followup_route"] == "collect_parameters"
+    mock_audit.assert_called_once()
+    kwargs = mock_audit.call_args[1]
+    assert kwargs["operation"] == expected_op
+    assert kwargs["outcome"] == "resolved"
+    assert f"origin_turn_id={expected_origin_id}" in kwargs["details"]
+    assert f"resolved_slots={expected_slots}" in kwargs["details"]
+
+
+def test_unauthorized_user_followup_is_denied():
+    """RBAC: unauthorized user's follow-up is denied at Step 3."""
+    state = {
+        "detected_intent": "sales-analytics-report",
+        "collected_fields": {"query_type": "total_sales_period"},
+        "user_roles": ["Guest"] # Unauthorized
+    }
+    with patch("workflow.graph._get_skill_for_intent") as mock_get_skill:
+        mock_get_skill.return_value = {
+            "name": "sales-analytics-report",
+            "doctype": "Sales Order",
+            "allowed_roles": ["System Manager", "Sales Manager"]
+        }
+        res = entity_resolution_and_read_rbac_node(state)
+        
+    assert res["read_rbac_passed"] is False
+    assert "Access Denied" in res["final_response"]
+    assert res["failure_classification"] == "permission_denied_read"
