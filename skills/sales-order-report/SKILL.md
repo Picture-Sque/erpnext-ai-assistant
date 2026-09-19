@@ -47,6 +47,12 @@ query_parameters:
     - currency
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - date_from
+  - date_to
+  - status
+  - docstatus
 keywords:
   - list sales orders
   - list orders

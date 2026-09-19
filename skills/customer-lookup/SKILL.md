@@ -25,6 +25,9 @@ query_parameters:
     - mobile_no
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - customer_name
 keywords:
   - "look up customer"
   - "lookup customer"

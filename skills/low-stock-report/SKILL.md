@@ -40,6 +40,10 @@ defaults:
   - field: threshold
     value: "10"
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - threshold
+  - warehouse
 keywords:
   - low on stock
   - low stock

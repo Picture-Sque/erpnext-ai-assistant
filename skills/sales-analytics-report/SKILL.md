@@ -48,6 +48,13 @@ defaults:
   - field: status_filter
     value: submitted
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - query_type
+  - date_from
+  - date_to
+  - limit
+  - status_filter
 keywords:
   - best selling item
   - best seller

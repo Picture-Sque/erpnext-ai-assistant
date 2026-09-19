@@ -187,6 +187,9 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
                 "clarification_attempts": extra_state.get("clarification_attempts") or 0,
                 "resolved_entities": extra_state.get("resolved_entities") or {},
                 "bulk_operation_scope": extra_state.get("bulk_operation_scope"),
+                # Follow-up router state
+                "last_turn_context": extra_state.get("last_turn_context"),
+                "pending_slot_clarification": extra_state.get("pending_slot_clarification"),
             }
     except Exception as e:
         logger.exception(f"Failed to load session state for {session_id}: {e}")
@@ -203,6 +206,9 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
             "clarification_attempts": 0,
             "resolved_entities": {},
             "bulk_operation_scope": None,
+            # Follow-up router state
+            "last_turn_context": None,
+            "pending_slot_clarification": None,
         }
 
 

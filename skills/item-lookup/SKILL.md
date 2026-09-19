@@ -13,7 +13,8 @@ tool: get_list
 doctype: Item
 required_fields:
   - item_code
-optional_fields: []
+optional_fields:
+  - price_list
 query_parameters:
   filters:
     - ["item_code", "like", "%{item_code}%"]
@@ -25,6 +26,10 @@ query_parameters:
     - is_stock_item
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - item_code
+  - price_list
 keywords:
   - look up item
   - lookup item

@@ -37,6 +37,11 @@ query_parameters:
     - currency
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - name
+  - supplier
+  - item_code
 keywords:
   - show purchase order
   - show me purchase order

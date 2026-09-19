@@ -186,3 +186,37 @@ class AgentState(TypedDict, total=False):
     # Whether the agent checked for an existing equivalent record before a create operation,
     # when duplicate creation would be harmful. Default False.
     idempotency_check_performed: bool
+
+    # -------------------------------------------------------------------------
+    # 10. Follow-Up Context (Pre-Classifier Router)
+    # -------------------------------------------------------------------------
+
+    # Pre-Classifier (resolve_followup_node):
+    # Snapshot of the most recently COMPLETED read-skill turn, used by the follow-up
+    # router to resolve elliptical follow-ups ("what about July?") deterministically.
+    # Only set for read/analytics skills; never set for write intents.
+    # Schema: {
+    #   "skill": str,         # e.g. "sales-analytics-report"
+    #   "slots": dict,        # collected_fields at time of completion
+    #   "turn_id": int,       # len(messages) at time of completion
+    #   "completed_at": str,  # ISO-8601 UTC timestamp
+    # }
+    # None when no qualifying turn has completed yet.
+    last_turn_context: Optional[dict]
+
+    # Pre-Classifier (resolve_followup_node):
+    # Active slot-level clarification awaiting user answer (e.g. "which price list?").
+    # Distinct from clarification_target / ambiguous_candidates which handle entity
+    # disambiguation (Step 4). This captures clarifications about missing or ambiguous
+    # SLOT VALUES for the current skill's required/optional fields.
+    # Schema: {
+    #   "origin_skill": str,       # skill being resumed when this is answered
+    #   "origin_slots": dict,      # slots already collected before asking
+    #   "missing_slot": str,       # field name being requested
+    #   "question_asked": str,     # verbatim question text sent to user
+    #   "options": list | None,    # specific choices offered, or None for free value
+    #   "asked_turn_id": int,      # len(messages) when the question was asked
+    #   "attempts": int,           # how many times we have re-asked (0 = first ask)
+    # }
+    # None when no slot clarification is pending.
+    pending_slot_clarification: Optional[dict]

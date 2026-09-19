@@ -12,6 +12,13 @@ from langgraph.graph import StateGraph, END
 
 from llm import invoke_structured_llm, invoke_llm
 from workflow.state import AgentState
+from workflow.followup_router import (
+    resolve_followup_node,
+    route_after_followup_router,
+    build_last_turn_context,
+    FOLLOWUP_MAX_TURNS,
+    FOLLOWUP_MAX_MINUTES,
+)
 from tools.generic_tools import (
     create_document,
     get_list,
@@ -118,7 +125,10 @@ def load_skills() -> List[Dict[str, Any]]:
                                     "response_template": data.get("response_template", ""),
                                     "not_found_message": data.get("not_found_message", ""),
                                     "error_template": data.get("error_template", ""),
-                                    "examples": data.get("examples", [])
+                                    "examples": data.get("examples", []),
+                                    # Follow-up router fields
+                                    "follow_up_eligible": bool(data.get("follow_up_eligible", False)),
+                                    "follow_up_slots": data.get("follow_up_slots", []),
                                 })
                 except Exception as e:
                     logger.warning(f"Failed to parse skill {skill_md}: {e}")
@@ -2380,6 +2390,24 @@ def format_agent_message_node(state: AgentState):
     updates["final_response"] = response_text
     updates["is_workflow_complete"] = True
     updates["messages"] = [AIMessage(content=response_text)]
+
+    # Record last_turn_context for the follow-up router (read-only skills only).
+    # Write intents must never be stored here — the router will never resume them.
+    tool_name = skill.get("tool", "")
+    is_write = tool_name in _WRITE_TOOLS
+    if not is_write and skill.get("follow_up_eligible", False):
+        follow_up_slots = skill.get("follow_up_slots", [])
+        updates["last_turn_context"] = build_last_turn_context(
+            skill_name=intent,
+            collected_fields=collected,
+            turn_id=len(messages),
+            follow_up_slots=follow_up_slots,
+        )
+        logger.info(
+            f"[format_agent_message] Saved last_turn_context for skill='{intent}', "
+            f"turn_id={len(messages)}, follow_up_slots={follow_up_slots}"
+        )
+
     return updates
 
 
@@ -2642,6 +2670,7 @@ def route_after_retry_and_escalation(state: AgentState) -> str:
 workflow = StateGraph(AgentState)
 
 # --- Register nodes ---
+workflow.add_node("resolve_followup",                  resolve_followup_node)           # Pre-classifier (Priority 1/2)
 workflow.add_node("classify_intent",                   classify_intent_node)
 workflow.add_node("collect_parameters",                collect_parameters_node)
 workflow.add_node("validate_parameters",               validate_parameters_node)
@@ -2660,9 +2689,20 @@ workflow.add_node("fallback_response",                 fallback_response_node)
 workflow.add_node("format_response",                   format_response_node)                    # Step 9b
 
 # --- Entry point ---
-workflow.set_entry_point("classify_intent")
+workflow.set_entry_point("resolve_followup")
 
 # --- Edges ---
+
+# resolve_followup → classify_intent | collect_parameters | format_response
+workflow.add_conditional_edges(
+    "resolve_followup",
+    route_after_followup_router,
+    {
+        "classify_intent": "classify_intent",
+        "collect_parameters": "collect_parameters",
+        "format_response": "format_response",
+    }
+)
 
 # classify_intent → fallback | collect_parameters | format_response
 workflow.add_conditional_edges(

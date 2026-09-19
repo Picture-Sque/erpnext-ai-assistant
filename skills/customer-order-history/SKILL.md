@@ -46,6 +46,12 @@ query_parameters:
     - currency
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - customer
+  - date_from
+  - date_to
+  - status
 keywords:
   - orders from customer
   - orders for customer

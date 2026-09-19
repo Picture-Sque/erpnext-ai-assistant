@@ -31,6 +31,11 @@ query_parameters:
     - items
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - name
+  - customer
+  - transaction_date
 keywords:
   - show sales order
   - show me sales order

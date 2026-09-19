@@ -239,7 +239,13 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
                 "clarification_attempts": updated_state.get("clarification_attempts"),
                 "resolved_entities": updated_state.get("resolved_entities"),
                 "bulk_operation_scope": updated_state.get("bulk_operation_scope"),
+                # Follow-up router — pending slot clarification only relevant when mid-turn
+                "pending_slot_clarification": updated_state.get("pending_slot_clarification"),
             }
+        # last_turn_context persists across completed turns so follow-up resolution
+        # can reference the previous successful read-skill result on the NEXT request.
+        # Always include it (None is fine — it won't break anything).
+        extra_state["last_turn_context"] = updated_state.get("last_turn_context")
         
         if should_reset:
             chat_store.update_session_state(
