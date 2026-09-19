@@ -173,7 +173,26 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
                     except Exception as e:
                         logger.error(f"Error parsing extra_state JSON for session {session_id}: {e}")
                         extra_state = {}
-            
+                from workflow.graph import CHAIN_MAX_MINUTES
+                from datetime import datetime, timezone
+                
+                chain_plan = extra_state.get("chain_plan")
+                chain_step_index = extra_state.get("chain_step_index")
+                chain_results = extra_state.get("chain_results")
+                
+                if chain_plan:
+                    started_at = extra_state.get("chain_started_at")
+                    if started_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at)
+                            now = datetime.now(tz=timezone.utc)
+                            if (now - start_dt).total_seconds() / 60 > CHAIN_MAX_MINUTES:
+                                chain_plan = None
+                                chain_step_index = None
+                                chain_results = None
+                        except:
+                            pass
+                            
             return {
                 "messages": messages,
                 "detected_intent": detected_intent,
@@ -190,6 +209,11 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
                 # Follow-up router state
                 "last_turn_context": extra_state.get("last_turn_context"),
                 "pending_slot_clarification": extra_state.get("pending_slot_clarification"),
+                # Chain state
+                "chain_plan": chain_plan,
+                "chain_step_index": chain_step_index,
+                "chain_results": chain_results,
+                "chain_started_at": extra_state.get("chain_started_at") if chain_plan else None,
             }
     except Exception as e:
         logger.exception(f"Failed to load session state for {session_id}: {e}")

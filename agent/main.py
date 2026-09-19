@@ -202,6 +202,7 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
     # Save user message to SQLite message history
     chat_store.save_message(session_id, "user", request.message)
     session_state["messages"].append(HumanMessage(content=request.message))
+    session_state["user_id"] = user_id
     
     try:
         # Run state machine iteration
@@ -239,9 +240,15 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
                 "clarification_attempts": updated_state.get("clarification_attempts"),
                 "resolved_entities": updated_state.get("resolved_entities"),
                 "bulk_operation_scope": updated_state.get("bulk_operation_scope"),
-                # Follow-up router — pending slot clarification only relevant when mid-turn
                 "pending_slot_clarification": updated_state.get("pending_slot_clarification"),
             }
+            if updated_state.get("chain_plan") and not updated_state.get("chain_aborted"):
+                from datetime import datetime, timezone
+                extra_state["chain_plan"] = updated_state.get("chain_plan")
+                extra_state["chain_step_index"] = updated_state.get("chain_step_index")
+                extra_state["chain_results"] = updated_state.get("chain_results")
+                extra_state["chain_started_at"] = updated_state.get("chain_started_at") or datetime.now(tz=timezone.utc).isoformat()
+            
         # last_turn_context persists across completed turns so follow-up resolution
         # can reference the previous successful read-skill result on the NEXT request.
         # Always include it (None is fine — it won't break anything).

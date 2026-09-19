@@ -37,6 +37,11 @@ from tools.generic_tools import (
 logger = logging.getLogger("workflow_graph")
 logger.setLevel(logging.INFO)
 
+MAX_CHAIN_STEPS = 4
+CHAIN_LOW_STOCK_THRESHOLD = 10
+CHAIN_MAX_MINUTES = 10
+
+
 
 # =========================================================================
 # Trust Boundary & Free-Text Wrapping (Part B)
@@ -1608,8 +1613,15 @@ def confirmation_node(state: AgentState):
 
     operation = state.get("write_rbac_operation") or _TOOL_TO_OPERATION.get(skill.get("tool", ""), "")
 
+    chain_plan = state.get("chain_plan")
+    
     # 1. Scope constraint: only specific destructive operations require this gate
-    if operation not in {"cancel", "delete", "submit"}:
+    # EXCEPT for chained writes, which always require confirmation
+    requires_confirmation = operation in {"cancel", "delete", "submit"}
+    if chain_plan and operation in {"create", "update", "cancel", "delete", "submit"}:
+        requires_confirmation = True
+
+    if not requires_confirmation:
         logger.info(f"[Step 6] Confirmation skipped: operation '{operation}' does not require explicit confirmation.")
         return {}
 
@@ -1786,6 +1798,16 @@ def confirmation_node(state: AgentState):
             scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}'?"
         else:
             scope_desc = f"Are you sure you want to {operation} {doctype} '{record_id}'?"
+        if chain_plan:
+            chain_results = state.get("chain_results", {})
+            findings = []
+            for idx_str, res in chain_results.items():
+                if isinstance(res, dict):
+                    res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
+                    if res_info:
+                        findings.append(f"Step {idx_str} findings: {res_info}")
+            if findings:
+                scope_desc = "\n".join(findings) + "\n\n" + scope_desc
     
         pending = {
             "operation": operation,
@@ -2277,7 +2299,38 @@ def result_validation_node(state: AgentState):
     
     # LOOP-BACK LOGIC for multi-step
     pending_steps = state.get("pending_followup_steps", [])
-    if write_verified and pending_steps:
+    chain_plan = state.get("chain_plan")
+    
+    if chain_plan and not state.get("chain_aborted") and (write_verified or not is_write):
+        idx = state.get("chain_step_index", 0)
+        results = dict(state.get("chain_results", {}))
+        
+        data = tool_raw_response.get("data")
+        step_res = {}
+        if isinstance(data, dict):
+            step_res.update(data)
+        elif isinstance(data, list):
+            step_res["list_data"] = data
+            if data and isinstance(data[0], dict):
+                step_res.update(data[0])
+                
+        for k, v in collected.items():
+            if k not in step_res:
+                step_res[k] = v
+                
+        results[str(idx)] = step_res
+        updates["chain_results"] = results
+        updates["chain_step_index"] = idx + 1
+        
+        # Clear fields for next step
+        updates["detected_intent"] = ""
+        updates["collected_fields"] = {}
+        updates["resolved_entities"] = {}
+        updates["preconditions_validated"] = None
+        updates["bulk_operation_scope"] = None
+        updates["pending_confirmation"] = None
+        
+    elif write_verified and pending_steps:
         messages = state.get("messages", [])
         ai_message_count = len([m for m in messages if isinstance(m, AIMessage)])
         if ai_message_count >= 10:
@@ -2384,6 +2437,19 @@ def format_agent_message_node(state: AgentState):
             "is_workflow_complete": True
         }
 
+    chain_plan = state.get("chain_plan")
+    if chain_plan and not state.get("chain_aborted"):
+        results = state.get("chain_results", {})
+        findings = []
+        idx = state.get("chain_step_index", 1) - 1
+        for i_str, res in results.items():
+            if str(i_str) != str(idx) and isinstance(res, dict):
+                res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
+                if res_info:
+                    findings.append(f"Step {i_str} findings: {res_info}")
+        if findings:
+            response_text = "\n".join(findings) + "\n\n" + response_text
+
     updates["final_response"] = response_text
     updates["is_workflow_complete"] = True
     updates["messages"] = [AIMessage(content=response_text)]
@@ -2408,7 +2474,7 @@ def format_agent_message_node(state: AgentState):
     return updates
 
 
-def retry_and_escalation_node(state: AgentState):
+def _retry_and_escalation_node_impl(state: AgentState):
     """
     Central node to evaluate failures and decide whether to retry or escalate.
     """
@@ -2507,8 +2573,32 @@ def retry_and_escalation_node(state: AgentState):
         return updates
         
     # For validation_error, conflict_stale_data, unsupported_operation
-    updates["is_workflow_complete"] = True
+    if classification not in ("empty_result", "not_found", "permission_denied", "auth_session_failure"):
+        updates["is_workflow_complete"] = True
+
     return updates
+
+def retry_and_escalation_node(state: AgentState):
+    updates = _retry_and_escalation_node_impl(state)
+    
+    chain_plan = state.get("chain_plan")
+    if chain_plan and updates.get("is_workflow_complete"):
+        updates["chain_aborted"] = True
+        idx = state.get("chain_step_index", 0)
+        results = state.get("chain_results", {})
+        findings = []
+        for i_str, res in results.items():
+            if isinstance(res, dict):
+                res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
+                if res_info:
+                    findings.append(f"Step {i_str} findings: {res_info}")
+        if findings:
+            prefix = "\n".join(findings) + f"\n\nChain aborted at step {idx}: "
+            updates["final_response"] = prefix + updates.get("final_response", state.get("final_response", ""))
+            updates["messages"] = [AIMessage(content=updates["final_response"])]
+            
+    return updates
+
 
 
 def fallback_response_node(state: AgentState):
@@ -2571,6 +2661,242 @@ def format_response_node(state: AgentState):
 
 
 # =========================================================================
+# Compound Chaining Nodes (Phase 2)
+# =========================================================================
+
+def plan_compound_chain_node(state: AgentState):
+    """Step 2.5: Plan complex compound requests."""
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+        
+    last_msg = messages[-1].content
+    skills_list = "\n".join([f"- {s['name']}: {s.get('description', '')}" for s in loaded_skills])
+    
+    prompt = f"""You are a compound request planner for an ERPNext AI assistant.
+The user has asked for a complex or multi-step request. Decompose it into an ordered list of steps.
+MAX_CHAIN_STEPS = {MAX_CHAIN_STEPS}.
+Available skills:
+{skills_list}
+
+For each step, provide:
+- "skill": the skill name
+- "slots": dictionary of parameters directly mentioned by the user (do NOT guess supplier or qty if not provided).
+- "uses": dictionary mapping a slot name to a previous step's output, e.g., {{"item_code": "$step0.item_code"}}
+- "condition": optional dictionary if the step is conditional. e.g., {{"field": "$step0.actual_qty", "operator": "<="}} (Only specify "value" if the user explicitly provided a number in their message. Otherwise omit "value" and the system default will be used.)
+
+User request: "{last_msg}"
+
+Respond strictly with a JSON object: {{"steps": [{{ "skill": "...", "slots": {{}}, "uses": {{}}, "condition": null }}]}}
+"""
+    res = invoke_structured_llm(prompt)
+    
+    def _abort(reason):
+        try:
+            from audit_logger import log_audit_event
+        except ImportError:
+            from agent.audit_logger import log_audit_event
+        log_audit_event("plan_compound_chain", "unknown", "unknown", "failed", details=reason)
+        return {
+            "chain_aborted": True, 
+            "final_response": "I couldn't plan the steps for this complex request.",
+            "is_workflow_complete": True,
+            "messages": [AIMessage(content="I couldn't plan the steps for this complex request.")],
+            "pending_followup_steps": [],
+        }
+
+    if not res or "steps" not in res:
+        return _abort("Invalid plan generated")
+        
+    steps = res["steps"]
+    if len(steps) > MAX_CHAIN_STEPS:
+        return _abort(f"Plan exceeded MAX_CHAIN_STEPS")
+        
+    if len(steps) <= 1:
+        # Fall back to single-step path (leave pending_followup_steps unchanged so they run sequentially)
+        return {}
+        
+    # Validate plan
+    skill_map = {s["name"]: s for s in loaded_skills}
+    write_count = 0
+    for i, step in enumerate(steps):
+        skill = step.get("skill")
+        if skill not in skill_map:
+            return _abort(f"Unknown skill: {skill}")
+        if not isinstance(step.get("slots", {}), dict) or not isinstance(step.get("uses", {}), dict):
+            return _abort(f"Slots or uses not a dict in step {i}")
+            
+        tool_name = skill_map[skill].get("tool", "")
+        is_write = tool_name in _WRITE_TOOLS
+        if is_write:
+            write_count += 1
+            if write_count > 1:
+                return _abort("Max ONE write step allowed")
+            
+        cond = step.get("condition")
+        if cond:
+            if not isinstance(cond, dict) or cond.get("operator") not in {"<", "<=", ">", ">=", "=="}:
+                return _abort(f"Invalid condition operator in step {i}")
+                
+        for k, v in step.get("uses", {}).items():
+            if not isinstance(v, str) or not v.startswith("$step"):
+                return _abort(f"Invalid uses format in step {i}: {v}")
+            try:
+                ref_idx = int(v.replace("$step", "").split(".")[0])
+                if ref_idx >= i:
+                    return _abort(f"Forward reference in step {i}: {v}")
+            except:
+                return _abort(f"Invalid uses reference in step {i}: {v}")
+                
+    # Start chain execution
+    import uuid
+    return {
+        "chain_plan": steps,
+        "chain_step_index": 0,
+        "chain_results": {},
+        "chain_aborted": False,
+        "chain_id": str(uuid.uuid4()),
+        "pending_followup_steps": [],
+    }
+
+
+def prepare_chain_step_node(state: AgentState):
+    """Prepares the state for the next chain step."""
+    plan = state.get("chain_plan", [])
+    idx = state.get("chain_step_index", 0)
+    results = state.get("chain_results", {})
+    chain_id = state.get("chain_id", "unknown")
+    user_id = state.get("user_id", "system")
+    
+    if idx >= len(plan):
+        return {"is_workflow_complete": True}
+        
+    step = plan[idx]
+    skill_name = step.get("skill", "")
+    slots = dict(step.get("slots") or {})
+    uses = step.get("uses") or {}
+    condition = step.get("condition")
+    
+    def _abort(msg):
+        try:
+            from audit_logger import log_audit_event
+        except ImportError:
+            from agent.audit_logger import log_audit_event
+        log_audit_event("chain_step", skill_name, chain_id, "failed", user_id=user_id, details=f"index={idx}, condition_result=N/A, outcome=aborted, error={msg}")
+        return {
+            "chain_aborted": True,
+            "is_workflow_complete": True,
+            "final_response": f"Chain aborted: {msg}",
+            "messages": [AIMessage(content=f"Chain aborted: {msg}")]
+        }
+    
+    # Evaluate condition
+    if condition and isinstance(condition, dict):
+        field_ref = condition.get("field", "")
+        if field_ref.startswith("$step"):
+            try:
+                parts = field_ref.replace("$step", "").split(".")
+                ref_idx = parts[0]
+                ref_key = parts[1]
+                if str(ref_idx) not in results:
+                    return _abort(f"Unresolved condition reference: step {ref_idx} not found")
+                
+                step_res = results.get(str(ref_idx), {})
+                actual_val = step_res.get(ref_key)
+                
+                # special case for stock check
+                if ref_key == "actual_qty":
+                    if "list_data" in step_res:
+                        actual_val = sum([float(b.get("actual_qty", 0)) for b in step_res["list_data"]])
+                    elif "actual_qty" in step_res:
+                        actual_val = step_res["actual_qty"]
+                        
+                if actual_val is None:
+                    return _abort(f"Unresolved condition reference: field '{ref_key}' not found in step {ref_idx}")
+
+                op = condition.get("operator")
+                val = condition.get("value")
+                if val is None:
+                    val = CHAIN_LOW_STOCK_THRESHOLD
+                
+                passed = False
+                if op == "<=":
+                    passed = float(actual_val) <= float(val)
+                elif op == "<":
+                    passed = float(actual_val) < float(val)
+                elif op == ">=":
+                    passed = float(actual_val) >= float(val)
+                elif op == ">":
+                    passed = float(actual_val) > float(val)
+                elif op == "==":
+                    passed = str(actual_val) == str(val)
+                    
+                if not passed:
+                    # Construct findings string
+                    findings = []
+                    for i_str, res in results.items():
+                        if isinstance(res, dict):
+                            res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
+                            if res_info:
+                                findings.append(f"Step {i_str} findings: {res_info}")
+                    
+                    prefix = "\n".join(findings) + "\n\n" if findings else ""
+                    final_msg = f"{prefix}Condition not met (actual qty is {actual_val}). No PO needed."
+                    try:
+                        from audit_logger import log_audit_event
+                    except ImportError:
+                        from agent.audit_logger import log_audit_event
+                    log_audit_event("chain_step", skill_name, chain_id, "rejected", user_id=user_id, details=f"index={idx}, condition_result=false, outcome=rejected, condition={actual_val} {op} {val}")
+                    return {
+                        "chain_aborted": False,
+                        "is_workflow_complete": True,
+                        "final_response": final_msg,
+                        "messages": [AIMessage(content=final_msg)]
+                    }
+                else:
+                    try:
+                        from audit_logger import log_audit_event
+                    except ImportError:
+                        from agent.audit_logger import log_audit_event
+                    log_audit_event("chain_step", skill_name, chain_id, "passed", user_id=user_id, details=f"index={idx}, condition_result=true, outcome=passed, condition={actual_val} {op} {val}")
+            except Exception as e:
+                return _abort(f"Condition evaluation failed: {e}")
+    else:
+        try:
+            from audit_logger import log_audit_event
+        except ImportError:
+            from agent.audit_logger import log_audit_event
+        log_audit_event("chain_step", skill_name, chain_id, "passed", user_id=user_id, details=f"index={idx}, condition_result=unconditional, outcome=passed")
+                
+    # Resolve uses
+    for k, v in uses.items():
+        if isinstance(v, str) and v.startswith("$step"):
+            try:
+                parts = v.replace("$step", "").split(".")
+                ref_idx = parts[0]
+                ref_key = parts[1]
+                if str(ref_idx) not in results:
+                    return _abort(f"Unresolved reference: step {ref_idx} not found for slot '{k}'")
+                
+                val = results.get(str(ref_idx), {}).get(ref_key)
+                if val is None:
+                    return _abort(f"Unresolved reference: field '{ref_key}' not found in step {ref_idx} for slot '{k}'")
+                slots[k] = val
+            except Exception as e:
+                return _abort(f"Invalid reference format for slot '{k}': {v}")
+
+    return {
+        "detected_intent": skill_name,
+        "collected_fields": slots,
+        "is_workflow_complete": False,
+        "clarification_attempts": 0,
+        "missing_parameters": [],
+        "all_required_filled": False,
+        "retry_count": 0,
+    }
+
+
+# =========================================================================
 # Router Functions
 # =========================================================================
 
@@ -2587,7 +2913,27 @@ def route_after_classify(state: AgentState) -> str:
     intent = state.get("detected_intent", "fallback")
     if intent == "fallback":
         return "fallback_response"
+    if state.get("pending_followup_steps"):
+        messages = state.get("messages", [])
+        if messages:
+            msg = messages[-1].content
+            import re
+            if re.search(r'\b(then|if|and then|after that)\b', msg, re.IGNORECASE):
+                return "plan_compound_chain"
     return "collect_parameters"
+def route_after_plan(state: AgentState) -> str:
+    """After plan_compound_chain_node: if aborted/completed return format_response, else prepare step."""
+    if state.get("is_workflow_complete"):
+        return "format_response"
+    if state.get("chain_plan"):
+        return "prepare_chain_step"
+    return "collect_parameters"
+
+def route_after_prepare(state: AgentState) -> str:
+    if state.get("is_workflow_complete"):
+        return "format_response"
+    return "validate_parameters"
+
 
 
 def route_after_validation(state: AgentState) -> str:
@@ -2672,9 +3018,21 @@ def route_after_tool(state: AgentState) -> str:
 
 
 def route_after_result_validation(state: AgentState) -> str:
-    """After result_validation (Step 8): format the agent message (Step 9), unless looping back."""
+    """
+    After result_validation_node:
+    - write failure -> retry_and_escalation
+    - loop-back needed (chain_plan or pending_followup_steps)
+    - otherwise -> format_agent_message
+    """
     if state.get("failure_classification"):
         return "retry_and_escalation"
+        
+    chain_plan = state.get("chain_plan")
+    if chain_plan and not state.get("chain_aborted"):
+        idx = state.get("chain_step_index", 0)
+        if idx < len(chain_plan):
+            return "prepare_chain_step"
+            
     if state.get("is_workflow_complete"):
         return "format_agent_message"
     if not state.get("detected_intent"): # cleared by loop-back logic
@@ -2701,6 +3059,8 @@ workflow = StateGraph(AgentState)
 # --- Register nodes ---
 workflow.add_node("resolve_followup",                  resolve_followup_node)           # Pre-classifier (Priority 1/2)
 workflow.add_node("classify_intent",                   classify_intent_node)
+workflow.add_node("plan_compound_chain",               plan_compound_chain_node)        # Compound step planner
+workflow.add_node("prepare_chain_step",                prepare_chain_step_node)         # Compound step preparer
 workflow.add_node("collect_parameters",                collect_parameters_node)
 workflow.add_node("validate_parameters",               validate_parameters_node)
 workflow.add_node("ask_for_missing_info",              ask_for_missing_info_node)
@@ -2733,13 +3093,35 @@ workflow.add_conditional_edges(
     }
 )
 
-# classify_intent → fallback | collect_parameters | format_response
+# classify_intent → fallback | plan_compound_chain | collect_parameters | format_response
 workflow.add_conditional_edges(
     "classify_intent",
     route_after_classify,
     {
         "fallback_response": "fallback_response",
+        "plan_compound_chain": "plan_compound_chain",
         "collect_parameters": "collect_parameters",
+        "format_response": "format_response"
+    }
+)
+
+# plan_compound_chain → prepare_chain_step | collect_parameters | format_response
+workflow.add_conditional_edges(
+    "plan_compound_chain",
+    route_after_plan,
+    {
+        "prepare_chain_step": "prepare_chain_step",
+        "collect_parameters": "collect_parameters",
+        "format_response": "format_response"
+    }
+)
+
+# prepare_chain_step → validate_parameters | format_response
+workflow.add_conditional_edges(
+    "prepare_chain_step",
+    route_after_prepare,
+    {
+        "validate_parameters": "validate_parameters",
         "format_response": "format_response"
     }
 )
