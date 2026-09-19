@@ -1391,11 +1391,8 @@ def precondition_validation_node(state: AgentState):
                 )
                 return {
                     "preconditions_validated": False,
-                    "failure_classification": "validation_error",
-                    "final_response": (
-                        f"{doctype} '{record_id}' no longer exists or the ID is invalid. "
-                        f"The document may have been deleted. Please verify and try again."
-                    ),
+                    "failure_classification": "not_found",
+                    "final_response": "",
                 }
 
         fresh_snapshot = fetch_result["data"]
@@ -2121,18 +2118,18 @@ def call_generic_tool_node(state: AgentState):
     tool_status = tool_res.get("status")
     failure_classification = None
 
-    if tool_status == "not_found":
-        failure_classification = "validation_error"
+    if tool_status == "not_found" or tool_status == "empty":
+        failure_classification = "not_found"
     elif tool_status == "permission_denied":
         failure_classification = "permission_denied"
     elif tool_status == "system_error":
         failure_classification = "tool_system_failure"
-    elif not tool_res.get("success", False) and tool_status != "empty":
+    elif not tool_res.get("success", False):
         err_str = str(tool_res.get("error", "")).lower()
         if "permission" in err_str or "whitelist" in err_str or "403" in err_str:
             failure_classification = "permission_denied"
         elif "not found" in err_str or "404" in err_str:
-            failure_classification = "validation_error"
+            failure_classification = "not_found"
         else:
             failure_classification = "tool_system_failure"
 
@@ -2450,6 +2447,38 @@ def retry_and_escalation_node(state: AgentState):
     if classification == "empty_result":
         return {}
         
+    if classification == "not_found":
+        entity_name = state.get("collected_fields", {}).get("name") or state.get("collected_fields", {}).get("id") or "unknown"
+        if doctype == "record" and state.get("detected_intent"):
+            skill = _get_skill_for_intent(state.get("detected_intent", ""))
+            if skill:
+                doctype = skill.get("doctype", "record")
+                
+        candidates = state.get("ambiguous_candidates")
+        suggestions = []
+        if candidates and isinstance(candidates, list):
+            for c in candidates:
+                c_name = c.get("name")
+                if c_name and c_name not in suggestions:
+                    suggestions.append(c_name)
+            suggestions = suggestions[:3]
+            
+        msg = f"I couldn't find a {doctype} matching '{entity_name}'."
+        if suggestions:
+            if len(suggestions) == 1:
+                msg += f" Did you mean '{suggestions[0]}'?"
+            elif len(suggestions) == 2:
+                msg += f" Did you mean '{suggestions[0]}' or '{suggestions[1]}'?"
+            else:
+                msg += f" Did you mean '{suggestions[0]}', '{suggestions[1]}', or '{suggestions[2]}'?"
+                
+        log_audit_event(operation=operation, doctype=doctype, target_name=entity_name, outcome="not_found", details=msg)
+        
+        updates["escalated"] = False
+        updates["is_workflow_complete"] = True
+        updates["final_response"] = msg
+        return updates
+
     if classification == "permission_denied":
         messages = state.get("messages", [])
         denial_count = 0
