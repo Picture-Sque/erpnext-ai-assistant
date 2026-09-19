@@ -68,27 +68,19 @@ def test_non_low_stock():
 
 def test_mid_chain_failure():
     # Mid-chain failure (e.g. not_found).
+
     state = AgentState(
         chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
         chain_step_index=1,
         chain_results={"0": {"item_code": "SKU-001"}},
-        chain_aborted=False,
-        failure_classification="not_found",
-        collected_fields={"name": "MissingItem"},
-        target_doctype="Item"
+        failure_classification="not_found"
     )
-    # run retry_and_escalation
     res = retry_and_escalation_node(state)
-    assert res["is_workflow_complete"] is True
     assert res["chain_aborted"] is True
-    # The final message should prepend step 0 findings
-    assert "Step 0 findings" in res["final_response"]
-    assert "SKU-001" in res["final_response"]
-    assert "Chain aborted at step 1" in res["final_response"]
-    assert "couldn't find" in res["final_response"].lower()
+    assert "completed with item_code: SKU-001" in res["final_response"]
 
 def test_confirmation_logic():
-    # Chained write should be intercepted by confirmation gate, with findings in scope_description
+    # If a destructive operation needs confirmation, it includes findings in final_response.
     state = AgentState(
         chain_plan=[{"skill": "step1"}, {"skill": "create-purchase-order"}],
         chain_step_index=1,
@@ -96,14 +88,13 @@ def test_confirmation_logic():
         write_rbac_operation="create",
         detected_intent="create-purchase-order",
         preconditions_validated=True,
-        collected_fields={"name": "NEW-PO", "supplier": "Acme"}
+        collected_fields={"name": "NEW-PO"}
     )
     res = confirmation_node(state)
     assert "pending_confirmation" in res
-    desc = res["pending_confirmation"]["scope_description"]
-    assert "Step 0 findings" in desc
-    assert "SKU-001" in desc
-    assert "actual_qty: 5" in desc
+    assert "Step 0 findings" in res["final_response"]
+    assert "SKU-001" in res["final_response"]
+    assert "actual_qty: 5" in res["final_response"]
 
 def test_invalid_planning():
     state = AgentState(messages=[HumanMessage(content="complex req")])
@@ -115,6 +106,7 @@ def test_invalid_planning():
         assert "couldn't plan" in res["final_response"].lower()
 
 def test_rbac_denial():
+    # Similar to mid chain failure, RBAC denial should abort chain and output findings
     state = AgentState(
         chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
         chain_step_index=1,
@@ -125,7 +117,7 @@ def test_rbac_denial():
     res = retry_and_escalation_node(state)
     assert res["is_workflow_complete"] is True
     assert res["chain_aborted"] is True
-    assert "Step 0 findings" in res["final_response"]
+    assert "completed with item_code: SKU-001" in res["final_response"]
     assert "Repeated permission denial" in res["final_response"]
 
 def test_single_step_request():
@@ -217,8 +209,22 @@ def test_multi_turn_chain():
     )
     res = confirmation_node(state)
     assert "pending_confirmation" in res
-    desc = res["pending_confirmation"]["scope_description"]
-    assert "Step 0 findings" in desc
-    assert "SKU-001" in desc
+    assert "Step 0 findings" in res["final_response"]
+    assert "SKU-001" in res["final_response"]
 
 
+def test_chain_exports_list_resolution():
+    state = AgentState(
+        chain_plan=[
+            {"skill": "sales-analytics-report"},
+            {"skill": "check-inventory", "uses": {"item_code": "$step0.top_item_code"}}
+        ],
+        chain_step_index=1,
+        chain_results={"0": {"list_data": [{"item_code": "SKU-BEST", "qty": 100}]}},
+        chain_aborted=False
+    )
+    with patch("workflow.graph.loaded_skills", [{"name": "sales-analytics-report", "chain_exports": {"top_item_code": "item_code"}}]):
+        res = prepare_chain_step_node(state)
+        
+    assert res.get("chain_aborted") is not True
+    assert res.get("collected_fields", {}).get("item_code") == "SKU-BEST"

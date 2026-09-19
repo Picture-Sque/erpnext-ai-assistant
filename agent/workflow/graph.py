@@ -134,6 +134,7 @@ def load_skills() -> List[Dict[str, Any]]:
                                     # Follow-up router fields
                                     "follow_up_eligible": bool(data.get("follow_up_eligible", False)),
                                     "follow_up_slots": data.get("follow_up_slots", []),
+                                    "chain_exports": data.get("chain_exports", {}),
                                 })
                 except Exception as e:
                     logger.warning(f"Failed to parse skill {skill_md}: {e}")
@@ -1798,26 +1799,29 @@ def confirmation_node(state: AgentState):
             scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}'?"
         else:
             scope_desc = f"Are you sure you want to {operation} {doctype} '{record_id}'?"
-        if chain_plan:
-            chain_results = state.get("chain_results", {})
-            findings = []
-            for idx_str, res in chain_results.items():
-                if isinstance(res, dict):
-                    res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
-                    if res_info:
-                        findings.append(f"Step {idx_str} findings: {res_info}")
-            if findings:
-                scope_desc = "\n".join(findings) + "\n\n" + scope_desc
     
-        pending = {
-            "operation": operation,
-            "doctype": doctype,
-            "target_name": record_id,
-            "scope_description": scope_desc,
-            "requested_at": len(messages)
-        }
+    findings_prefix = ""
+    chain_plan = state.get("chain_plan")
+    if chain_plan and not state.get("chain_aborted"):
+        chain_results = state.get("chain_results", {})
+        findings = []
+        for idx_str, res in chain_results.items():
+            if isinstance(res, dict):
+                res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
+                if res_info:
+                    findings.append(f"Step {idx_str} findings: {res_info}")
+        if findings:
+            findings_prefix = "\n".join(findings) + "\n\n"
     
-        logger.info(f"[Step 6] Generating confirmation ask for {operation} on {record_id}.")
+    pending = {
+        "operation": operation,
+        "doctype": doctype,
+        "target_name": record_id,
+        "scope_description": scope_desc,
+        "requested_at": len(messages)
+    }
+
+    logger.info(f"[Step 6] Generating confirmation ask for {operation} on {record_id}.")
     log_audit_event(
         operation=operation,
         doctype=doctype,
@@ -1827,7 +1831,7 @@ def confirmation_node(state: AgentState):
     )
     return {
         "pending_confirmation": pending,
-        "final_response": scope_desc + "\n\nReply **Yes** to confirm, or **No** to cancel.",
+        "final_response": findings_prefix + scope_desc + "\n\nReply **Yes** to confirm, or **No** to cancel.",
         "is_workflow_complete": False,
     }
 
@@ -2591,11 +2595,25 @@ def retry_and_escalation_node(state: AgentState):
             if isinstance(res, dict):
                 res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
                 if res_info:
-                    findings.append(f"Step {i_str} findings: {res_info}")
+                    try:
+                        s_name = chain_plan[int(i_str)].get("skill", i_str)
+                    except (IndexError, ValueError):
+                        s_name = i_str
+                    findings.append(f"- {s_name} completed with {res_info}")
+        
+        try:
+            failed_skill = chain_plan[idx].get("skill", idx)
+        except (IndexError, ValueError):
+            failed_skill = idx
+            
+        prefix_lines = ["Chain execution failed:"]
         if findings:
-            prefix = "\n".join(findings) + f"\n\nChain aborted at step {idx}: "
-            updates["final_response"] = prefix + updates.get("final_response", state.get("final_response", ""))
-            updates["messages"] = [AIMessage(content=updates["final_response"])]
+            prefix_lines.extend(findings)
+        prefix_lines.append(f"-> Aborted at step '{failed_skill}' (index {idx}): ")
+        prefix = "\n".join(prefix_lines)
+        
+        updates["final_response"] = prefix + updates.get("final_response", state.get("final_response", ""))
+        updates["messages"] = [AIMessage(content=updates["final_response"])]
             
     return updates
 
@@ -2652,9 +2670,17 @@ def format_response_node(state: AgentState):
     pending_steps = state.get("pending_followup_steps", [])
     updates = {}
     
-    if state.get("is_workflow_complete") and pending_steps:
-        final_resp += f"\n\nNote: The remaining requested steps were NOT attempted due to the above result: {', '.join(pending_steps)}."
-        updates["pending_followup_steps"] = []
+    if state.get("is_workflow_complete"):
+        if pending_steps:
+            final_resp += f"\n\nNote: The remaining requested steps were NOT attempted due to the above result: {', '.join(pending_steps)}."
+            updates["pending_followup_steps"] = []
+            
+        # Clear chain state on completion (abort, success, decline, unrelated finished)
+        updates["chain_plan"] = None
+        updates["chain_step_index"] = None
+        updates["chain_results"] = None
+        updates["chain_aborted"] = None
+        updates["chain_id"] = None
         
     updates["messages"] = [AIMessage(content=final_resp)]
     return updates
@@ -2816,7 +2842,13 @@ def prepare_chain_step_node(state: AgentState):
 
                 op = condition.get("operator")
                 val = condition.get("value")
-                if val is None:
+                if val is not None:
+                    # Enforce that user-stated threshold appears in user's message
+                    messages = state.get("messages", [])
+                    user_msgs = " ".join([m.content for m in messages if getattr(m, "type", "") == "human" or m.__class__.__name__ == "HumanMessage"])
+                    if str(val) not in user_msgs:
+                        val = CHAIN_LOW_STOCK_THRESHOLD
+                else:
                     val = CHAIN_LOW_STOCK_THRESHOLD
                 
                 passed = False
@@ -2878,7 +2910,20 @@ def prepare_chain_step_node(state: AgentState):
                 if str(ref_idx) not in results:
                     return _abort(f"Unresolved reference: step {ref_idx} not found for slot '{k}'")
                 
-                val = results.get(str(ref_idx), {}).get(ref_key)
+                step_res = results.get(str(ref_idx), {})
+                val = step_res.get(ref_key)
+                
+                if val is None and "list_data" in step_res:
+                    ref_skill_name = plan[int(ref_idx)].get("skill")
+                    skill_map = {s["name"]: s for s in loaded_skills}
+                    ref_skill_def = skill_map.get(ref_skill_name, {})
+                    chain_exports = ref_skill_def.get("chain_exports", {})
+                    if ref_key in chain_exports:
+                        actual_field = chain_exports[ref_key]
+                        list_data = step_res["list_data"]
+                        if list_data and isinstance(list_data[0], dict):
+                            val = list_data[0].get(actual_field)
+                            
                 if val is None:
                     return _abort(f"Unresolved reference: field '{ref_key}' not found in step {ref_idx} for slot '{k}'")
                 slots[k] = val
