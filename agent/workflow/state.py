@@ -249,3 +249,14 @@ class AgentState(TypedDict, total=False):
     # Real user id for auditing
     user_id: Optional[str]
 
+    # -------------------------------------------------------------------------
+    # 13. Compound Request Flag
+    # -------------------------------------------------------------------------
+
+    # Set by classify_intent_node when the LLM identifies the user message as a
+    # compound (2+ dependent actions) request.  Consumed by route_after_classify
+    # to enter plan_compound_chain_node.  Reset to False at the start of every
+    # user turn (in _build_intent_updates) and after the planner consumes it.
+    # Non-boolean values returned by the LLM are coerced to False with a warning.
+    is_compound: Optional[bool]
+

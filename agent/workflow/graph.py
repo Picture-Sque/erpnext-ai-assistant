@@ -403,9 +403,13 @@ def _build_intent_updates(new_intent: str, state: AgentState, extra_updates: Opt
             "clarification_target": None,
             "retry_count": 0,
             "is_workflow_complete": False,
+            "is_compound": False,  # Reset compound flag at every new turn
         })
     elif new_intent != current_intent:
         updates["retry_count"] = 0
+        # Only reset is_compound if the caller didn't explicitly set it (e.g. classifier set it True)
+        if extra_updates is None or "is_compound" not in extra_updates:
+            updates["is_compound"] = False  # Reset on intent change if not explicitly provided
         
     return updates
 
@@ -463,9 +467,19 @@ def classify_intent_node(state: AgentState):
         f"Classify the user message intent into one of the allowed categories.\n"
         f"Allowed categories:\n{skills_descriptions}\n"
         f"Or 'fallback'.\n"
-        f"If the user is asking for multiple chained actions (e.g. 'do X then do Y'), classify the FIRST action only, and list the remaining actions as plain text strings in 'pending_followup_steps'.\n"
+        f"If the user is asking for 2 or more DEPENDENT actions in a single message (compound request), "
+        f"set is_compound to true, classify the FIRST action only as the intent, "
+        f"and list the remaining actions as plain text strings in 'pending_followup_steps'.\n"
+        f"Set is_compound to false for single-action messages.\n"
+        f"Examples:\n"
+        f"  'Find our best-selling item, check its stock, and create a PO if stock is low' "
+        f"→ is_compound: true\n"
+        f"  'What is the stock of ITEM-DESK-001?' → is_compound: false\n"
+        f"  'Create a sales order for Acme Corp' → is_compound: false\n"
         f"User message: '{last_msg}'{context_str}\n"
-        f"Respond strictly with JSON object: {{\"intent\": \"<category>\", \"pending_followup_steps\": [\"step 2 description\", ...]}}"
+        f"Respond strictly with JSON object: "
+        f"{{\"intent\": \"<category>\", \"is_compound\": <true|false>, "
+        f"\"pending_followup_steps\": [\"step 2 description\", ...]}}"
     )
     res = invoke_structured_llm(prompt)
     if res is None:
@@ -489,16 +503,31 @@ def classify_intent_node(state: AgentState):
 
     intent = "fallback"
     pending_steps = state.get("pending_followup_steps", [])
+    is_compound = False  # Default: safe
     if res and res.get("intent"):
         llm_intent = res.get("intent")
         if llm_intent in [s["name"] for s in loaded_skills] or llm_intent == "fallback":
             intent = llm_intent
-            
+
         if "pending_followup_steps" in res and not current_intent:
             pending_steps = res.get("pending_followup_steps", [])
 
-    logger.info(f"Classified intent: {intent}")
-    return _build_intent_updates(intent, state, {"pending_followup_steps": pending_steps})
+        # Validate is_compound: must be a Python bool; warn and coerce on anything else.
+        raw_compound = res.get("is_compound", False)
+        if isinstance(raw_compound, bool):
+            is_compound = raw_compound
+        else:
+            logger.warning(
+                f"classify_intent_node: is_compound returned non-boolean value "
+                f"{raw_compound!r} (type {type(raw_compound).__name__}); treating as False."
+            )
+            is_compound = False
+
+    logger.info(f"Classified intent: {intent}, is_compound: {is_compound}")
+    return _build_intent_updates(intent, state, {
+        "pending_followup_steps": pending_steps,
+        "is_compound": is_compound,
+    })
 
 
 def collect_parameters_node(state: AgentState):
@@ -2681,6 +2710,7 @@ def format_response_node(state: AgentState):
         updates["chain_results"] = None
         updates["chain_aborted"] = None
         updates["chain_id"] = None
+        updates["is_compound"] = False  # Never let this leak across turns
         
     updates["messages"] = [AIMessage(content=final_resp)]
     return updates
@@ -2774,7 +2804,7 @@ Respond strictly with a JSON object: {{"steps": [{{ "skill": "...", "slots": {{}
             except:
                 return _abort(f"Invalid uses reference in step {i}: {v}")
                 
-    # Start chain execution
+    # Start chain execution; clear is_compound now that the planner has consumed it.
     import uuid
     return {
         "chain_plan": steps,
@@ -2783,6 +2813,7 @@ Respond strictly with a JSON object: {{"steps": [{{ "skill": "...", "slots": {{}
         "chain_aborted": False,
         "chain_id": str(uuid.uuid4()),
         "pending_followup_steps": [],
+        "is_compound": False,  # Consumed; reset so it doesn't leak into later turns.
     }
 
 
@@ -2952,19 +2983,23 @@ def route_after_collect(state: AgentState) -> str:
 
 
 def route_after_classify(state: AgentState) -> str:
-    """After classify_intent: route fallback intents directly, otherwise collect parameters."""
+    """
+    After classify_intent: route fallback intents directly, otherwise collect parameters.
+
+    Routing to plan_compound_chain:
+      - state.is_compound is True  (fresh compound message identified by the classifier), OR
+      - state.pending_followup_steps is non-empty (in-progress chain loop-back).
+    The old keyword-regex gate is intentionally removed; is_compound is the sole
+    semantic signal for new compound messages.
+    """
     if state.get("failure_classification") == "llm_unavailable":
         return "format_response"
     intent = state.get("detected_intent", "fallback")
     if intent == "fallback":
         return "fallback_response"
-    if state.get("pending_followup_steps"):
-        messages = state.get("messages", [])
-        if messages:
-            msg = messages[-1].content
-            import re
-            if re.search(r'\b(then|if|and then|after that)\b', msg, re.IGNORECASE):
-                return "plan_compound_chain"
+    # Enter chain planner for fresh compound requests OR continuing chains.
+    if state.get("is_compound") or state.get("pending_followup_steps"):
+        return "plan_compound_chain"
     return "collect_parameters"
 def route_after_plan(state: AgentState) -> str:
     """After plan_compound_chain_node: if aborted/completed return format_response, else prepare step."""
