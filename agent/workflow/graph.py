@@ -3292,6 +3292,7 @@ workflow.add_conditional_edges(
         "retry_and_escalation": "retry_and_escalation",
         "format_agent_message": "format_agent_message",
         "classify_intent": "classify_intent",
+        "prepare_chain_step": "prepare_chain_step",
     }
 )
 
