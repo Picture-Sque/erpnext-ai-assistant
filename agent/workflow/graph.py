@@ -2211,102 +2211,117 @@ def result_validation_node(state: AgentState):
     """
     intent = state.get("detected_intent", "")
     skill = _get_skill_for_intent(intent)
+    tool = ""
+    operation = None
     if not skill:
         operation = state.get("write_rbac_operation")
         if not operation or operation not in _TOOL_TO_OPERATION.values():
-            return {}
-        tool = state.get("target_tool") or {v: k for k, v in _TOOL_TO_OPERATION.items()}.get(operation, "")
+            if not state.get("chain_plan") and not state.get("pending_followup_steps"):
+                return {}
+        tool = state.get("target_tool") or ({v: k for k, v in _TOOL_TO_OPERATION.items()}.get(operation, "") if operation else "")
     else:
         tool = skill.get("tool", "")
-        if tool not in _WRITE_TOOLS:
-            return {} # Read-only, skip
         operation = state.get("write_rbac_operation") or _TOOL_TO_OPERATION.get(tool, "")
 
+    is_write = tool in _WRITE_TOOLS
+    chain_plan = state.get("chain_plan")
+    pending_steps = state.get("pending_followup_steps", [])
+
+    # If it's a read-only operation and NOT part of any chain or multi-step, skip verification
+    if not is_write and not chain_plan and not pending_steps:
+        return {}
+
     doctype = state.get("target_doctype") or (skill.get("doctype", "") if skill else "")
-    tool_raw = state.get("tool_raw_response", {})
+    tool_raw = state.get("tool_raw_response", {}) or {}
     success = tool_raw.get("success", False)
     data = tool_raw.get("data")
-    
+    collected = state.get("collected_fields", {}) or {}
+
     # If the tool failed upfront, verification is not needed
     if not success:
+        if chain_plan:
+            return {
+                "chain_aborted": True,
+                "is_workflow_complete": True,
+                "final_response": f"Chain stopped: step failed with error: {tool_raw.get('error', 'Unknown error')}"
+            }
         return {}
 
     write_verified = False
     failure_classification = None
     failure_msg = ""
 
-    # Extract the target record name/ID
-    record_id = None
-    if isinstance(data, dict):
-        record_id = data.get("name")
-    if not record_id:
-        collected = state.get("collected_fields", {})
-        record_id = collected.get("id") or collected.get("name")
+    if is_write:
+        # Extract the target record name/ID
+        record_id = None
+        if isinstance(data, dict):
+            record_id = data.get("name")
         if not record_id:
-            resolved_entities = state.get("resolved_entities", {})
-            for k, v in resolved_entities.items():
-                if isinstance(v, dict) and v.get("name"):
-                    record_id = v.get("name")
-                    break
+            record_id = collected.get("id") or collected.get("name")
+            if not record_id:
+                resolved_entities = state.get("resolved_entities", {})
+                for k, v in resolved_entities.items():
+                    if isinstance(v, dict) and v.get("name"):
+                        record_id = v.get("name")
+                        break
 
-    # VERIFICATION LOGIC
-    is_ambiguous = True
-    
-    if operation == "create":
-        # Unambiguous if it returned a dict with 'name'
-        if isinstance(data, dict) and data.get("name"):
-            is_ambiguous = False
-            write_verified = True
-            
-    if is_ambiguous and record_id:
-        logger.info(f"[Step 8] Re-reading {doctype} '{record_id}' for write verification.")
-        read_res = get_document(doctype, record_id)
-        if operation == "delete":
-            if read_res.get("status") == "not_found":
+        # VERIFICATION LOGIC
+        is_ambiguous = True
+        
+        if operation == "create":
+            # Unambiguous if it returned a dict with 'name'
+            if isinstance(data, dict) and data.get("name"):
+                is_ambiguous = False
                 write_verified = True
-            else:
-                write_verified = False
-                failure_classification = "tool_system_failure"
-                failure_msg = f"Requested to delete {doctype} '{record_id}', but the document still exists after verification. The operation may not have completed."
-        else:
-            if read_res.get("status") == "success":
-                doc = read_res.get("data", {})
-                if operation == "update":
-                    collected = state.get("collected_fields", {})
-                    write_verified = True
-                    for k, expected_val in collected.items():
-                        if k in ("id", "name", "filters", "_auto_resolved_note"): continue
-                        if k in doc and str(doc[k]) != str(expected_val):
-                            write_verified = False
-                            failure_classification = "conflict_stale_data"
-                            failure_msg = f"Requested update to '{k}' to '{expected_val}' on {doctype} '{record_id}', but the document still shows '{doc[k]}' after verification. The update may not have completed."
-                            break
-                elif operation == "cancel":
-                    if str(doc.get("docstatus")) == "2":
-                        write_verified = True
-                    else:
-                        write_verified = False
-                        failure_classification = "tool_system_failure"
-                        failure_msg = f"Requested to cancel {doctype} '{record_id}', but its docstatus is still {doc.get('docstatus')} after verification. The cancellation may have been blocked."
-                elif operation == "submit":
-                    if str(doc.get("docstatus")) == "1":
-                        write_verified = True
-                    else:
-                        write_verified = False
-                        failure_classification = "tool_system_failure"
-                        failure_msg = f"Requested to submit {doctype} '{record_id}', but its docstatus is still {doc.get('docstatus')} after verification. The submission may have been blocked."
-                elif operation == "create":
-                    write_verified = True
-            else:
-                write_verified = False
-                failure_classification = "tool_system_failure"
-                failure_msg = f"Could not verify {operation} on {doctype} '{record_id}' — document fetch failed after operation."
                 
-    elif not record_id and operation != "create":
-        # Bulk operations
-        bulk_scope = state.get("bulk_operation_scope")
-        if bulk_scope and bulk_scope.get("confirmed"):
-            write_verified = True # Verified via tool's own loop aggregation in Step 7
+        if is_ambiguous and record_id:
+            logger.info(f"[Step 8] Re-reading {doctype} '{record_id}' for write verification.")
+            read_res = get_document(doctype, record_id)
+            if operation == "delete":
+                if read_res.get("status") == "not_found":
+                    write_verified = True
+                else:
+                    write_verified = False
+                    failure_classification = "tool_system_failure"
+                    failure_msg = f"Requested to delete {doctype} '{record_id}', but the document still exists after verification. The operation may not have completed."
+            else:
+                if read_res.get("status") == "success":
+                    doc = read_res.get("data", {})
+                    if operation == "update":
+                        write_verified = True
+                        for k, expected_val in collected.items():
+                            if k in ("id", "name", "filters", "_auto_resolved_note"): continue
+                            if k in doc and str(doc[k]) != str(expected_val):
+                                write_verified = False
+                                failure_classification = "conflict_stale_data"
+                                failure_msg = f"Requested update to '{k}' to '{expected_val}' on {doctype} '{record_id}', but the document still shows '{doc[k]}' after verification. The update may not have completed."
+                                break
+                    elif operation == "cancel":
+                        if str(doc.get("docstatus")) == "2":
+                            write_verified = True
+                        else:
+                            write_verified = False
+                            failure_classification = "tool_system_failure"
+                            failure_msg = f"Requested to cancel {doctype} '{record_id}', but its docstatus is still {doc.get('docstatus')} after verification. The cancellation may have been blocked."
+                    elif operation == "submit":
+                        if str(doc.get("docstatus")) == "1":
+                            write_verified = True
+                        else:
+                            write_verified = False
+                            failure_classification = "tool_system_failure"
+                            failure_msg = f"Requested to submit {doctype} '{record_id}', but its docstatus is still {doc.get('docstatus')} after verification. The submission may have been blocked."
+                    elif operation == "create":
+                        write_verified = True
+                else:
+                    write_verified = False
+                    failure_classification = "tool_system_failure"
+                    failure_msg = f"Could not verify {operation} on {doctype} '{record_id}' — document fetch failed after operation."
+                    
+        elif not record_id and operation != "create":
+            # Bulk operations
+            bulk_scope = state.get("bulk_operation_scope")
+            if bulk_scope and bulk_scope.get("confirmed"):
+                write_verified = True # Verified via tool's own loop aggregation in Step 7
 
     updates = {}
     if failure_classification:
@@ -2335,14 +2350,10 @@ def result_validation_node(state: AgentState):
         updates["retry_count"] = 0
     
     # LOOP-BACK LOGIC for multi-step
-    pending_steps = state.get("pending_followup_steps", [])
-    chain_plan = state.get("chain_plan")
-    
     if chain_plan and not state.get("chain_aborted") and (write_verified or not is_write):
         idx = state.get("chain_step_index", 0)
         results = dict(state.get("chain_results", {}))
         
-        data = tool_raw_response.get("data")
         step_res = {}
         if isinstance(data, dict):
             step_res.update(data)
@@ -2359,13 +2370,14 @@ def result_validation_node(state: AgentState):
         updates["chain_results"] = results
         updates["chain_step_index"] = idx + 1
         
-        # Clear fields for next step
-        updates["detected_intent"] = ""
-        updates["collected_fields"] = {}
-        updates["resolved_entities"] = {}
-        updates["preconditions_validated"] = None
-        updates["bulk_operation_scope"] = None
-        updates["pending_confirmation"] = None
+        # Clear fields for next step only if there are more steps
+        if idx + 1 < len(chain_plan):
+            updates["detected_intent"] = ""
+            updates["collected_fields"] = {}
+            updates["resolved_entities"] = {}
+            updates["preconditions_validated"] = None
+            updates["bulk_operation_scope"] = None
+            updates["pending_confirmation"] = None
         
     elif write_verified and pending_steps:
         messages = state.get("messages", [])
@@ -2400,6 +2412,12 @@ def result_validation_node(state: AgentState):
 def format_agent_message_node(state: AgentState):
     """Step 9a: Format the tool result into a human-readable assistant message."""
     intent = state.get("detected_intent", "")
+    if not intent and state.get("chain_plan"):
+        chain_plan = state.get("chain_plan", [])
+        idx = min(state.get("chain_step_index", 1) - 1, len(chain_plan) - 1)
+        if idx >= 0:
+            intent = chain_plan[idx].get("skill", "")
+
     tool_raw_response = state.get("tool_raw_response", {}) or {}
     collected = state.get("collected_fields", {}) or {}
     messages = state.get("messages", [])
@@ -3116,6 +3134,7 @@ def route_after_result_validation(state: AgentState) -> str:
         idx = state.get("chain_step_index", 0)
         if idx < len(chain_plan):
             return "prepare_chain_step"
+        return "format_agent_message"
             
     if state.get("is_workflow_complete"):
         return "format_agent_message"

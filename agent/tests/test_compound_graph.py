@@ -27,6 +27,8 @@ from workflow.graph import (
     prepare_chain_step_node,
     classify_intent_node,
     confirmation_node,
+    result_validation_node,
+    route_after_result_validation,
     CHAIN_LOW_STOCK_THRESHOLD,
 )
 from workflow.state import AgentState
@@ -328,3 +330,52 @@ def test_planner_resets_is_compound():
     assert "chain_plan" in res
     assert res.get("is_compound") is False, \
         f"is_compound must be reset after planner consumes it, got {res.get('is_compound')!r}"
+
+
+# ===========================================================================
+# result_validation_node chain progression for read-only skills
+# ===========================================================================
+
+def test_result_validation_advances_chain_on_read_only_skill():
+    """Read-only skill in a chain must store results and advance chain_step_index."""
+    state = AgentState(
+        detected_intent="sales-analytics-report",
+        chain_plan=[
+            {"skill": "sales-analytics-report", "slots": {}, "uses": {}, "condition": None},
+            {"skill": "check-inventory", "slots": {}, "uses": {"item_code": "$step0.item_code"}, "condition": None},
+        ],
+        chain_step_index=0,
+        chain_results={},
+        chain_aborted=False,
+        collected_fields={"query_type": "best_selling_item_qty"},
+        tool_raw_response={
+            "success": True,
+            "data": [{"item_code": "ITEM-DESK-001", "qty": 580.0}],
+        },
+    )
+    res = result_validation_node(state)
+    assert res.get("chain_step_index") == 1
+    assert "0" in res.get("chain_results", {})
+    assert res["chain_results"]["0"].get("item_code") == "ITEM-DESK-001"
+    assert res["chain_results"]["0"].get("qty") == 580.0
+    # Next step exists, so per-turn fields must be cleared
+    assert res.get("detected_intent") == ""
+    assert res.get("collected_fields") == {}
+
+
+def test_route_after_result_validation_chain_flow():
+    """route_after_result_validation routes to prepare_chain_step while steps remain, format_agent_message when done."""
+    state_in_progress = AgentState(
+        chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
+        chain_step_index=1,
+        chain_aborted=False,
+    )
+    assert route_after_result_validation(state_in_progress) == "prepare_chain_step"
+
+    state_completed = AgentState(
+        chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
+        chain_step_index=2,
+        chain_aborted=False,
+    )
+    assert route_after_result_validation(state_completed) == "format_agent_message"
+
