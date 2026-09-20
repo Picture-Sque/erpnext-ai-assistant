@@ -3016,7 +3016,7 @@ def route_after_plan(state: AgentState) -> str:
 def route_after_prepare(state: AgentState) -> str:
     if state.get("is_workflow_complete"):
         return "format_response"
-    return "validate_parameters"
+    return "collect_parameters"
 
 
 
@@ -3200,12 +3200,12 @@ workflow.add_conditional_edges(
     }
 )
 
-# prepare_chain_step → validate_parameters | format_response
+# prepare_chain_step → collect_parameters | format_response
 workflow.add_conditional_edges(
     "prepare_chain_step",
     route_after_prepare,
     {
-        "validate_parameters": "validate_parameters",
+        "collect_parameters": "collect_parameters",
         "format_response": "format_response"
     }
 )
