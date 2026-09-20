@@ -445,7 +445,11 @@ def classify_intent_node(state: AgentState):
 
     # 2. Check skill declarative keywords (longest match first) - SKIP if it's a short context message
     # so we don't accidentally match "sell" inside "Standard Selling" or other false positives.
-    if not context_str:
+    # ALSO skip if it looks like a compound request (contains 'and', 'then', 'if', or commas),
+    # so the LLM can correctly set is_compound.
+    is_compound_candidate = bool(re.search(r'\b(and|then|if|after)\b|,', cleaned))
+    
+    if not context_str and not is_compound_candidate:
         all_kw = []
         for skill in loaded_skills:
             for kw in skill.get("keywords", []):
