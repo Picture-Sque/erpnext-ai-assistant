@@ -260,3 +260,13 @@ class AgentState(TypedDict, total=False):
     # Non-boolean values returned by the LLM are coerced to False with a warning.
     is_compound: Optional[bool]
 
+    # -------------------------------------------------------------------------
+    # 14. Contextual Write History
+    # -------------------------------------------------------------------------
+
+    # After a verified write operation, stores the target doctype and name
+    # e.g. {"doctype": "Purchase Order", "name": "PUR-ORD-2026-00020"}.
+    # Used to resolve elliptical references (like "submit") in follow-up turns.
+    # None when no write has occurred in the session yet.
+    last_created_doc: Optional[dict]
+

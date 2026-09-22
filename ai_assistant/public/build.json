@@ -1,8 +1,1 @@
-{
-	"desk/assistant.js": [
-		"public/desk/assistant.js"
-	],
-	"desk/assistant.css": [
-		"public/desk/assistant.css"
-	]
-}
+{"desk/assistant.bundle.js": ["public/desk/assistant.bundle.js"], "desk/assistant.bundle.css": ["public/desk/assistant.bundle.css"]}

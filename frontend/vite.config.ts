@@ -11,10 +11,9 @@ export default defineConfig({
 		cssCodeSplit: true,
 		rollupOptions: {
 			output: {
-				entryFileNames: "assistant.js",
+				entryFileNames: "assistant.bundle.js",
 				chunkFileNames: "chunks/[name].js",
-				assetFileNames: assetInfo =>
-					assetInfo.name?.endsWith(".css") ? "assistant.css" : "assets/[name][extname]"
+				assetFileNames: "assistant.bundle.[ext]"
 			}
 		}
 	}

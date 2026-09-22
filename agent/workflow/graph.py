@@ -551,6 +551,9 @@ def collect_parameters_node(state: AgentState):
     if last_msg.strip():
         req_fields = skill.get("required_fields", [])
         opt_fields = skill.get("optional_fields", [])
+        last_created_doc = state.get("last_created_doc")
+        last_created_msg = f"Last created document: {json.dumps(last_created_doc)}\nIf the user uses pronouns (it, that, the PO) or just says 'submit'/'cancel', use this document's name for the 'name' or 'id' field if it matches the expected doctype." if last_created_doc else ""
+
         prompt = (
             f"You are a precise JSON entity extractor for ERPNext AI Assistant.\n"
             f"Skill name: '{skill['name']}'\n"
@@ -558,8 +561,10 @@ def collect_parameters_node(state: AgentState):
             f"Optional fields: {opt_fields}\n"
             f"Skill instructions:\n{skill['instructions']}\n"
             f"Current collected fields: {json.dumps(wrap_free_text_fields(current_fields))}\n"
+            f"{last_created_msg}\n"
             f"User message: '{last_msg}'\n"
             f"Extract or update fields using the exact field names listed above according to the skill instructions.\n"
+            f"Do not invent or assume values. In particular, NEVER default quantities to 1 unless the user explicitly said 'one' or '1'.\n"
             f"Respond strictly with a JSON object of extracted fields."
         )
 
@@ -1826,9 +1831,29 @@ def confirmation_node(state: AgentState):
         display_name = _get_display_name(display_info) if display_info else record_id
     
         # If it was a fuzzy match, make the scope description explicitly name the match
-        if target_match_type == "fuzzy" and matched_on and display_name.lower() != matched_on.lower():
+        if operation == "create" and doctype == "Purchase Order":
+            supplier = collected.get("supplier", "Unknown Supplier")
+            items = collected.get("items", [])
+            item_details = []
+            total = 0
+            for it in items:
+                it_code = it.get("item_code", "Unknown")
+                try:
+                    qty = float(it.get("qty", 0))
+                except (ValueError, TypeError):
+                    qty = 0
+                try:
+                    rate = float(it.get("rate", 0))
+                except (ValueError, TypeError):
+                    rate = 0
+                line_total = qty * rate
+                total += line_total
+                item_details.append(f"- {qty}x {it_code} @ {rate}")
+            items_str = "\n".join(item_details) if item_details else "- No items"
+            scope_desc = f"Are you sure you want to create a Purchase Order for supplier '{supplier}'?\n\nItems:\n{items_str}\n\nEstimated Total: {total}"
+        elif target_match_type == "fuzzy" and matched_on and display_name.lower() != matched_on.lower():
             scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}' (closest match to '{matched_on}')?"
-        elif target_match_type == "fuzzy" and display_name.lower() != record_id.lower():
+        elif target_match_type == "fuzzy" and display_name and record_id and display_name.lower() != record_id.lower():
             scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}'?"
         else:
             scope_desc = f"Are you sure you want to {operation} {doctype} '{record_id}'?"
@@ -2348,6 +2373,8 @@ def result_validation_node(state: AgentState):
             outcome="executed"
         )
         updates["retry_count"] = 0
+        if operation in ("create", "submit", "update") and record_id and doctype:
+            updates["last_created_doc"] = {"doctype": doctype, "name": record_id}
     
     # LOOP-BACK LOGIC for multi-step
     if chain_plan and not state.get("chain_aborted") and (write_verified or not is_write):
