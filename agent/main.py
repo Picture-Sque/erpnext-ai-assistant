@@ -56,6 +56,7 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -326,6 +327,6 @@ async def delete_doctype_endpoint(request: GenericToolRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Run locally on localhost:8000
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
+    # Run locally on 0.0.0.0:8000
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
 

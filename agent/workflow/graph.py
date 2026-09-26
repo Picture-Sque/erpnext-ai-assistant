@@ -548,8 +548,11 @@ def collect_parameters_node(state: AgentState):
     conversation_text = " ".join([m.content for m in messages])
     fields = dict(current_fields)
 
-    if last_msg.strip():
-        req_fields = skill.get("required_fields", [])
+    chain_plan = state.get("chain_plan")
+    req_fields = skill.get("required_fields", [])
+    has_all_required = bool(req_fields) and all(current_fields.get(rf) is not None and str(current_fields.get(rf)).strip() != "" for rf in req_fields)
+
+    if last_msg.strip() and not (chain_plan and has_all_required):
         opt_fields = skill.get("optional_fields", [])
         last_created_doc = state.get("last_created_doc")
         last_created_msg = f"Last created document: {json.dumps(last_created_doc)}\nIf the user uses pronouns (it, that, the PO) or just says 'submit'/'cancel', use this document's name for the 'name' or 'id' field if it matches the expected doctype." if last_created_doc else ""
@@ -593,7 +596,7 @@ def collect_parameters_node(state: AgentState):
         if res and isinstance(res, dict):
             for k, v in res.items():
                 if v is not None and str(v).strip() != "" and v != "null":
-                    if is_continuation and k in current_fields and current_fields.get(k):
+                    if (is_continuation or chain_plan) and k in current_fields and current_fields.get(k):
                         continue
                     fields[k] = v
 
@@ -1950,8 +1953,15 @@ def call_generic_tool_node(state: AgentState):
             if isinstance(flt, list) and len(flt) == 3:
                 field_name, op, template_val = flt
                 val = str(template_val)
+                is_list_match = False
                 for k, v in collected.items():
-                    val = val.replace(f"%{{{k}}}%", f"%{v}%").replace(f"{{{k}}}", str(v))
+                    if isinstance(v, list) and template_val == f"{{{k}}}":
+                        op = "in"
+                        val = v
+                        is_list_match = True
+                        break
+                    elif not isinstance(v, list):
+                        val = val.replace(f"%{{{k}}}%", f"%{v}%").replace(f"{{{k}}}", str(v))
                 formatted_filters.append([field_name, op, val])
 
         # Optional filters
@@ -2596,11 +2606,31 @@ def _retry_and_escalation_node_impl(state: AgentState):
         return {}
         
     if classification == "not_found":
-        entity_name = state.get("collected_fields", {}).get("name") or state.get("collected_fields", {}).get("id") or "unknown"
-        if doctype == "record" and state.get("detected_intent"):
-            skill = _get_skill_for_intent(state.get("detected_intent", ""))
-            if skill:
-                doctype = skill.get("doctype", "record")
+        collected = state.get("collected_fields", {}) or {}
+        intent = state.get("detected_intent", "")
+        skill = _get_skill_for_intent(intent) if intent else None
+        
+        if doctype == "record" and skill:
+            doctype = skill.get("doctype", "record")
+
+        entity_name = None
+        if skill:
+            req_fields = skill.get("required_fields", [])
+            for rf in req_fields:
+                val = collected.get(rf)
+                if val is not None and str(val).strip():
+                    entity_name = str(val)
+                    break
+
+        if not entity_name:
+            for key in ("name", "id", "item_code", "customer_name", "customer", "supplier", "title", "search_term"):
+                val = collected.get(key)
+                if val is not None and str(val).strip():
+                    entity_name = str(val)
+                    break
+
+        if not entity_name:
+            entity_name = "unknown"
                 
         candidates = state.get("ambiguous_candidates")
         suggestions = []

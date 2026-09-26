@@ -1,7 +1,7 @@
 ---
 name: customer-lookup
 intent: customer-lookup
-description: Look up an ERPNext customer record by name, ID, or partial match. Use when the user asks "find customer X", "who is X", needs customer details, or when another skill needs to confirm a customer exists.
+description: Look up an ERPNext customer record by name, ID, or partial match, or list all customers when no specific customer is requested. Use when the user asks "show all customers", "show me all customer", "list customers", "find customer X", "who is X", needs customer details, or when another skill needs to confirm a customer exists.
 allowed_roles:
   - Sales User
   - Sales Manager
@@ -11,12 +11,14 @@ allowed_roles:
   - Administrator
 tool: get_list
 doctype: Customer
-required_fields:
+required_fields: []
+optional_fields:
   - customer_name
-optional_fields: []
 query_parameters:
-  filters:
-    - ["customer_name", "like", "%{customer_name}%"]
+  filters: []
+  optional_filters:
+    - field: customer_name
+      filter: ["customer_name", "like", "%{customer_name}%"]
   fields:
     - customer_name
     - customer_group
@@ -37,6 +39,12 @@ keywords:
   - "customer group"
   - "customer info"
   - "customer"
+  - "show all customer"
+  - "show me all customer"
+  - "show all customers"
+  - "show me all customers"
+  - "list customers"
+  - "list all customers"
   - details of
   - details for
   - their customer group
@@ -58,6 +66,9 @@ response_template: |
   - **Mobile**: {mobile_no}
 not_found_message: "Customer Lookup Result:\n\nUnfortunately, we were unable to find any information on the customer \"{customer_name}\" in our database."
 examples:
+  - "Show me all customers"
+  - "Show me all customer"
+  - "List all customers"
   - "Look up customer West View Software Ltd."
   - "Show me details of West View Software Ltd."
   - "Find customer Acme"
@@ -66,10 +77,11 @@ examples:
 # Customer Lookup
 
 ## When to use
-Trigger this skill when the user wants to find or confirm details about a customer, or when another skill needs a customer confirmed before proceeding.
+Trigger this skill when the user wants to list all customers, or find and confirm details about a specific customer, or when another skill needs a customer confirmed before proceeding.
 
 ## Required information
-- **customer_name**: customer name (full or partial), or customer ID
+- None for listing all customers.
+- **customer_name**: (Optional) customer name (full or partial), or customer ID for looking up a specific customer.
 
 ## ERPNext details
 - Doctype: `Customer`
@@ -80,6 +92,6 @@ Trigger this skill when the user wants to find or confirm details about a custom
 Tool name: `get_list` with DocType `Customer`.
 
 ## Steps
-1. Call `get_list` with `customer_name` filter.
-2. If match found, return formatted customer details.
-3. If no match, state that no customer record was found.
+1. Call `get_list` on DocType `Customer` (with `customer_name` filter if specified, or without filters if user wants all customers).
+2. If records are found, format and return customer details/table.
+3. If looking up a specific customer and no match is found, state that no customer record was found.
