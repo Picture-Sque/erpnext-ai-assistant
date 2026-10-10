@@ -1,188 +1,252 @@
-# ERPNext AI Assistant
+# AI Assistant for ERPNext
 
-An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, Vite, LangGraph, Groq LLM (`gpt-oss-120b`), and FastAPI.
+An AI chatbot agent for **ERPNext / Frappe Desk**, built with **FastAPI**, **LangGraph**, **React**, and LLMs served through **Groq** (or **xAI**).
 
-The assistant is injected globally into the ERPNext Desk UI, providing an interactive sidebar chat interface powered by an intelligent agent workflow without modifying any core ERPNext or Frappe files.
+The assistant translates natural-language requests into verified ERPNext REST API operations. It enforces role-based access control (RBAC), validates required fields before acting, asks for confirmation before writes, and verifies the result after a document is created.
+
+> [!IMPORTANT]
+> **Current Version**: This README describes the **`integration-fixed`** branch, which is the current working version of the project. The `main` branch may not reflect the latest features and fixes.
 
 ---
 
-## Architecture Overview
+## Key Features
+
+* **19 declarative skills**: Natural-language workflows for Customers, Sales Orders, Purchase Orders, Items, Stock, and Business Analytics. Each skill is defined as a spec in `skills/`.
+* **Multi-step safety pipeline**: A LangGraph state machine (19 compiled nodes covering 10 main stages) handles intent classification, slot collection, parameter validation, entity resolution, RBAC checks, precondition checks, and a confirmation gate.
+* **Write verification (Gate 6)**: After a create operation, the returned document is checked immediately (including its `name`) to prevent duplicate retries.
+* **Session state**: Conversation messages and slot state, including the last created document (`last_created_doc`), are persisted in SQLite (`chat_history.db`). This lets the agent resolve some follow-ups such as "that customer". See [Known Limitations](#known-limitations) for what does not work yet.
+* **Embedded Frappe Desk UI**: A React + TypeScript chat widget bundled as a Desk asset (`assistant.bundle.js`) and shown as a drawer inside ERPNext.
+* **Security and audit logging**: JWT authentication matched to ERPNext Desk sessions, role-based permission checks, and a SQLite audit log (`audit_log.db`).
+* **DocType whitelist**: Generic CRUD tools only operate on a fixed set of 12 DocTypes (configurable through an environment variable).
+
+---
+
+## Architecture
+
+The diagram below is a simplified view of the pipeline. The compiled graph in `agent/workflow/graph.py` contains additional helper nodes.
 
 ```mermaid
-graph TD
-    subgraph Host Development Environment
-        A[React Frontend: Vite/TypeScript] -->|npm run build| B[Production Assets: assistant.js / assistant.css]
-        G[FastAPI Agent Service: Port 8000] -->|LangGraph + Groq API| H[ERPNext REST API]
+flowchart TD
+    A[ERPNext Desk / React Chat Widget] -->|HTTP POST /chat + JWT Bearer| B[FastAPI Gateway - main.py]
+    B -->|Load Session State| C[(SQLite - chat_history.db)]
+    B -->|Invoke State Machine| D[LangGraph Pipeline - workflow/graph.py]
+
+    subgraph LangGraph Pipeline
+        D --> Step1[1. Follow-up Router]
+        Step1 --> Step2a[2a. Intent Classifier]
+        Step2a --> Step2b[2b. Slot Parameter Collector]
+        Step2b --> Step2c[2c. Parameter Validator]
+        Step2c -->|Missing Slots| Step2d[2d. Ask Missing Info Node]
+        Step2c -->|Valid| Step3[3. Read RBAC & Entity Resolution]
+        Step3 -->|Ambiguous Entities| Step4[4. Disambiguation Gate]
+        Step3 -->|Valid| Step5[5. Write RBAC Gate]
+        Step5 --> Step55[5.5 Precondition Validation]
+        Step55 --> Step6[6. Confirmation Gate]
+        Step6 --> Step7[7. Generic Tool Dispatcher]
+        Step7 --> Step8[8. Gate 6 Write Verification]
+        Step8 --> Step9[9. Response Formatting Node]
     end
 
-    subgraph Docker Container Environment
-        B -->|Deploy: docker cp| C[Backend Container: frappe_docker-backend-1]
-        C -->|Sites Assets Symlink| D[Served Site Assets: /assets/ai_assistant/desk/]
-        D -->|docker cp| E[Frontend Container Nginx: frappe_docker-frontend-1]
-    end
-
-    E -->|Loads Widget Assets| F[Browser Client: ERPNext Desk on http://localhost:8081]
-    F -->|JWT Session Auth| G
+    Step7 -->|httpx Token REST API| E[ERPNext REST API]
+    E -->|JSON Payload| Step8
+    Step9 -->|Formatted Response| B
+    B -->|Save Messages & State| C
+    B -->|Return ChatResponse| A
 ```
 
-### Key Components
+---
 
-- **[`ai_assistant/hooks.py`](./ai_assistant/hooks.py)**: Registers global asset includes (`app_include_js` and `app_include_css`) in Frappe Desk.
-- **[`ai_assistant/ai_assistant/api.py`](./ai_assistant/ai_assistant/api.py)**: Whitelisted Frappe REST endpoint (`get_chat_token`) that signs JWT tokens using the session user's identity.
-- **[`frontend/`](./frontend/)**: React + Vite + TypeScript chat widget embedded into ERPNext Desk.
-- **[`agent/`](./agent/)**: FastAPI service running a multi-turn LangGraph state machine with Groq LLM (`llama-3.3-70b-versatile`) intent classification, slot filling, unified LLM client (`agent/llm.py`), and ERPNext REST API integration.
-- **[`skills/`](./skills/)**: Declarative skill specifications (`check-inventory`, `create-sales-order`, `customer-lookup`).
+## Tech Stack
+
+* **Backend**: Python 3.13+, FastAPI, LangGraph, LangChain Core, Pydantic v2
+* **LLM providers**: Groq (default model `openai/gpt-oss-120b`, with `openai/gpt-oss-20b` and `qwen/qwen3.8-27b` as fallbacks) or xAI (`grok-2-latest`). The model can be overridden with `GROQ_MODEL`. See `agent/llm.py`.
+* **ERPNext integration**: HTTP REST API via `httpx`, token authentication (`token API_KEY:API_SECRET`), and JWT session bearer tokens
+* **Frontend widget**: React, TypeScript, Vite, and plain (vanilla) CSS
+* **Frappe Desk integration**: Custom Frappe app (`ai_assistant`) with Desk hooks (`hooks.py`) and a bundled asset (`assistant.bundle.js`)
+* **Persistence and auditing**: SQLite (`chat_history.db` for sessions, `audit_log.db` for audit trails)
+* **Containerization**: Docker and Docker Compose (`docker-compose-integration.yml`)
 
 ---
 
-## Prerequisites
+## Project Structure
 
-Before starting, ensure you have the following installed:
-1. **Python 3.10+** (with `pip` and `venv`)
-2. **Node.js 18+** (with `npm`)
-3. **Docker Desktop** running the ERPNext multi-container bench (`frappe_docker-backend-1`, `frappe_docker-frontend-1`, etc.) reachable at `http://localhost:8081`.
+```text
+erpnext-ai-assistant/
+├── agent/                         # FastAPI agent service
+│   ├── main.py                    # Entrypoint, REST endpoints, JWT auth (port 8000)
+│   ├── chat_store.py              # SQLite session persistence
+│   ├── audit_logger.py            # Security audit logging
+│   ├── llm.py                     # Groq / xAI LLM integration
+│   ├── requirements.txt           # Python dependencies
+│   ├── Dockerfile                 # Agent container build
+│   ├── tools/
+│   │   ├── erpnext_client.py      # Low-level httpx REST client for ERPNext
+│   │   └── generic_tools.py       # Generic CRUD tools and DocType whitelist
+│   └── workflow/                  # LangGraph state machine
+│       ├── graph.py               # Compiled pipeline and safety gates
+│       ├── state.py               # AgentState schema
+│       └── followup_router.py     # Deterministic router for read follow-ups
+├── skills/                        # 19 declarative skill specs
+├── frontend/                      # React + TypeScript + Vite chat widget
+│   ├── src/                       # Chat UI components, hooks, styles
+│   └── vite.config.ts             # Build config targeting Frappe Desk
+├── ai_assistant/                  # Frappe app package
+│   ├── hooks.py                   # Desk asset injection
+│   └── public/desk/               # Built asset (assistant.bundle.js)
+├── docker-compose-integration.yml # Docker Compose stack
+├── pyproject.toml                 # Python project configuration
+└── license.txt                    # MIT license
+```
 
 ---
 
-## Quick Start & Installation Guide
+## Installation
 
-### Step 1: Clone the Integration Branch
+### Prerequisites
 
-Clone the repository specifically on the **`integration-wip`** branch:
+1. **Python**: 3.13 or higher
+2. **Node.js**: 18+ and `npm`
+3. **ERPNext instance**: A running ERPNext / Frappe site
+4. **Docker** (optional): Only needed for the Docker Compose setup
+
+### 1. Install the Frappe app
+
+Use the `integration-fixed` branch:
 
 ```bash
-git clone -b integration-wip https://github.com/Picture-Sque/erpnext-ai-assistant.git
-cd erpnext-ai-assistant
+cd $PATH_TO_YOUR_BENCH
+bench get-app https://github.com/Picture-Sque/erpnext-ai-assistant --branch integration-fixed
+bench install-app ai_assistant
 ```
 
----
+### 2. Configure environment variables
 
-### Step 2: Install Frappe App in Bench
+Create `agent/.env` (or set the variables in `docker-compose-integration.yml`):
 
-Inside your Frappe bench environment (or container), fetch and install the app onto your site:
+```ini
+# LLM provider
+GROQ_API_KEY=your_groq_api_key
 
-```bash
-# Get the app on the integration-wip branch
-bench get-app https://github.com/Picture-Sque/erpnext-ai-assistant.git --branch integration-wip
+# ERPNext connection and token credentials
+ERPNEXT_BASE_URL=http://localhost:8080
+ERPNEXT_API_KEY=your_frappe_api_key
+ERPNEXT_API_SECRET=your_frappe_api_secret
 
-# Install onto your site (e.g. frontend)
-bench --site frontend install-app ai_assistant
-```
-
----
-
-### Step 3: Configure and Start the FastAPI Agent Backend
-
-Navigate to the `agent` directory, set up your Python virtual environment, install dependencies, configure environment variables, and start the server:
-
-```bash
-cd agent
-
-# Create and activate virtual environment
-python -m venv venv
-
-# Windows PowerShell:
-.\venv\Scripts\activate
-
-# Linux / macOS:
-# source venv/bin/activate
-
-# Install requirements
-pip install -r requirements.txt
-
-# Create environment config from example
-cp .env.example .env
-```
-
-Edit `agent/.env` to configure your credentials:
-
-```env
-# Shared JWT Secret matching Frappe site secret
-JWT_SECRET=your_jwt_secret_here
-
-# Dev Mock Authentication Fallback (set to false for production session auth)
+# Authentication
+JWT_SECRET=your_jwt_shared_secret
 ALLOW_DEV_MOCK_AUTH=false
 
-# ERPNext REST API Connection
-ERPNEXT_BASE_URL=http://localhost:8081
-ERPNEXT_API_KEY=your_erpnext_api_key
-ERPNEXT_API_SECRET=your_erpnext_api_secret
-
-# Groq API Key and Model (Standard non-compound model for deterministic JSON extraction)
-GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=openai/gpt-oss-120b
+# Optional overrides
+# GROQ_MODEL=openai/gpt-oss-120b
+# DOCTYPE_WHITELIST=Customer,Item,Sales Order,Bin,Quotation,Sales Invoice,Purchase Order,Supplier,Sales Order Item,Purchase Order Item,Customer Group,Territory
+# SQLITE_DB_PATH=chat_history.db
+# SQLITE_AUDIT_DB_PATH=audit_log.db
+# AGENT_AUTH_TOKEN=...
 ```
 
-Launch the FastAPI Agent server:
+Notes:
+
+* `ALLOW_DEV_MOCK_AUTH` should stay `false` outside local development.
+* The code also reads `AGENT_AUTH_TOKEN` and accepts `ALLOWED_DOCTYPES` as an alternative to `DOCTYPE_WHITELIST`. See `agent/main.py` and `agent/tools/generic_tools.py` for how they are used.
+* `GEMINI_API_KEY` is not used by the current code.
+
+### 3. Build the Desk widget
 
 ```bash
-python -m uvicorn main:app --host 127.0.0.1 --port 8000
-```
-
-*The agent service runs on `http://127.0.0.1:8000`.*
-
----
-
-### Step 4: Compile Frontend Assets & Deploy to Docker Containers
-
-From the repository root, build the React frontend production bundle:
-
-```bash
-cd frontend
+cd apps/ai_assistant/frontend
 npm install
 npm run build
 ```
 
-This compiles assets into `ai_assistant/public/desk/assistant.js` and `assistant.css`.
+The build writes `ai_assistant/public/desk/assistant.bundle.js`, which Frappe Desk loads.
 
-Now synchronize the compiled assets to your running Docker containers:
+### 4. Run the agent service
 
-```bash
-# 1. Copy assets to Backend container application directory
-docker cp ../ai_assistant/public/desk/assistant.css frappe_docker-backend-1:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.css
-docker cp ../ai_assistant/public/desk/assistant.js frappe_docker-backend-1:/home/frappe/frappe-bench/apps/ai_assistant/ai_assistant/public/desk/assistant.js
-
-# 2. Copy assets to Backend container site assets symlink
-docker cp ../ai_assistant/public/desk/assistant.css frappe_docker-backend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
-docker cp ../ai_assistant/public/desk/assistant.js frappe_docker-backend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
-
-# 3. Copy assets to Frontend Nginx container site assets
-docker cp ../ai_assistant/public/desk/assistant.css frappe_docker-frontend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.css
-docker cp ../ai_assistant/public/desk/assistant.js frappe_docker-frontend-1:/home/frappe/frappe-bench/sites/assets/ai_assistant/desk/assistant.js
-```
-
----
-
-### Step 5: Clear Cache and Refresh Desk
-
-Run `bench clear-cache` inside the backend container so Frappe links the app hooks:
+**Option A: Direct**
 
 ```bash
-docker exec frappe_docker-backend-1 bench --site frontend clear-cache
+cd apps/ai_assistant/agent
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
----
+**Option B: Docker Compose**
 
-## Verification & Usage
+```bash
+docker compose -f docker-compose-integration.yml up -d --build
+docker compose -f docker-compose-integration.yml ps
+```
 
-1. Open **`http://localhost:8081`** in your browser.
-2. Log into ERPNext Desk using test user credentials:
-   - **Administrator**: `Administrator` / `admin`
-   - **Employee**: `employee@test.com` / `password123`
-3. Click the floating AI Assistant chat launcher in the bottom-right corner.
-4. **Try test prompts**:
-   - **Customer Lookup**: `"Look up customer West View Software Ltd."`
-   - **Stock Check**: `"Check stock for SKU005"`
-   - **Sales Order Creation**: `"Create a sales order for Grant Plastics Ltd. for 5 units of SKU001"`
+The agent service listens on port `8000`.
 
 ---
 
-## Repository Branching Strategy
+## Usage
 
-- **`integration-wip`** *(Main Integration Branch)*: Complete, self-contained MVP branch containing the React Desk widget, FastAPI backend, LangGraph workflow, skills, JWT authentication, and Docker synchronization procedures.
+### Customers
+* **Create**: `"Create a customer named Apex Cybernetics"`
+* **List**: `"Show all customers"` or `"List customers in Commercial group"`
+* **Lookup**: `"Look up customer West View Software Ltd."`
+
+### Sales Orders
+* **Create**: `"Create a sales order for Acme Corp with SKU001 qty 5"`
+* **Follow-up creation**: *"Create a customer named Nova Tech"*, then *"Create a sales order for that customer with SKU001 qty 2"*
+* **Lookup**: `"Show me sales order SAL-ORD-2026-00013"`
+* **Customer order history**: `"Show all orders for Acme Corp"`
+* **Submit / Cancel / Update**: `"Submit sales order SAL-ORD-2026-00013"`
+
+### Purchase Orders
+* **Create**: `"Create a PO for Zuckerman Security for ITEM-DESK-001 qty 50"`
+* **Lookup / Update / Submit / Cancel**: `"Show purchase order PUR-ORD-2026-00013"`
+
+### Stock and Inventory
+* **Check stock**: `"How much SKU001 do we have?"`
+* **Low stock report**: `"What items are running low?"`
+
+### Business Analytics
+* **Top customer / item**: `"Who is our top customer by order value?"` or `"What is our best-selling item?"`
+* **Sales summary**: `"Total sales for August 2026"`
+
+---
+
+## Known Limitations
+
+1. **One request per message.** When a message contains several independent requests (for example, *"Create a sales order for Acme and delete a previous order"*), only the first is executed. When the agent detects the remaining steps, it appends a note saying they were **not attempted**; they are never run automatically.
+2. **No delete via chat.** A `delete_document` tool and its confirmation and verification gates exist in the backend, but there is no delete skill in `skills/`, so deletion requests cannot be routed to it. A request like *"Delete that sales order"* will not delete anything.
+3. **Limited reference resolution.** The last created document is persisted in session state, and some follow-ups work: "that customer" is resolved explicitly, and submit/cancel can refer to the last document when the DocType matches. References such as *"that sales order"* are not reliably resolved across arbitrary later requests.
+4. **Drawer UI only.** The chat renders as a sliding drawer inside Frappe Desk, not as a full-page view.
+5. **No new-chat button or history list.** Conversations are persisted in SQLite, but the UI cannot start a fresh chat or switch between saved sessions.
+6. **Whitelisted DocTypes only.** Generic CRUD tools are restricted to 12 DocTypes: `Customer`, `Item`, `Sales Order`, `Bin`, `Quotation`, `Sales Invoice`, `Purchase Order`, `Supplier`, `Sales Order Item`, `Purchase Order Item`, `Customer Group`, `Territory`. The list can be changed through the `DOCTYPE_WHITELIST` environment variable.
+
+---
+
+## Roadmap / Future Scope
+
+* **"New Chat" and chat history**: A "New Chat" button that opens a fresh chat window, with all previous chats saved and browsable in a history list.
+* **Full-page chat mode**: Clicking the chatbot icon expands the chatbot to occupy the entire page.
+* **Multi-intent execution**: Detect multiple requests in one message and execute them in order (for example, create a sales order, then delete a previous one), with a combined response summarising every action.
+* **Stronger conversation memory**: Remember earlier requests and the records created or referenced in them, so follow-ups like *"delete that sales order"* resolve to the right document.
+* **Delete skill**: Expose the existing backend delete tool through a skill, with confirmation required before anything is removed.
+
+---
+
+## Contributing
+
+This app uses `pre-commit` for code formatting, linting, and quality checks. [Install pre-commit](https://pre-commit.com/#installation) and enable it for this repository:
+
+```bash
+cd apps/ai_assistant
+pre-commit install
+```
+
+Configured tools (see `.pre-commit-config.yaml`):
+
+* **Python**: `ruff` (linting and import sorting), `ruff-format` (formatting)
+* **JS / TS**: `eslint`, `prettier`
+* **General checks**: `trailing-whitespace`, `check-merge-conflict`, `check-ast`, `check-json`, `check-toml`, `check-yaml`, `debug-statements`
 
 ---
 
 ## License
 
-This project is licensed under the MIT License.
+MIT. See [`license.txt`](license.txt) for details.
