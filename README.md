@@ -1,6 +1,6 @@
 # ERPNext AI Assistant
 
-An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, Vite, LangGraph, Groq LLM (`llama-3.3-70b-versatile`), and FastAPI.
+An elegant, fully-integrated AI Assistant widget for ERPNext Desk built using Frappe, React, TypeScript, Vite, LangGraph, Groq LLM (`gpt-oss-120b`), and FastAPI.
 
 The assistant is injected globally into the ERPNext Desk UI, providing an interactive sidebar chat interface powered by an intelligent agent workflow without modifying any core ERPNext or Frappe files.
 
