@@ -4,6 +4,7 @@ import { ChatUI } from "../chat/chat-ui";
 
 export function DeskAssistantShell() {
 	const [isOpen, setIsOpen] = useState(false);
+	const [isExpanded, setIsExpanded] = useState(false);
 	const toggleButtonRef = useRef<HTMLButtonElement>(null);
 	const sidebarRef = useRef<HTMLDivElement>(null);
 
@@ -13,6 +14,10 @@ export function DeskAssistantShell() {
 
 	const toggleAssistant = useCallback(() => {
 		setIsOpen(previousState => !previousState);
+	}, []);
+
+	const toggleExpand = useCallback(() => {
+		setIsExpanded(previousState => !previousState);
 	}, []);
 
 	useEffect(() => {
@@ -69,7 +74,7 @@ export function DeskAssistantShell() {
 	}, [closeAssistant, isOpen]);
 
 	return (
-		<div className="desk-assistant" data-open={isOpen}>
+		<div className="desk-assistant" data-open={isOpen} data-expanded={isExpanded}>
 			<div
 				className="desk-assistant__overlay"
 				data-open={isOpen}
@@ -81,12 +86,18 @@ export function DeskAssistantShell() {
 				ref={sidebarRef}
 				className="desk-assistant__sidebar"
 				data-open={isOpen}
+				data-expanded={isExpanded}
 				id="ai-assistant-sidebar"
 				role="dialog"
 				aria-modal="true"
 				aria-label="AI assistant sidebar"
 			>
-				<ChatUI isActive={isOpen} onClose={closeAssistant} />
+				<ChatUI
+					isActive={isOpen}
+					isExpanded={isExpanded}
+					onClose={closeAssistant}
+					onToggleExpand={toggleExpand}
+				/>
 			</aside>
 
 			<button

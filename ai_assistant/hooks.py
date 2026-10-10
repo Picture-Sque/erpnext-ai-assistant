@@ -10,16 +10,16 @@ app_license = "mit"
 
 # include js, css files in header of desk.html
 app_include_css = [
-	"assistant.bundle.css"
+	"/assets/ai_assistant/desk/assistant.bundle.css"
 ]
 app_include_js = [
-	"assistant.bundle.js"
+	"/assets/ai_assistant/desk/assistant.bundle.js"
 ]
 
 # Explicit Desk includes for maximum compatibility across Frappe v14/v15/v16
 desk_include_css = [
-	"assistant.bundle.css"
+	"/assets/ai_assistant/desk/assistant.bundle.css"
 ]
 desk_include_js = [
-	"assistant.bundle.js"
+	"/assets/ai_assistant/desk/assistant.bundle.js"
 ]

@@ -389,11 +389,49 @@ export function useDemoChat() {
         [authUser.token]
     );
 
+    const startNewChat = useCallback(async () => {
+        let activeToken = tokenRef.current || authUser.token;
+        if (!activeToken) {
+            activeToken = await fetchTokenOnDemand();
+        }
+
+        if (activeToken) {
+            try {
+                const resetUrl = BACKEND_URL.replace(/\/chat\/?$/, "/chat/reset");
+                await fetch(resetUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${activeToken}`
+                    }
+                });
+            } catch (err) {
+                console.warn("[Chat Widget] Error resetting session on backend:", err);
+            }
+        }
+
+        const greeting = authUser.fullName && authUser.fullName !== "Guest"
+            ? `Welcome, ${authUser.fullName}! Connected to ERPNext. How can I assist you today?`
+            : "Welcome! Connected to ERPNext. How can I assist you today?";
+
+        if (isMountedRef.current) {
+            setMessages([
+                {
+                    id: createId(),
+                    role: "assistant",
+                    content: greeting,
+                    timestamp: createTimestamp()
+                }
+            ]);
+        }
+    }, [authUser.fullName, authUser.token]);
+
     return {
         authUser,
         setAuthUser,
         currentUser: authUser.fullName,
         messages,
-        sendMessage
+        sendMessage,
+        startNewChat
     };
 }

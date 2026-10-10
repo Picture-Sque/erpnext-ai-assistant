@@ -550,9 +550,9 @@ def collect_parameters_node(state: AgentState):
 
     chain_plan = state.get("chain_plan")
     req_fields = skill.get("required_fields", [])
-    has_all_required = bool(req_fields) and all(current_fields.get(rf) is not None and str(current_fields.get(rf)).strip() != "" for rf in req_fields)
-
-    if last_msg.strip() and not (chain_plan and has_all_required):
+    has_all_required = all(f in fields and fields[f] is not None for f in req_fields)
+    is_clarifying = bool(state.get("clarification_target") or state.get("ambiguous_candidates"))
+    if last_msg.strip() and not (chain_plan and has_all_required) and not is_clarifying:
         opt_fields = skill.get("optional_fields", [])
         last_created_doc = state.get("last_created_doc")
         last_created_msg = f"Last created document: {json.dumps(last_created_doc)}\nIf the user uses pronouns (it, that, the PO) or just says 'submit'/'cancel', use this document's name for the 'name' or 'id' field if it matches the expected doctype." if last_created_doc else ""
@@ -795,6 +795,77 @@ def entity_resolution_and_read_rbac_node(state: AgentState):
         }
 
     ambiguous_candidates = None
+
+    # 3a-items: Resolve child items (item_code / item_name) in collected_fields['items']
+    raw_items = collected.get("items")
+    if isinstance(raw_items, list) and raw_items:
+        for idx, itm in enumerate(raw_items):
+            if not isinstance(itm, dict):
+                continue
+            item_raw_code = itm.get("item_code") or itm.get("item") or itm.get("name")
+            if not item_raw_code:
+                continue
+
+            item_key = f"item_{item_raw_code}"
+            if resolved_entities.get(item_key):
+                itm["item_code"] = resolved_entities[item_key].get("name", item_raw_code)
+                continue
+
+            matched_items = []
+            try:
+                # 1. Exact match by item_code
+                exact_res = get_list("Item", filters=[["item_code", "=", str(item_raw_code)]], fields=["name", "item_code", "item_name", "item_group"], limit=2)
+                if exact_res.get("status") == "success" and exact_res.get("data"):
+                    matched_items = exact_res.get("data")
+                else:
+                    # 2. search_document / like search
+                    like_res = search_document("Item", str(item_raw_code))
+                    if like_res.get("status") == "success" and like_res.get("data"):
+                        matched_items = like_res.get("data")
+            except Exception as e:
+                logger.warning(f"[Step 3] Item lookup error for '{item_raw_code}': {e}")
+
+            if len(matched_items) == 1:
+                cand = matched_items[0]
+                resolved_code = cand.get("name")
+                itm["item_code"] = resolved_code
+                match_type = "exact" if str(resolved_code).lower() == str(item_raw_code).lower() else "fuzzy"
+                resolved_entities[item_key] = {
+                    "name": resolved_code,
+                    "matched_on": item_raw_code,
+                    "confidence": "high" if match_type == "exact" else "partial",
+                    "match_type": match_type,
+                    "record": cand,
+                }
+                logger.info(f"[Step 3] Resolved child item {item_raw_code} -> {resolved_code}")
+            elif len(matched_items) > 1:
+                ambiguous_candidates = [
+                    {"doctype": "Item", "name": c.get("name"), "display": c, "item_index": idx}
+                    for c in matched_items
+                ]
+                logger.info(f"[Step 3] Ambiguous child item '{item_raw_code}': {len(matched_items)} matches")
+                break
+            else:
+                # 0 matches: Item not found! Look up existing items for suggestions
+                all_items_res = get_list("Item", fields=["name", "item_code", "item_name"], limit=50)
+                item_names = [i.get("name") for i in (all_items_res.get("data") or []) if i.get("name")]
+                import difflib
+                close_matches = difflib.get_close_matches(str(item_raw_code), item_names, n=3, cutoff=0.3)
+                if not close_matches and item_names:
+                    close_matches = item_names[:3]
+
+                sugg_text = ", ".join(close_matches) if close_matches else "none"
+                not_found_msg = f"Item '{item_raw_code}' not found. Did you mean {sugg_text}?"
+                logger.info(f"[Step 3] Item '{item_raw_code}' not found. Prompting suggestions: {not_found_msg}")
+
+                return {
+                    "read_rbac_passed": True,
+                    "failure_classification": "not_found",
+                    "final_response": not_found_msg,
+                    "is_workflow_complete": True,
+                    "resolved_entities": resolved_entities,
+                    "ambiguous_candidates": None,
+                }
 
     for cfg in _ENTITY_RESOLUTION_CONFIG:
         res_doctype = cfg["doctype"]
@@ -1098,7 +1169,12 @@ def disambiguation_node(state: AgentState):
                 "match_type": "user_selected",
                 "record": matched.get("display", {}),
             }
-            collected[clarification_target] = matched.get("name")
+            if matched.get("doctype") == "Item" and "item_index" in matched:
+                item_idx = matched["item_index"]
+                if "items" in collected and len(collected["items"]) > item_idx:
+                    collected["items"][item_idx]["item_code"] = matched.get("name")
+            else:
+                collected[clarification_target] = matched.get("name")
             return {
                 "resolved_entities": resolved_entities,
                 "collected_fields": collected,
@@ -1162,12 +1238,21 @@ def disambiguation_node(state: AgentState):
         }
 
     # Determine the search_key (entity slot being disambiguated)
-    doctype = skill.get("doctype", "")
-    cfg = next((c for c in _ENTITY_RESOLUTION_CONFIG if c["doctype"] == doctype), {})
-    search_key = cfg.get("collected_key") or next(
-        (k for k in skill.get("required_fields", []) if k != "items"), "entity"
-    )
-    raw_query = str(collected.get(search_key, ""))
+    searched_doctype = ambiguous[0].get("doctype") if ambiguous else (skill.get("doctype", "") or "record")
+    raw_query = ""
+    search_key = None
+    for cfg_cand in _ENTITY_RESOLUTION_CONFIG:
+        if cfg_cand["doctype"] == searched_doctype and collected.get(cfg_cand["collected_key"]):
+            search_key = cfg_cand["collected_key"]
+            raw_query = str(collected.get(search_key))
+            break
+    if not raw_query:
+        search_key = cfg.get("collected_key") or ("item_code" if searched_doctype == "Item" else next(
+            (k for k in skill.get("required_fields", []) if k != "items"), "entity"
+        ))
+        raw_query = str(collected.get(search_key, ""))
+    if not raw_query and searched_doctype == "Item":
+        raw_query = ambiguous[0].get("display", {}).get("item_code") or ambiguous[0].get("name", "")
 
     risk = _classify_disambiguation_risk(skill, ambiguous, resolved_entities, raw_query)
     logger.info(f"[Step 4] Disambiguation risk for intent='{intent}': {risk}")
@@ -1198,7 +1283,7 @@ def disambiguation_node(state: AgentState):
         # Store interpretation note as a private key in collected_fields so
         # format_agent_message_node can embed it without touching AgentState schema.
         note = (
-            f"Showing results for {doctype or 'record'} '{best_display}' — "
+            f"Showing results for {searched_doctype or 'record'} '{best_display}' — "
             f"closest match to '{raw_query}'."
         )
         collected["_auto_resolved_note"] = note
@@ -1225,7 +1310,7 @@ def disambiguation_node(state: AgentState):
             f"Reply **Yes** to confirm, or provide a more specific name."
         )
     else:
-        clarification_msg = _format_candidate_list(ambiguous, doctype or "record", raw_query)
+        clarification_msg = _format_candidate_list(ambiguous, searched_doctype or "record", raw_query)
 
     clarification_attempts += 1
     logger.info(
@@ -1662,6 +1747,30 @@ def confirmation_node(state: AgentState):
     requires_confirmation = operation in {"cancel", "delete", "submit"}
     if chain_plan and operation in {"create", "update", "cancel", "delete", "submit"}:
         requires_confirmation = True
+
+    # Confirm-before-write for updates on submitted orders (docstatus == 1)
+    if operation == "update":
+        last_snap = state.get("last_read_snapshot")
+        if last_snap and last_snap.get("docstatus") == 1:
+            requires_confirmation = True
+        elif not last_snap:
+            # Check target document docstatus
+            rec = None
+            resolved_ents = state.get("resolved_entities") or {}
+            for k, v in resolved_ents.items():
+                if isinstance(v, dict) and v.get("name"):
+                    rec = v.get("name")
+                    break
+            if not rec:
+                rec = state.get("collected_fields", {}).get("id") or state.get("collected_fields", {}).get("name")
+            target_dt = state.get("target_doctype") or (skill.get("doctype", "") if skill else "")
+            if rec and target_dt:
+                try:
+                    cur_doc = get_document(target_dt, rec)
+                    if cur_doc.get("status") == "success" and cur_doc.get("data", {}).get("docstatus") == 1:
+                        requires_confirmation = True
+                except Exception:
+                    pass
 
     if not requires_confirmation:
         logger.info(f"[Step 6] Confirmation skipped: operation '{operation}' does not require explicit confirmation.")
@@ -2331,6 +2440,15 @@ def result_validation_node(state: AgentState):
                                 failure_classification = "conflict_stale_data"
                                 failure_msg = f"Requested update to '{k}' to '{expected_val}' on {doctype} '{record_id}', but the document still shows '{doc[k]}' after verification. The update may not have completed."
                                 break
+                        # Issue 2: Verify child rows for Sales Order delivery_date
+                        if write_verified and doctype == "Sales Order" and "delivery_date" in collected:
+                            exp_date = str(collected["delivery_date"])
+                            for it in doc.get("items", []):
+                                if str(it.get("delivery_date")) != exp_date:
+                                    write_verified = False
+                                    failure_classification = "conflict_stale_data"
+                                    failure_msg = f"Requested update to 'delivery_date' to '{exp_date}' on {doctype} '{record_id}', but item row '{it.get('item_code')}' shows '{it.get('delivery_date')}' after verification. The update may not have completed."
+                                    break
                     elif operation == "cancel":
                         if str(doc.get("docstatus")) == "2":
                             write_verified = True
@@ -2594,7 +2712,13 @@ def _retry_and_escalation_node_impl(state: AgentState):
             }
         else:
             updates["escalated"] = True
-            reason = f"Operation failed after 2 retries: {classification}."
+            tool_raw = state.get("tool_raw_response", {}) or {}
+            erpnext_err = tool_raw.get("error") if isinstance(tool_raw, dict) else None
+            if erpnext_err:
+                logger.error(f"[Step 8.5 Escalation] Tool error after retries: {erpnext_err}")
+                reason = f"Operation failed: {erpnext_err}"
+            else:
+                reason = f"Operation failed after 2 retries: {classification}."
             log_audit_event(operation=operation, doctype=doctype, target_name=state.get("collected_fields", {}).get("name", "unknown"), outcome="escalated", details=reason)
             updates["escalation_reason"] = reason
             updates["is_workflow_complete"] = True
@@ -3107,23 +3231,26 @@ def route_after_read_rbac(state: AgentState) -> str:
     """
     After entity_resolution_and_read_rbac (Step 3):
     - Read denied → retry_and_escalation
+    - Direct final response set (e.g. item not found friendly message) → format_response
     - Everything else → disambiguation (Step 4 handles both the ambiguous and unambiguous cases)
     """
     if not state.get("read_rbac_passed", True):
         return "retry_and_escalation"
+    if state.get("final_response") and state.get("is_workflow_complete"):
+        return "format_response"
     return "disambiguation"
 
 
 def route_after_disambiguation(state: AgentState) -> str:
     """
     After disambiguation_node (Step 4):
-    - HIGH-RISK pause OR failed candidate match → format_response (pause, wait for next turn)
+    - HIGH-RISK pause OR failed candidate match OR final response set → format_response (pause or complete)
     - Resolved (either auto or user-selected) → check write intent:
         - Write intent  → write_rbac_gate (Step 5)
         - Read-only     → confirmation_node (skip Step 5)
     """
-    # If a clarification question was generated, or re-ask was triggered, stop here.
-    if state.get("final_response") and not state.get("is_workflow_complete"):
+    # If a final response or clarification question was generated, stop here.
+    if state.get("final_response"):
         return "format_response"
 
     # Ambiguity is resolved (or was never present) — continue the pipeline.
@@ -3313,6 +3440,7 @@ workflow.add_conditional_edges(
     {
         "retry_and_escalation": "retry_and_escalation",
         "disambiguation": "disambiguation",
+        "format_response": "format_response",
     }
 )
 

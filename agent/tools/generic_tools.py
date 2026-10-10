@@ -26,7 +26,68 @@ DEFAULT_WHITELIST = [
     "Supplier",              # create-purchase-order entity resolution
     "Sales Order Item",      # sales-analytics-report aggregate on child table
     "Purchase Order Item",   # purchase-order-lookup item-based PO check
+    "Company",               # Dynamic company resolution
+    "Warehouse",             # Dynamic warehouse resolution
 ]
+
+_cached_company = None
+_cached_warehouse = None
+
+def get_default_company() -> str:
+    global _cached_company
+    if _cached_company:
+        return _cached_company
+    env_val = os.getenv("DEFAULT_COMPANY")
+    if env_val:
+        _cached_company = env_val.strip()
+        return _cached_company
+    try:
+        headers = get_auth_headers()
+        with httpx.Client() as client:
+            resp = client.get(f"{ERPNEXT_BASE_URL}/api/resource/Company", headers=headers, timeout=10.0)
+            if resp.is_success:
+                data = resp.json().get("data", [])
+                if data:
+                    _cached_company = data[0]["name"]
+                    return _cached_company
+    except Exception as e:
+        logger.warning(f"Failed to fetch default company from ERPNext: {e}")
+    _cached_company = "Metal Forms"
+    return _cached_company
+
+def get_default_warehouse(company: Optional[str] = None) -> Optional[str]:
+    global _cached_warehouse
+    if _cached_warehouse:
+        return _cached_warehouse
+    env_val = os.getenv("DEFAULT_WAREHOUSE")
+    if env_val:
+        _cached_warehouse = env_val.strip()
+        return _cached_warehouse
+    comp = company or get_default_company()
+    try:
+        headers = get_auth_headers()
+        with httpx.Client() as client:
+            resp = client.get(
+                f"{ERPNEXT_BASE_URL}/api/resource/Warehouse",
+                headers=headers,
+                params={"filters": json.dumps([["company", "=", comp]])},
+                timeout=10.0
+            )
+            if resp.is_success:
+                data = resp.json().get("data", [])
+                for wh in data:
+                    w_name = wh.get("name", "")
+                    if "stores" in w_name.lower():
+                        _cached_warehouse = w_name
+                        return _cached_warehouse
+                if data:
+                    _cached_warehouse = data[0]["name"]
+                    return _cached_warehouse
+    except Exception as e:
+        logger.warning(f"Failed to fetch default warehouse from ERPNext: {e}")
+    _cached_warehouse = "Stores - MF"
+    return _cached_warehouse
+
 
 def get_allowed_doctypes() -> List[str]:
     env_val = os.getenv("DOCTYPE_WHITELIST") or os.getenv("ALLOWED_DOCTYPES")
@@ -139,11 +200,41 @@ def create_document(doctype: str, fields: dict) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
+    from datetime import datetime, timedelta
+    payload = dict(fields)
+
+    # Dynamic default resolution for Sales Order and Purchase Order
+    if doctype in ("Sales Order", "Purchase Order"):
+        if not payload.get("company"):
+            payload["company"] = get_default_company()
+        if not payload.get("transaction_date"):
+            payload["transaction_date"] = datetime.now().strftime("%Y-%m-%d")
+        
+        default_wh = get_default_warehouse(payload.get("company"))
+        if doctype == "Sales Order":
+            if not payload.get("delivery_date"):
+                payload["delivery_date"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+            if "items" in payload and isinstance(payload["items"], list):
+                for item in payload["items"]:
+                    if not item.get("warehouse"):
+                        item["warehouse"] = default_wh
+                    if not item.get("delivery_date"):
+                        item["delivery_date"] = payload["delivery_date"]
+        elif doctype == "Purchase Order":
+            if not payload.get("schedule_date"):
+                payload["schedule_date"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+            if "items" in payload and isinstance(payload["items"], list):
+                for item in payload["items"]:
+                    if not item.get("warehouse"):
+                        item["warehouse"] = default_wh
+                    if not item.get("schedule_date"):
+                        item["schedule_date"] = payload["schedule_date"]
+
     url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}"
     headers = get_auth_headers()
     try:
         with httpx.Client() as client:
-            response = client.post(url, headers=headers, json=fields, timeout=60.0)
+            response = client.post(url, headers=headers, json=payload, timeout=60.0)
             if response.is_success:
                 try:
                     resp_json = response.json()
@@ -164,11 +255,33 @@ def update_document(doctype: str, name: str, fields: dict) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
+    payload = dict(fields)
+    # Special handling for Sales Order parent-synced fields:
+    # In ERPNext, Sales Order header delivery_date is synced from items[].delivery_date.
+    # When updating delivery_date, we must also update delivery_date on every row in items,
+    # otherwise ERPNext will revert the header date back to the child items' date.
+    # Note: Other parent-synced fields (e.g. warehouse, or rate/qty which recalculate totals)
+    # may require similar child table synchronization in future enhancements.
+    if doctype == "Sales Order" and "delivery_date" in payload and "items" not in payload:
+        try:
+            current_doc_res = get_document(doctype, name)
+            if current_doc_res.get("status") == "success":
+                current_items = current_doc_res.get("data", {}).get("items", [])
+                if current_items:
+                    updated_items = []
+                    for it in current_items:
+                        it_copy = dict(it)
+                        it_copy["delivery_date"] = payload["delivery_date"]
+                        updated_items.append(it_copy)
+                    payload["items"] = updated_items
+        except Exception as e:
+            logger.warning(f"Failed to synchronize items delivery_date for {doctype} {name}: {e}")
+
     url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}/{name}"
     headers = get_auth_headers()
     try:
         with httpx.Client() as client:
-            response = client.put(url, headers=headers, json=fields, timeout=60.0)
+            response = client.put(url, headers=headers, json=payload, timeout=60.0)
             if response.is_success:
                 try:
                     resp_json = response.json()

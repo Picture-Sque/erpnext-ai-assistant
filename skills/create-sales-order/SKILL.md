@@ -16,15 +16,14 @@ optional_fields:
   - transaction_date
   - delivery_date
 payload_structure:
-  fixed:
-    company: "LOREM Sample for internship"
+  fixed: {}
   field_mappings:
     customer: customer
     transaction_date: transaction_date
     delivery_date: delivery_date
     items: items
   child_defaults:
-    warehouse: "Stores - LS"
+    delivery_date: "{delivery_date}"
 defaults:
   - field: transaction_date
     value: today

@@ -1,11 +1,20 @@
-import { ChatLogoIcon, CloseIcon } from "./chat-icons";
+import { ChatLogoIcon, CloseIcon, MaximizeIcon, MinimizeIcon, PlusIcon } from "./chat-icons";
 
 interface ChatHeaderProps {
 	onClose?: () => void;
 	currentUser?: string;
+	onNewChat?: () => void;
+	isExpanded?: boolean;
+	onToggleExpand?: () => void;
 }
 
-export function ChatHeader({ onClose, currentUser }: ChatHeaderProps) {
+export function ChatHeader({
+	onClose,
+	currentUser,
+	onNewChat,
+	isExpanded = false,
+	onToggleExpand
+}: ChatHeaderProps) {
 	const displayUser = currentUser && currentUser.trim() !== "" ? currentUser : "Guest";
 
 	return (
@@ -23,26 +32,56 @@ export function ChatHeader({ onClose, currentUser }: ChatHeaderProps) {
 			</div>
 
 			<div className="chat-header__meta">
-				<div className="chat-header__status">
-					<span className="chat-header__status-dot" />
-					<span>Connected</span>
+				<div className="chat-header__actions">
+					{onNewChat ? (
+						<button
+							className="chat-header__btn chat-header__btn--new"
+							type="button"
+							onClick={onNewChat}
+							aria-label="Start new chat session"
+							title="New chat"
+						>
+							<PlusIcon size={15} />
+							<span>New Chat</span>
+						</button>
+					) : null}
+
+					{onToggleExpand ? (
+						<button
+							className="chat-header__btn chat-header__btn--icon"
+							type="button"
+							onClick={onToggleExpand}
+							aria-label={isExpanded ? "Collapse to sidebar" : "Expand to full window"}
+							title={isExpanded ? "Collapse to sidebar" : "Full window"}
+						>
+							{isExpanded ? <MinimizeIcon size={15} /> : <MaximizeIcon size={15} />}
+						</button>
+					) : null}
+
+					{onClose ? (
+						<button
+							className="chat-header__close"
+							type="button"
+							onClick={onClose}
+							aria-label="Close AI assistant"
+							title="Close"
+						>
+							<CloseIcon />
+						</button>
+					) : null}
 				</div>
 
-				<div className="chat-header__user-slot">
-					<span className="chat-header__user-label">ERP User</span>
-					<span className="chat-header__user-value">{displayUser}</span>
-				</div>
+				<div className="chat-header__badges">
+					<div className="chat-header__status">
+						<span className="chat-header__status-dot" />
+						<span>Connected</span>
+					</div>
 
-				{onClose ? (
-					<button
-						className="chat-header__close"
-						type="button"
-						onClick={onClose}
-						aria-label="Close AI assistant sidebar"
-					>
-						<CloseIcon />
-					</button>
-				) : null}
+					<div className="chat-header__user-slot">
+						<span className="chat-header__user-label">ERP User</span>
+						<span className="chat-header__user-value">{displayUser}</span>
+					</div>
+				</div>
 			</div>
 		</header>
 	);

@@ -9,10 +9,17 @@ import { ChatScrollButtons } from "./chat-scroll-buttons";
 interface ChatUIProps {
 	isActive?: boolean;
 	onClose?: () => void;
+	isExpanded?: boolean;
+	onToggleExpand?: () => void;
 }
 
-export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
-	const { messages, sendMessage, currentUser } = useDemoChat();
+export function ChatUI({
+	isActive = true,
+	onClose,
+	isExpanded = false,
+	onToggleExpand
+}: ChatUIProps) {
+	const { messages, sendMessage, currentUser, startNewChat } = useDemoChat();
 	const messagesContainerRef = useRef<HTMLDivElement>(null);
 
 	const {
@@ -31,10 +38,20 @@ export function ChatUI({ isActive = true, onClose }: ChatUIProps) {
 	}, [messages.length, measure, scrollToBottom]);
 
 	return (
-		<div className="app-shell">
-			<section className="chat-page" aria-label="AI assistant chat interface">
-				<div className="chat-panel">
-					<ChatHeader onClose={onClose} currentUser={currentUser} />
+		<div className="app-shell" data-expanded={isExpanded}>
+			<section
+				className={`chat-page ${isExpanded ? "chat-page--expanded" : ""}`}
+				data-expanded={isExpanded}
+				aria-label="AI assistant chat interface"
+			>
+				<div className="chat-panel" data-expanded={isExpanded}>
+					<ChatHeader
+						onClose={onClose}
+						currentUser={currentUser}
+						onNewChat={startNewChat}
+						isExpanded={isExpanded}
+						onToggleExpand={onToggleExpand}
+					/>
 
 					<div className="chat-panel__body">
 						<div className="chat-panel__spacer" aria-hidden="true" />

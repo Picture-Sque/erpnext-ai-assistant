@@ -1,3 +1,5 @@
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { ChatMessage } from "../../types/chat";
 import { UserCircleIcon } from "./chat-icons";
 
@@ -29,9 +31,47 @@ export function ChatMessageView({ message }: ChatMessageProps) {
 				</div>
 
 				<div className="chat-message__bubble">
-					{message.content.split("\n").map((line, index) => (
-						<p key={`${message.id}-${index}`}>{line}</p>
-					))}
+					{isAssistant ? (
+						<div className="chat-markdown">
+							<ReactMarkdown
+								remarkPlugins={[remarkGfm]}
+								components={{
+									table: ({ children }) => (
+										<div className="chat-markdown__table-wrapper">
+											<table className="chat-markdown__table">{children}</table>
+										</div>
+									),
+									pre: ({ children }) => (
+										<pre className="chat-markdown__code-block">{children}</pre>
+									),
+									code: ({ className, children, ...props }: any) => (
+										<code
+											className={className ? `chat-markdown__block-code ${className}` : "chat-markdown__inline-code"}
+											{...props}
+										>
+											{children}
+										</code>
+									),
+									a: ({ href, children }) => (
+										<a
+											href={href}
+											target="_blank"
+											rel="noopener noreferrer"
+											className="chat-markdown__link"
+										>
+											{children}
+										</a>
+									)
+								}}
+							>
+								{message.content}
+							</ReactMarkdown>
+						</div>
+					) : (
+						message.content.split("\n").map((line, index) => (
+							<p key={`${message.id}-${index}`}>{line}</p>
+						))
+					)}
 				</div>
 			</div>
 		</article>

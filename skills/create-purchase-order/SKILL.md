@@ -17,15 +17,13 @@ optional_fields:
   - transaction_date
   - schedule_date
 payload_structure:
-  fixed:
-    company: "LOREM Sample for internship"
+  fixed: {}
   field_mappings:
     supplier: supplier
     transaction_date: transaction_date
     schedule_date: schedule_date
     items: items
   child_defaults:
-    warehouse: "Stores - LS"
     schedule_date: "{schedule_date}"
 defaults:
   - field: transaction_date
@@ -79,7 +77,7 @@ Trigger this skill when the user wants to create a new Purchase Order document i
 ## ERPNext details
 - Doctype: `Purchase Order`
 - Child table: `items` (each row needs `item_code`, `qty`, `schedule_date`, `warehouse`)
-- Fixed field: `company` = "LOREM Sample for internship"
+- Field: `company` (dynamically resolved to default company if not specified)
 
 ## Tool
 Tool name: `create_document` on DocType `Purchase Order`.
