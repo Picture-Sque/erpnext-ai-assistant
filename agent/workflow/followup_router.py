@@ -106,8 +106,10 @@ def _is_fresh(last_turn_context: dict, current_turn_id: int) -> bool:
             elapsed_minutes = (now - completed_at).total_seconds() / 60
             if elapsed_minutes > FOLLOWUP_MAX_MINUTES:
                 return False
-        except Exception:
-            pass  # Unparseable timestamp — skip time check, trust turn count
+        except (TypeError, ValueError) as exc:
+            # Unknown age: treat as stale rather than resume on unverified context.
+            logger.warning(f"[FollowupRouter] Unparseable completed_at {completed_at_str!r} ({exc}); treating context as stale")
+            return False
 
     return True
 
@@ -219,6 +221,24 @@ def _detect_elliptical_pattern(text: str) -> tuple[bool, Optional[str]]:
             return True, subject_cleaned
 
     return False, None
+
+
+# A short message only counts as a possible follow-up if it is elliptical (above) or
+# refers back to the previous result. Anything else ("check stock for X and submit
+# PO Y", "yes", "show purchase order Z") is a new request for the classifier.
+_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:that|it|this|those|these|them|same|again|instead|previous|last one)\b",
+    re.IGNORECASE,
+)
+
+# A free-text slot answer longer than this is treated as the user moving on to a new
+# request, not as the value of the slot.
+FREE_VALUE_MAX_WORDS: int = 4
+
+
+def _could_be_followup(text: str) -> bool:
+    is_elliptical, _ = _detect_elliptical_pattern(text)
+    return is_elliptical or bool(_BACK_REFERENCE_RE.search(text))
 
 
 def _extract_followup_overrides(
@@ -345,6 +365,25 @@ def resolve_followup_node(state: AgentState) -> dict:
         asked_turn_id = pending_slot_clarification.get("asked_turn_id", 0)
         attempts = pending_slot_clarification.get("attempts", 0)
 
+        if not options and len(last_msg.split()) > FREE_VALUE_MAX_WORDS:
+            # An open question ("what would you like to change?") must not swallow a
+            # full new request as its answer. Drop the question and classify normally.
+            logger.info(
+                f"[FollowupRouter] Priority 1: reply is too long to be a value for '{missing_slot}' — "
+                f"abandoning clarification and treating it as a new request"
+            )
+            log_audit_event(
+                operation="clarification_slot_abandoned",
+                doctype=origin_skill,
+                target_name=missing_slot,
+                outcome="rejected",
+                details=f"Reply treated as a new request. origin_turn_id={asked_turn_id}"
+            )
+            return {
+                "_followup_route": "classify_intent",
+                "pending_slot_clarification": None,
+            }
+
         resolved_value = _resolve_slot_answer(last_msg, options)
 
         if resolved_value is not None:
@@ -422,6 +461,10 @@ def resolve_followup_node(state: AgentState) -> dict:
             logger.info(
                 f"[FollowupRouter] Priority 2: message too long ({word_count} words > {FOLLOWUP_SHORT_MSG_WORDS}) — falling through"
             )
+            return {"_followup_route": "classify_intent"}
+
+        if not _could_be_followup(last_msg):
+            logger.info("[FollowupRouter] Priority 2: not elliptical and no back-reference — falling through")
             return {"_followup_route": "classify_intent"}
 
         skill_name = last_turn_context.get("skill", "")

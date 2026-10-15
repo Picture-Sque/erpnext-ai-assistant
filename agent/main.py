@@ -182,104 +182,129 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
 
-# In-memory session store to support multi-turn conversations
-# Maps session_id (e.g. "default-session") to current AgentState dictionary
-session_store = {}
+# One mixed chain turn (up to MAX_CHAIN_STEPS steps, each ~10 nodes) exceeds
+# LangGraph's default recursion limit of 25 super-steps.
+GRAPH_RECURSION_LIMIT = 200
+
+_WRITE_TOOLS = ("create_document", "update_document", "delete_document", "cancel_document", "submit_document")
+
+
+def build_persisted_state(updated_state: dict) -> dict:
+    """
+    What survives to the next request. A pending confirmation and the chain it belongs
+    to are always persisted while pending, regardless of is_workflow_complete, so the
+    next turn can confirm, cancel and resume it. Everything else follows the
+    complete/incomplete rules below.
+    """
+    complete = bool(updated_state.get("is_workflow_complete"))
+    pending = updated_state.get("pending_confirmation")
+
+    extra_state = {
+        # Survive completed turns: follow-up resolution and "submit it" style references.
+        "last_turn_context": updated_state.get("last_turn_context"),
+        "last_created_doc": updated_state.get("last_created_doc"),
+        "pending_confirmation": pending,
+    }
+    if not complete:
+        extra_state.update({
+            "ambiguous_candidates": updated_state.get("ambiguous_candidates"),
+            "clarification_target": updated_state.get("clarification_target"),
+            "clarification_attempts": updated_state.get("clarification_attempts"),
+            "resolved_entities": updated_state.get("resolved_entities"),
+            "bulk_operation_scope": updated_state.get("bulk_operation_scope"),
+            "pending_slot_clarification": updated_state.get("pending_slot_clarification"),
+        })
+    if pending and updated_state.get("chain_plan") and not updated_state.get("chain_aborted"):
+        extra_state.update({
+            "chain_plan": updated_state.get("chain_plan"),
+            "chain_step_index": updated_state.get("chain_step_index"),
+            "chain_results": updated_state.get("chain_results"),
+            "chain_step_status": updated_state.get("chain_step_status"),
+            "chain_id": updated_state.get("chain_id"),
+            "chain_started_at": updated_state.get("chain_started_at"),
+        })
+
+    # Reset slots after a finished write, a fallback or a permission denial so they
+    # are not reused by the next request. Read results keep intent/fields so pronoun
+    # follow-ups ("what is their customer group?") still work.
+    failure = updated_state.get("failure_classification") or ""
+    should_reset = complete and not pending and (
+        updated_state.get("target_tool", "") in _WRITE_TOOLS
+        or updated_state.get("detected_intent") == "fallback"
+        or failure.startswith("permission_denied")
+    )
+    if should_reset:
+        return {"detected_intent": "", "collected_fields": {}, "is_complete": True, "extra_state": extra_state}
+    return {
+        "detected_intent": updated_state.get("detected_intent", ""),
+        "collected_fields": updated_state.get("collected_fields", {}),
+        "is_complete": complete,
+        "extra_state": extra_state,
+    }
+
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_token)):
-    session_id = request.conversation_id or payload.get("sub")
-    if not session_id:
+    user_sub = payload.get("sub")
+    if not user_sub:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Token payload missing required 'sub' claim"
         )
-    
-    user_id = payload.get("full_name") or payload.get("sub") or ""
-    # Ensure conversation record exists and load persistent session state from SQLite
-    chat_store.get_or_create_conversation(session_id, user_id=user_id)
-    session_state = chat_store.load_session_state(session_id, user_roles=payload.get("roles", []))
-    
-    # Save user message to SQLite message history
-    chat_store.save_message(session_id, "user", request.message)
+    session_id = request.conversation_id or user_sub
+    user_id = payload.get("full_name") or user_sub
+
+    try:
+        # A conversation belongs to the user who created it; nobody else may load it,
+        # read its history, or answer its pending confirmations.
+        chat_store.verify_conversation_owner(session_id, user_sub, user_id=user_id)
+    except chat_store.ConversationAccessError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This conversation belongs to another user."
+        )
+
+    try:
+        session_state = chat_store.load_session_state(session_id, user_roles=payload.get("roles", []))
+        chat_store.save_message(session_id, "user", request.message)
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
     session_state["messages"].append(HumanMessage(content=request.message))
     session_state["user_id"] = user_id
-    
+    session_state["user_sub"] = user_sub
+
     try:
         # Run state machine iteration
-        updated_state = compiled_graph.invoke(session_state)
-        final_resp = updated_state.get("final_response", "")
-        
-        # Save assistant message to SQLite message history
-        chat_store.save_message(
-            session_id,
-            "assistant",
-            final_resp,
-            intent=updated_state.get("detected_intent", "")
-        )
-        
-        # Reset workflow slots if the query completes a WRITE operation or falls back
-        # For READ operations (customer lookup, inventory) keep intent/fields so
-        # follow-up questions like "What is their customer group?" still work.
-        target_tool = updated_state.get("target_tool", "")
-        is_write_op = target_tool in ("create_document", "update_document", "delete_document", "cancel_document", "submit_document")
-        
-        should_reset = (
-            (updated_state.get("is_workflow_complete") and is_write_op) or
-            "Successfully created" in final_resp or
-            "Failed to create" in final_resp or
-            "How can I help you today?" in final_resp or
-            "Permission Denied" in final_resp
-        )
-        
-        extra_state = {}
-        if not updated_state.get("is_workflow_complete"):
-            extra_state = {
-                "pending_confirmation": updated_state.get("pending_confirmation"),
-                "ambiguous_candidates": updated_state.get("ambiguous_candidates"),
-                "clarification_target": updated_state.get("clarification_target"),
-                "clarification_attempts": updated_state.get("clarification_attempts"),
-                "resolved_entities": updated_state.get("resolved_entities"),
-                "bulk_operation_scope": updated_state.get("bulk_operation_scope"),
-                "pending_slot_clarification": updated_state.get("pending_slot_clarification"),
-            }
-            if updated_state.get("chain_plan") and not updated_state.get("chain_aborted"):
-                from datetime import datetime, timezone
-                extra_state["chain_plan"] = updated_state.get("chain_plan")
-                extra_state["chain_step_index"] = updated_state.get("chain_step_index")
-                extra_state["chain_results"] = updated_state.get("chain_results")
-                extra_state["chain_started_at"] = updated_state.get("chain_started_at") or datetime.now(tz=timezone.utc).isoformat()
-            
-        # last_turn_context persists across completed turns so follow-up resolution
-        # can reference the previous successful read-skill result on the NEXT request.
-        # Always include it (None is fine — it won't break anything).
-        extra_state["last_turn_context"] = updated_state.get("last_turn_context")
-        
-        if should_reset:
-            chat_store.update_session_state(
-                session_id,
-                detected_intent="",
-                collected_fields={},
-                is_complete=True,
-                extra_state={}
-            )
-        else:
-            chat_store.update_session_state(
-                session_id,
-                detected_intent=updated_state.get("detected_intent", ""),
-                collected_fields=updated_state.get("collected_fields", {}),
-                is_complete=updated_state.get("is_workflow_complete", False),
-                extra_state=extra_state
-            )
-            
-        return ChatResponse(response=final_resp)
-        
+        updated_state = compiled_graph.invoke(session_state, config={"recursion_limit": GRAPH_RECURSION_LIMIT})
     except Exception as e:
         logger.exception("Error executing conversation graph")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error executing conversation graph: {str(e)}"
         )
+
+    final_resp = updated_state.get("final_response", "")
+    persisted = build_persisted_state(updated_state)
+    try:
+        chat_store.save_message(session_id, "assistant", final_resp, intent=updated_state.get("detected_intent", ""))
+        chat_store.update_session_state(
+            session_id,
+            detected_intent=persisted["detected_intent"],
+            collected_fields=persisted["collected_fields"],
+            is_complete=persisted["is_complete"],
+            extra_state=persisted["extra_state"],
+        )
+    except chat_store.ChatStoreError as e:
+        # The turn ran, but its state (possibly a pending confirmation) was not saved.
+        # Say so rather than return a response the next turn cannot honor.
+        logger.error(f"Turn completed but state was not saved for {session_id}. Response was: {final_resp!r}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{e}. The last response was: {final_resp}"
+        )
+
+    return ChatResponse(response=final_resp)
 
 @app.post("/chat/reset")
 async def reset_session(payload: dict = Depends(verify_token)):

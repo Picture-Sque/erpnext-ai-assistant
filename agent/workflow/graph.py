@@ -1,10 +1,12 @@
 import os
+import copy
+import uuid
 import logging
 import re
 import json
 import yaml
 from audit_logger import log_audit_event
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage
@@ -40,7 +42,8 @@ logger.setLevel(logging.INFO)
 MAX_CHAIN_STEPS = 4
 CHAIN_LOW_STOCK_THRESHOLD = 10
 CHAIN_MAX_MINUTES = 10
-
+# A pending confirmation older than this is discarded unexecuted.
+PENDING_CONFIRMATION_MAX_MINUTES = CHAIN_MAX_MINUTES
 
 
 # =========================================================================
@@ -102,8 +105,8 @@ def load_skills() -> List[Dict[str, Any]]:
                                 data = yaml.safe_load(frontmatter_str)
                                 if not isinstance(data, dict):
                                     data = {}
-                            except Exception as ex:
-                                logger.warning(f"YAML parsing failed for frontmatter in {skill_md}: {ex}")
+                            except yaml.YAMLError as ex:
+                                logger.error(f"YAML parsing failed for frontmatter in {skill_md}; skill not loaded: {ex}")
                                 data = {}
 
                             name = data.get("name") or data.get("intent") or folder
@@ -136,8 +139,8 @@ def load_skills() -> List[Dict[str, Any]]:
                                     "follow_up_slots": data.get("follow_up_slots", []),
                                     "chain_exports": data.get("chain_exports", {}),
                                 })
-                except Exception as e:
-                    logger.warning(f"Failed to parse skill {skill_md}: {e}")
+                except OSError as e:
+                    logger.error(f"Failed to read skill {skill_md}; skill not loaded: {e}")
 
     return skills
 
@@ -194,6 +197,21 @@ def _check_role_access(user_roles: List[str], skill: Dict[str, Any]) -> Tuple[bo
         f"required roles ({', '.join(allowed)}) for this action."
     )
     return False, reason
+
+
+def _target_record_id(collected: dict, resolved_entities: dict) -> Optional[str]:
+    """
+    The record an update/submit/cancel/delete acts on. An explicit id/name slot wins;
+    resolved_entities is only a fallback, because it can also hold related records
+    (e.g. a resolved supplier) that are not the target document.
+    """
+    explicit = (collected or {}).get("id") or (collected or {}).get("name")
+    if explicit:
+        return explicit
+    for resolved in (resolved_entities or {}).values():
+        if isinstance(resolved, dict) and resolved.get("name"):
+            return resolved.get("name")
+    return None
 
 
 # =========================================================================
@@ -405,12 +423,17 @@ def _build_intent_updates(new_intent: str, state: AgentState, extra_updates: Opt
             "is_workflow_complete": False,
             "is_compound": False,  # Reset compound flag at every new turn
         })
+        # What the caller just decided for THIS turn (e.g. the classifier's is_compound)
+        # must survive the reset; otherwise a compound request sent after a completed
+        # turn silently runs as a single step.
+        if extra_updates:
+            updates.update(extra_updates)
     elif new_intent != current_intent:
         updates["retry_count"] = 0
         # Only reset is_compound if the caller didn't explicitly set it (e.g. classifier set it True)
         if extra_updates is None or "is_compound" not in extra_updates:
             updates["is_compound"] = False  # Reset on intent change if not explicitly provided
-        
+
     return updates
 
 def classify_intent_node(state: AgentState):
@@ -552,7 +575,10 @@ def collect_parameters_node(state: AgentState):
     req_fields = skill.get("required_fields", [])
     has_all_required = all(f in fields and fields[f] is not None for f in req_fields)
     is_clarifying = bool(state.get("clarification_target") or state.get("ambiguous_candidates"))
-    if last_msg.strip() and not (chain_plan and has_all_required) and not is_clarifying:
+    # A resumed chain step runs on the turn of a yes/no reply. It must use its stored
+    # per-step slots only; extracting from the reply ("yes") would corrupt them.
+    is_resumed_chain_step = bool(chain_plan and state.get("chain_resumed"))
+    if last_msg.strip() and not (chain_plan and has_all_required) and not is_clarifying and not is_resumed_chain_step:
         opt_fields = skill.get("optional_fields", [])
         last_created_doc = state.get("last_created_doc")
         last_created_msg = f"Last created document: {json.dumps(last_created_doc)}\nIf the user uses pronouns (it, that, the PO) or just says 'submit'/'cancel', use this document's name for the 'name' or 'id' field if it matches the expected doctype." if last_created_doc else ""
@@ -573,7 +599,6 @@ def collect_parameters_node(state: AgentState):
 
         res = invoke_structured_llm(prompt)
         if res is None:
-            from agent.audit_logger import log_audit_event
             log_audit_event(
                 operation="parameter_extraction",
                 doctype=skill.get("target_doctype", "unknown"),
@@ -812,18 +837,27 @@ def entity_resolution_and_read_rbac_node(state: AgentState):
                 continue
 
             matched_items = []
-            try:
-                # 1. Exact match by item_code
-                exact_res = get_list("Item", filters=[["item_code", "=", str(item_raw_code)]], fields=["name", "item_code", "item_name", "item_group"], limit=2)
-                if exact_res.get("status") == "success" and exact_res.get("data"):
-                    matched_items = exact_res.get("data")
-                else:
-                    # 2. search_document / like search
-                    like_res = search_document("Item", str(item_raw_code))
-                    if like_res.get("status") == "success" and like_res.get("data"):
-                        matched_items = like_res.get("data")
-            except Exception as e:
-                logger.warning(f"[Step 3] Item lookup error for '{item_raw_code}': {e}")
+            # 1. Exact match by item_code
+            exact_res = get_list("Item", filters=[["item_code", "=", str(item_raw_code)]], fields=["name", "item_code", "item_name", "item_group"], limit=2)
+            lookup_res = exact_res
+            if exact_res.get("status") == "success" and exact_res.get("data"):
+                matched_items = exact_res.get("data")
+            elif exact_res.get("status") in ("success", "empty"):
+                # 2. search_document / like search
+                lookup_res = search_document("Item", str(item_raw_code))
+                if lookup_res.get("status") == "success" and lookup_res.get("data"):
+                    matched_items = lookup_res.get("data")
+            if lookup_res.get("status") in ("permission_denied", "system_error"):
+                # A failed lookup is not the same as "not found"; report it as an error.
+                logger.error(f"[Step 3] Item lookup failed for '{item_raw_code}': {lookup_res.get('error')}")
+                return {
+                    "read_rbac_passed": True,
+                    "failure_classification": "tool_system_failure",
+                    "final_response": f"Could not look up item '{item_raw_code}': {lookup_res.get('error') or lookup_res.get('status')}",
+                    "is_workflow_complete": True,
+                    "resolved_entities": resolved_entities,
+                    "ambiguous_candidates": None,
+                }
 
             if len(matched_items) == 1:
                 cand = matched_items[0]
@@ -874,63 +908,68 @@ def entity_resolution_and_read_rbac_node(state: AgentState):
 
         if raw_value and not resolved_entities.get(search_key):
             logger.info(f"[Step 3] Attempting entity resolution: {res_doctype}.{search_key} = '{raw_value}'")
-            try:
-                res = search_document(res_doctype, str(raw_value))
-                candidates = res.get("data") or []
-
-                if res.get("status") == "success" and isinstance(candidates, list):
-                    if len(candidates) == 1:
-                        candidate = candidates[0]
-                        candidate_name = candidate.get(cfg["name_field"], "") or candidate.get("name", "")
-                        # Determine if this was an exact match or a fuzzy (LIKE) match.
-                        # search_document always uses LIKE %query%, so a match is only "exact"
-                        # when the raw query == the candidate's primary field value (case-insensitive).
-                        match_type = (
-                            "exact"
-                            if str(raw_value).strip().lower() == str(candidate_name).strip().lower()
-                            else "fuzzy"
-                        )
-                        resolved_entities[search_key] = {
-                            "name": candidate.get("name"),
-                            "matched_on": raw_value,
-                            "confidence": "high" if match_type == "exact" else "partial",
-                            "match_type": match_type,
-                            "record": candidate,
-                        }
+            res = search_document(res_doctype, str(raw_value))
+            candidates = res.get("data") or []
+            if res.get("status") in ("permission_denied", "system_error"):
+                logger.error(f"[Step 3] Entity resolution failed for '{raw_value}' in {res_doctype}: {res.get('error')}")
+                return {
+                    "read_rbac_passed": True,
+                    "failure_classification": "tool_system_failure",
+                    "final_response": f"Could not look up {res_doctype} '{raw_value}': {res.get('error') or res.get('status')}",
+                    "is_workflow_complete": True,
+                    "resolved_entities": resolved_entities,
+                    "ambiguous_candidates": None,
+                }
+            if res.get("status") == "success" and isinstance(candidates, list):
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    candidate_name = candidate.get(cfg["name_field"], "") or candidate.get("name", "")
+                    # Determine if this was an exact match or a fuzzy (LIKE) match.
+                    # search_document always uses LIKE %query%, so a match is only "exact"
+                    # when the raw query == the candidate's primary field value (case-insensitive).
+                    match_type = (
+                        "exact"
+                        if str(raw_value).strip().lower() == str(candidate_name).strip().lower()
+                        else "fuzzy"
+                    )
+                    resolved_entities[search_key] = {
+                        "name": candidate.get("name"),
+                        "matched_on": raw_value,
+                        "confidence": "high" if match_type == "exact" else "partial",
+                        "match_type": match_type,
+                        "record": candidate,
+                    }
+                    logger.info(
+                        f"[Step 3] Resolved {search_key}: {resolved_entities[search_key]['name']} "
+                        f"(match_type={match_type})"
+                    )
+                    # Ensure we update collected with the resolved name so queries use it
+                    collected[search_key] = candidate.get("name")
+                elif len(candidates) > 1:
+                    if len(candidates) > _AMBIGUITY_THRESHOLD:
+                        # Too many matches — treat as ambiguous so user can refine
+                        ambiguous_candidates = [
+                            {"doctype": res_doctype, "name": c.get("name"), "display": c}
+                            for c in candidates[:10]
+                        ]
                         logger.info(
-                            f"[Step 3] Resolved {search_key}: {resolved_entities[search_key]['name']} "
-                            f"(match_type={match_type})"
+                            f"[Step 3] Ambiguous entity for '{raw_value}': "
+                            f"{len(candidates)} matches — needs disambiguation"
                         )
-                        # Ensure we update collected with the resolved name so queries use it
-                        collected[search_key] = candidate.get("name")
-                    elif len(candidates) > 1:
-                        if len(candidates) > _AMBIGUITY_THRESHOLD:
-                            # Too many matches — treat as ambiguous so user can refine
-                            ambiguous_candidates = [
-                                {"doctype": res_doctype, "name": c.get("name"), "display": c}
-                                for c in candidates[:10]
-                            ]
-                            logger.info(
-                                f"[Step 3] Ambiguous entity for '{raw_value}': "
-                                f"{len(candidates)} matches — needs disambiguation"
-                            )
-                            break # Only handle one ambiguity at a time
-                        else:
-                            # A small number of distinct matches — still ambiguous
-                            ambiguous_candidates = [
-                                {"doctype": res_doctype, "name": c.get("name"), "display": c}
-                                for c in candidates
-                            ]
-                            logger.info(
-                                f"[Step 3] Multiple matches for '{raw_value}' ({len(candidates)}) "
-                                f"— flagging as ambiguous"
-                            )
-                            break
-                    # len(candidates) == 0 → not found; leave resolved_entities empty,
-                    # the format_agent_message_node will handle not_found messaging.
-            except Exception as exc:
-                logger.warning(f"[Step 3] Entity resolution failed for '{raw_value}' in {res_doctype}: {exc}")
-                # Non-fatal: proceed without resolved entity; tool call will resolve or fail later.
+                        break # Only handle one ambiguity at a time
+                    else:
+                        # A small number of distinct matches — still ambiguous
+                        ambiguous_candidates = [
+                            {"doctype": res_doctype, "name": c.get("name"), "display": c}
+                            for c in candidates
+                        ]
+                        logger.info(
+                            f"[Step 3] Multiple matches for '{raw_value}' ({len(candidates)}) "
+                            f"— flagging as ambiguous"
+                        )
+                        break
+                # len(candidates) == 0 → not found; leave resolved_entities empty,
+                # the format_agent_message_node will handle not_found messaging.
 
     return {
         "read_rbac_passed": True,
@@ -1458,15 +1497,7 @@ def precondition_validation_node(state: AgentState):
 
     is_bulk = False
     if operation in _REQUIRES_EXISTING_DOC:
-        # Derive the target record ID from resolved_entities or collected_fields
-        for slot_key, resolved in resolved_entities.items():
-            candidate_name = resolved.get("name") if isinstance(resolved, dict) else None
-            if candidate_name:
-                record_id = candidate_name
-                break
-        if not record_id:
-            # Fall back to explicit id/name in collected
-            record_id = collected.get("id") or collected.get("name")
+        record_id = _target_record_id(collected, resolved_entities)
 
         if not record_id:
             if collected.get("filters"):
@@ -1490,8 +1521,8 @@ def precondition_validation_node(state: AgentState):
         try:
             fetch_result = get_document(doctype, record_id)
         except Exception as exc:
-            logger.error(f"[Step 5.5] get_document raised: {exc}")
-            fetch_result = {"status": "error", "data": None}
+            logger.exception(f"[Step 5.5] get_document raised for {doctype} '{record_id}'")
+            fetch_result = {"status": "system_error", "data": None, "error": str(exc)}
 
         fetch_status = fetch_result.get("status")
         if fetch_status != "success" or not fetch_result.get("data"):
@@ -1524,7 +1555,7 @@ def precondition_validation_node(state: AgentState):
                 return {
                     "preconditions_validated": False,
                     "failure_classification": "not_found",
-                    "final_response": "",
+                    "final_response": f"{doctype} '{record_id}' was not found.",
                 }
 
         fresh_snapshot = fetch_result["data"]
@@ -1682,7 +1713,10 @@ def precondition_validation_node(state: AgentState):
                             if age_seconds <= _IDEMPOTENCY_WINDOW_SECONDS:
                                 duplicates.append(doc)
                         except ValueError:
-                            pass  # Unparseable timestamp — skip
+                            logger.warning(
+                                f"[Step 5.5] Check 5: unparseable creation timestamp {created_str!r} "
+                                f"on {doctype} '{doc.get('name')}'; not counted as a duplicate."
+                            )
 
                 if duplicates:
                     dup_names = ", ".join(
@@ -1704,10 +1738,17 @@ def precondition_validation_node(state: AgentState):
                     }
 
         except Exception as exc:
-            # Non-fatal: idempotency check failure should not block the operation
-            logger.warning(
-                f"[Step 5.5] Check 5: idempotency check raised an exception (ignored): {exc}"
-            )
+            # Fail visibly: without the duplicate check we cannot safely create the record.
+            logger.exception("[Step 5.5] Check 5: idempotency check failed")
+            return {
+                "idempotency_check_performed": True,
+                "preconditions_validated": False,
+                "failure_classification": "tool_system_failure",
+                "final_response": (
+                    f"Could not check for a duplicate {doctype} before creating it: {exc}. "
+                    f"Nothing was created."
+                ),
+            }
 
         logger.info("[Step 5.5] Check 5 PASS: no recent duplicates detected.")
 
@@ -1728,8 +1769,16 @@ def confirmation_node(state: AgentState):
     """
     Step 6: Confirmation gate for destructive/consequential operations.
 
-    Applies ONLY to cancel, delete, and submit operations.
-    Structurally skips for create/update/read-only operations.
+    Asks for confirmation on submit, cancel and delete, on updates to submitted
+    documents, and on chained creates/updates whose parameters were derived by the
+    planner (the step has 'uses' or a 'condition') rather than stated by the user.
+
+    This node never interprets the user's reply. Replies are handled by
+    pending_action_gate_node at the start of the next turn, which re-runs write RBAC
+    and preconditions and then lets exactly the confirmed action through here.
+
+    Inside a chain, asking for confirmation does not end the turn: the step is marked
+    awaiting_confirmation and the router continues with steps that do not depend on it.
     """
     preconditions_validated = state.get("preconditions_validated")
     intent = state.get("detected_intent", "")
@@ -1739,155 +1788,79 @@ def confirmation_node(state: AgentState):
         return {}
 
     operation = state.get("write_rbac_operation") or _TOOL_TO_OPERATION.get(skill.get("tool", ""), "")
-
     chain_plan = state.get("chain_plan")
-    
-    # 1. Scope constraint: only specific destructive operations require this gate
-    # EXCEPT for chained writes, which always require confirmation
-    requires_confirmation = operation in {"cancel", "delete", "submit"}
-    if chain_plan and operation in {"create", "update", "cancel", "delete", "submit"}:
-        requires_confirmation = True
+    chain_idx = state.get("chain_step_index")
+    in_chain = bool(chain_plan) and chain_idx is not None and 0 <= chain_idx < len(chain_plan)
 
-    # Confirm-before-write for updates on submitted orders (docstatus == 1)
-    if operation == "update":
-        last_snap = state.get("last_read_snapshot")
-        if last_snap and last_snap.get("docstatus") == 1:
+    # 1. An action approved by its requester passes through exactly once.
+    confirmed = state.get("confirmed_action")
+    if state.get("confirmation_result") == "confirmed" and confirmed:
+        matches = (
+            confirmed.get("skill") == intent
+            and confirmed.get("operation") == operation
+            and (not in_chain or confirmed.get("step_index") == chain_idx)
+        )
+        if matches:
+            logger.info(f"[Step 6] Executing confirmed {operation} on {confirmed.get('doctype')} '{confirmed.get('target_name')}'.")
+            return {"confirmation_result": None, "confirmed_action": None, "pending_confirmation": None}
+        logger.error(
+            f"[Step 6] Confirmed action {confirmed.get('operation')}/{confirmed.get('skill')} does not match "
+            f"the step being executed ({operation}/{intent}); refusing to execute."
+        )
+        return {
+            "confirmation_result": None,
+            "confirmed_action": None,
+            "failure_classification": "validation_error",
+            "final_response": "The confirmed action no longer matches the current request, so nothing was executed. Please ask again.",
+        }
+
+    # 2. Does this operation need confirmation?
+    requires_confirmation = operation in {"cancel", "delete", "submit"}
+    if in_chain and operation in {"create", "update"}:
+        step = chain_plan[chain_idx]
+        if step.get("uses") or step.get("condition"):
+            # Parameters derived by the planner from earlier steps, not stated by the user.
             requires_confirmation = True
-        elif not last_snap:
-            # Check target document docstatus
-            rec = None
-            resolved_ents = state.get("resolved_entities") or {}
-            for k, v in resolved_ents.items():
-                if isinstance(v, dict) and v.get("name"):
-                    rec = v.get("name")
-                    break
-            if not rec:
-                rec = state.get("collected_fields", {}).get("id") or state.get("collected_fields", {}).get("name")
-            target_dt = state.get("target_doctype") or (skill.get("doctype", "") if skill else "")
-            if rec and target_dt:
-                try:
-                    cur_doc = get_document(target_dt, rec)
-                    if cur_doc.get("status") == "success" and cur_doc.get("data", {}).get("docstatus") == 1:
-                        requires_confirmation = True
-                except Exception:
-                    pass
+
+    doctype = skill.get("doctype", "") or state.get("target_doctype") or ""
+    resolved_entities = state.get("resolved_entities") or {}
+    collected = state.get("collected_fields") or {}
+    messages = state.get("messages", [])
+
+    record_id = None if operation == "create" else _target_record_id(collected, resolved_entities)
+
+    # Confirm-before-write for updates on submitted documents (docstatus == 1)
+    if operation == "update" and not requires_confirmation:
+        last_snap = state.get("last_read_snapshot")
+        if last_snap:
+            requires_confirmation = str(last_snap.get("docstatus")) == "1"
+        elif record_id and doctype:
+            cur_doc = get_document(doctype, record_id)
+            if cur_doc.get("status") == "success":
+                requires_confirmation = str((cur_doc.get("data") or {}).get("docstatus")) == "1"
+            else:
+                # Cannot tell whether it is submitted; ask rather than write blind.
+                logger.error(
+                    f"[Step 6] Could not read docstatus of {doctype} '{record_id}' "
+                    f"({cur_doc.get('status')}: {cur_doc.get('error')}); requiring confirmation."
+                )
+                requires_confirmation = True
 
     if not requires_confirmation:
         logger.info(f"[Step 6] Confirmation skipped: operation '{operation}' does not require explicit confirmation.")
         return {}
 
-    doctype = state.get("target_doctype") or (skill.get("doctype", "") if skill else "")
-    resolved_entities = state.get("resolved_entities") or {}
-    collected = state.get("collected_fields") or {}
-    pending = state.get("pending_confirmation")
-    messages = state.get("messages", [])
-    last_msg = messages[-1].content.strip().lower() if messages else ""
-
-    # Extract target record ID and metadata from resolved_entities or collected
-    record_id = None
-    target_match_type = "exact"
-    display_info = {}
-    matched_on = ""
-
-    for k, v in resolved_entities.items():
-        if isinstance(v, dict) and v.get("name"):
-            record_id = v.get("name")
-            target_match_type = v.get("match_type", "exact")
-            display_info = v.get("record", {})
-            matched_on = v.get("matched_on", "")
-            break
-
-    if not record_id:
-        record_id = collected.get("id") or collected.get("name")
-
-    if not record_id:
-        record_id = collected.get("id") or collected.get("name")
-
     filters = collected.get("filters")
-    is_bulk = bool(not record_id and filters)
+    is_bulk = bool(operation != "create" and not record_id and filters)
 
-    if not record_id and not is_bulk:
-        logger.warning("[Step 6] Missing target record ID and no filters for confirmation.")
-        return {}
+    if operation != "create" and not record_id and not is_bulk:
+        logger.error("[Step 6] Missing target record ID and no filters for a confirmation-gated operation.")
+        return {
+            "failure_classification": "validation_error",
+            "final_response": f"I could not determine which {doctype} to {operation}. Nothing was executed.",
+        }
 
-    # 2. Freshness and scope validation
-    bulk_scope = state.get("bulk_operation_scope")
-    if pending:
-        # Check if the context shifted since we asked
-        if pending.get("is_bulk"):
-            if (pending.get("operation") != operation or 
-                pending.get("doctype") != doctype or 
-                pending.get("filters") != filters):
-                logger.warning("[Step 6] Stale/mismatched bulk confirmation detected. Abandoning.")
-                pending = None
-                bulk_scope = None
-        else:
-            if (pending.get("operation") != operation or 
-                pending.get("doctype") != doctype or 
-                pending.get("target_name") != record_id):
-                logger.warning("[Step 6] Stale/mismatched confirmation detected. Abandoning previous confirmation.")
-                pending = None
-
-    # 3. Processing a user's reply
-    if pending:
-        affirmative_words = {"yes", "y", "confirm", "do it", "proceed", "ok", "okay", "yep", "yeah", "sure"}
-        negative_words = {"no", "n", "cancel", "cancel that", "don't", "stop", "abort", "nope"}
-
-        is_yes = any(last_msg == w or last_msg.startswith(w + " ") for w in affirmative_words)
-        is_no = any(last_msg == w or last_msg.startswith(w + " ") for w in negative_words)
-
-        if is_yes and not is_no:
-            if pending.get("is_bulk"):
-                logger.info(f"[Step 6] User CONFIRMED bulk operation {operation} on {doctype}.")
-                log_audit_event(operation=operation, doctype=doctype, target_name=f"Bulk: {pending.get('filters')}", outcome="confirmed", details=f"Affected count: {pending.get('affected_count')}")
-                return {
-                    "confirmation_result": "confirmed",
-                    "pending_confirmation": None,
-                    "bulk_operation_scope": {
-                        "doctype": doctype,
-                        "filters": pending.get("filters"),
-                        "affected_count": pending.get("affected_count"),
-                        "confirmed": True
-                    }
-                }
-            else:
-                logger.info(f"[Step 6] User CONFIRMED operation {operation} on {doctype} {record_id}.")
-                log_audit_event(operation=operation, doctype=doctype, target_name=record_id, outcome="confirmed")
-                return {
-                    "confirmation_result": "confirmed",
-                    "pending_confirmation": None,
-                    # Proceeds to execution via router
-                }
-        elif is_no and not is_yes:
-            if pending.get("is_bulk"):
-                logger.info(f"[Step 6] User REJECTED bulk operation {operation} on {doctype}.")
-                log_audit_event(operation=operation, doctype=doctype, target_name=f"Bulk: {pending.get('filters')}", outcome="rejected", details=f"Affected count: {pending.get('affected_count')}")
-                return {
-                    "confirmation_result": "rejected",
-                    "pending_confirmation": None,
-                    "bulk_operation_scope": None,
-                    "final_response": f"Operation cancelled. No {doctype} records were {operation}ed.",
-                    "is_workflow_complete": True,
-                }
-            else:
-                logger.info(f"[Step 6] User REJECTED operation {operation} on {doctype} {record_id}.")
-                log_audit_event(operation=operation, doctype=doctype, target_name=record_id, outcome="rejected")
-                return {
-                    "confirmation_result": "rejected",
-                    "pending_confirmation": None,
-                    "final_response": f"Operation cancelled. The {doctype} '{record_id}' was NOT {operation}ed.",
-                    "is_workflow_complete": True,
-                }
-        else:
-            # Ambiguous/unclear reply -> Re-ask exactly the same question.
-            # TODO [Task 6]: Confirmation re-asking currently has no limit. Could be bounded in a future hardening pass.
-            logger.warning("[Step 6] Ambiguous reply to confirmation. Re-asking.")
-            return {
-                "final_response": pending.get("scope_description") + "\n\nReply **Yes** to confirm, or **No** to cancel.",
-                "is_workflow_complete": False,
-            }
-
-    # 4. Fresh request — build pending_confirmation
+    # 3. Build the pending action
     if is_bulk:
         _LARGE_BULK_THRESHOLD = 50
         count_res = get_count(doctype, filters=filters)
@@ -1896,84 +1869,88 @@ def confirmation_node(state: AgentState):
             return {
                 "failure_classification": "permission_denied",
                 "final_response": f"Permission Denied: Unable to access {doctype} records. {count_res.get('error', '')}",
-                "is_workflow_complete": True,
             }
         elif count_res.get("status") == "system_error":
             logger.error(f"[Step 6] System error getting count for {doctype}: {count_res.get('error')}")
             return {
                 "failure_classification": "tool_system_failure",
                 "final_response": f"System Error: Failed to check {doctype} records. {count_res.get('error', '')}",
-                "is_workflow_complete": True,
             }
 
         affected_count = count_res.get("data", 0) if count_res.get("status") in ("success", "empty") else 0
-        
+
         if affected_count == 0:
-            logger.info(f"[Step 6] Bulk operation {operation} on {doctype} returned 0 records.")
+            logger.info(f"[Step 6] Bulk operation {operation} on {doctype} matched 0 records.")
             return {
+                "failure_classification": "not_found",
                 "final_response": f"No matching {doctype} records found to {operation}.",
-                "is_workflow_complete": True,
             }
-            
+
         list_res = get_list(doctype, filters=filters, fields=["name"], limit=5)
-        sample = [str(r.get("name")) for r in list_res.get("data", [])]
-        
+        sample = [str(r.get("name")) for r in list_res.get("data") or []]
+
         sample_str = ", ".join(sample)
         if affected_count > len(sample):
             sample_str += f", and {affected_count - len(sample)} more"
-            
+
         filters_desc = " ".join([f"{f[0]} {f[1]} {f[2]}" for f in filters]) if isinstance(filters, list) else str(filters)
-        scope_desc = f"This will {operation} {affected_count} draft {doctype}s matching {filters_desc}: {sample_str}. Confirm?"
-        
+        scope_desc = f"This will {operation} {affected_count} {doctype} records matching {filters_desc}: {sample_str}. Confirm?"
+
         if affected_count > _LARGE_BULK_THRESHOLD:
-            scope_desc = f"This is a large operation — {affected_count} {doctype} records. Are you sure you want to {operation} them? ({sample_str})"
-            
+            scope_desc = f"This is a large operation: {affected_count} {doctype} records. Are you sure you want to {operation} them? ({sample_str})"
+
         pending = {
             "operation": operation,
             "doctype": doctype,
+            "target_name": None,
             "is_bulk": True,
             "filters": filters,
             "affected_count": affected_count,
             "scope_description": scope_desc,
-            "requested_at": len(messages)
         }
-        
         logger.info(f"[Step 6] Generating confirmation ask for BULK {operation} on {doctype}.")
     else:
-        display_name = _get_display_name(display_info) if display_info else record_id
-    
-        # If it was a fuzzy match, make the scope description explicitly name the match
-        if operation == "create" and doctype == "Purchase Order":
-            supplier = collected.get("supplier", "Unknown Supplier")
-            items = collected.get("items", [])
-            item_details = []
-            total = 0
-            for it in items:
-                it_code = it.get("item_code", "Unknown")
-                try:
-                    qty = float(it.get("qty", 0))
-                except (ValueError, TypeError):
-                    qty = 0
-                try:
-                    rate = float(it.get("rate", 0))
-                except (ValueError, TypeError):
-                    rate = 0
-                line_total = qty * rate
-                total += line_total
-                item_details.append(f"- {qty}x {it_code} @ {rate}")
-            items_str = "\n".join(item_details) if item_details else "- No items"
-            scope_desc = f"Are you sure you want to create a Purchase Order for supplier '{supplier}'?\n\nItems:\n{items_str}\n\nEstimated Total: {total}"
-        elif target_match_type == "fuzzy" and matched_on and display_name.lower() != matched_on.lower():
-            scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}' (closest match to '{matched_on}')?"
-        elif target_match_type == "fuzzy" and display_name and record_id and display_name.lower() != record_id.lower():
-            scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}'?"
+        if operation == "create":
+            scope_desc = _describe_create_scope(doctype, collected)
         else:
-            scope_desc = f"Are you sure you want to {operation} {doctype} '{record_id}'?"
-    
+            target_info = next(
+                (v for v in resolved_entities.values() if isinstance(v, dict) and v.get("name") == record_id),
+                {},
+            )
+            display_name = _get_display_name(target_info.get("record") or {}) if target_info.get("record") else record_id
+            matched_on = target_info.get("matched_on", "")
+            if target_info.get("match_type") == "fuzzy" and matched_on and str(display_name).lower() != str(matched_on).lower():
+                scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}' (closest match to '{matched_on}')?"
+            else:
+                scope_desc = f"Are you sure you want to {operation} {doctype} '{record_id}'?"
+
+        pending = {
+            "operation": operation,
+            "doctype": doctype,
+            "target_name": record_id if operation != "create" else "(new)",
+            "is_bulk": False,
+            "scope_description": scope_desc,
+        }
+        logger.info(f"[Step 6] Generating confirmation ask for {operation} on {doctype} '{pending['target_name']}'.")
+
+    # Everything needed to execute later without re-extracting from the reply, scoped
+    # to the user who asked so nobody else can approve it.
+    pending.update({
+        "requested_at": len(messages),
+        "requested_at_ts": datetime.now(timezone.utc).isoformat(),
+        "requested_by": state.get("user_sub"),
+        "requested_roles": list(state.get("user_roles") or []),
+        "skill": intent,
+        "params": copy.deepcopy(collected),
+        "resolved_entities": copy.deepcopy(resolved_entities),
+        "step_index": chain_idx if in_chain else None,
+        "chain_id": state.get("chain_id") if in_chain else None,
+        "reask_count": 0,
+    })
+
     findings_prefix = ""
-    chain_plan = state.get("chain_plan")
-    if chain_plan and not state.get("chain_aborted"):
-        chain_results = state.get("chain_results", {})
+    if in_chain and not state.get("chain_aborted"):
+        chain_results = state.get("chain_results") or {}
         findings = []
         for idx_str, res in chain_results.items():
             if isinstance(res, dict):
@@ -1982,28 +1959,57 @@ def confirmation_node(state: AgentState):
                     findings.append(f"Step {idx_str} findings: {res_info}")
         if findings:
             findings_prefix = "\n".join(findings) + "\n\n"
-    
-    pending = {
-        "operation": operation,
-        "doctype": doctype,
-        "target_name": record_id,
-        "scope_description": scope_desc,
-        "requested_at": len(messages)
-    }
 
-    logger.info(f"[Step 6] Generating confirmation ask for {operation} on {record_id}.")
     log_audit_event(
         operation=operation,
         doctype=doctype,
-        target_name=f"Bulk: {pending.get('filters')}" if pending.get("is_bulk") else pending.get("target_name", record_id),
+        target_name=f"Bulk: {pending.get('filters')}" if pending.get("is_bulk") else str(pending.get("target_name")),
         outcome="pending",
-        details=f"Affected count: {pending.get('affected_count')}" if pending.get("is_bulk") else ""
+        user_id=state.get("user_sub") or "unknown",
+        details=f"Affected count: {pending.get('affected_count')}" if pending.get("is_bulk") else "",
     )
-    return {
+    updates = {
         "pending_confirmation": pending,
-        "final_response": findings_prefix + scope_desc + "\n\nReply **Yes** to confirm, or **No** to cancel.",
+        # In a chain the final message is composed when the turn ends; this text is
+        # what a standalone (non-chain) request returns.
+        "final_response": findings_prefix + pending["scope_description"] + "\n\nReply **Yes** to confirm, or **No** to cancel.",
         "is_workflow_complete": False,
     }
+    if in_chain:
+        status = _get_step_status(state)
+        status[str(chain_idx)] = {
+            "status": "awaiting_confirmation",
+            "label": _step_label(chain_plan[chain_idx], collected),
+            "reported": False,
+        }
+        updates["chain_step_status"] = status
+    return updates
+
+
+def _describe_create_scope(doctype: str, collected: dict) -> str:
+    """Human-readable summary of a create that is awaiting confirmation."""
+    party_key = next((k for k in ("supplier", "customer", "customer_name") if collected.get(k)), None)
+    party = f" for {party_key.replace('_', ' ')} '{collected[party_key]}'" if party_key else ""
+    lines = [f"Are you sure you want to create a {doctype}{party}?"]
+    rows = collected.get("items")
+    if isinstance(rows, list) and rows:
+        total = 0.0
+        lines.append("")
+        lines.append("Items:")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                qty = float(row.get("qty") or 0)
+                rate = float(row.get("rate") or 0)
+            except (TypeError, ValueError):
+                qty, rate = 0.0, 0.0
+            total += qty * rate
+            lines.append(f"- {row.get('qty')}x {row.get('item_code', 'Unknown')}" + (f" @ {row.get('rate')}" if row.get("rate") is not None else ""))
+        if total:
+            lines.append("")
+            lines.append(f"Estimated Total: {total}")
+    return "\n".join(lines)
 
 
 # =========================================================================
@@ -2353,6 +2359,11 @@ def result_validation_node(state: AgentState):
     """
     Step 8: Write verification + chained follow-up execution.
     """
+    # The tool step already classified a failure (including an empty result). Leave it
+    # to retry_and_escalation; never record a failed step as completed.
+    if state.get("failure_classification"):
+        return {}
+
     intent = state.get("detected_intent", "")
     skill = _get_skill_for_intent(intent)
     tool = ""
@@ -2385,9 +2396,8 @@ def result_validation_node(state: AgentState):
     if not success:
         if chain_plan:
             return {
-                "chain_aborted": True,
-                "is_workflow_complete": True,
-                "final_response": f"Chain stopped: step failed with error: {tool_raw.get('error', 'Unknown error')}"
+                "failure_classification": "tool_system_failure",
+                "final_response": f"The step failed with error: {tool_raw.get('error', 'Unknown error')}",
             }
         return {}
 
@@ -2476,6 +2486,16 @@ def result_validation_node(state: AgentState):
             if bulk_scope and bulk_scope.get("confirmed"):
                 write_verified = True # Verified via tool's own loop aggregation in Step 7
 
+        if not write_verified and not failure_classification:
+            # Neither verified nor failed: never treat an unverified write as done. Not
+            # retry-eligible, because retrying a write that may have landed duplicates it.
+            failure_classification = "write_unverified"
+            target_desc = f"'{record_id}'" if record_id else "(no record name returned)"
+            failure_msg = (
+                f"The {operation} on {doctype} {target_desc} could not be verified after execution. "
+                f"Please check ERPNext before retrying."
+            )
+
     updates = {}
     if failure_classification:
         log_audit_event(
@@ -2524,6 +2544,16 @@ def result_validation_node(state: AgentState):
         results[str(idx)] = step_res
         updates["chain_results"] = results
         updates["chain_step_index"] = idx + 1
+
+        status = _get_step_status(state)
+        status[str(idx)] = {
+            "status": "done",
+            "output": data,
+            "label": _step_label(chain_plan[idx], collected) if idx < len(chain_plan) else intent,
+            "slots": {k: v for k, v in collected.items() if not str(k).startswith("_")},
+            "reported": False,
+        }
+        updates["chain_step_status"] = status
         
         # Clear fields for next step only if there are more steps
         if idx + 1 < len(chain_plan):
@@ -2816,37 +2846,16 @@ def _retry_and_escalation_node_impl(state: AgentState):
 
 def retry_and_escalation_node(state: AgentState):
     updates = _retry_and_escalation_node_impl(state)
-    
-    chain_plan = state.get("chain_plan")
-    if chain_plan and updates.get("is_workflow_complete"):
-        updates["chain_aborted"] = True
-        idx = state.get("chain_step_index", 0)
-        results = state.get("chain_results", {})
-        findings = []
-        for i_str, res in results.items():
-            if isinstance(res, dict):
-                res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
-                if res_info:
-                    try:
-                        s_name = chain_plan[int(i_str)].get("skill", i_str)
-                    except (IndexError, ValueError):
-                        s_name = i_str
-                    findings.append(f"- {s_name} completed with {res_info}")
-        
-        try:
-            failed_skill = chain_plan[idx].get("skill", idx)
-        except (IndexError, ValueError):
-            failed_skill = idx
-            
-        prefix_lines = ["Chain execution failed:"]
-        if findings:
-            prefix_lines.extend(findings)
-        prefix_lines.append(f"-> Aborted at step '{failed_skill}' (index {idx}): ")
-        prefix = "\n".join(prefix_lines)
-        
-        updates["final_response"] = prefix + updates.get("final_response", state.get("final_response", ""))
-        updates["messages"] = [AIMessage(content=updates["final_response"])]
-            
+
+    # Inside a chain a terminal failure fails only the current step. Independent steps
+    # still run; steps that depend on this one are skipped with a reason.
+    if state.get("chain_plan") and not state.get("chain_aborted") and updates.get("is_workflow_complete"):
+        message = updates.get("final_response") or state.get("final_response") or "The step failed."
+        step_updates = _mark_current_step_failed(state, message, state.get("failure_classification"))
+        step_updates["escalated"] = updates.get("escalated", False)
+        step_updates["escalation_reason"] = updates.get("escalation_reason")
+        return step_updates
+
     return updates
 
 
@@ -2898,194 +2907,782 @@ def rbac_denied_response_node(state: AgentState):
 def format_response_node(state: AgentState):
     """Step 9b: Append the final response to the message history."""
     final_resp = state.get("final_response", "")
-    
+
+    # Notes raised earlier in the turn (expired or auto-cancelled pending action).
+    notes = [n for n in (state.get("turn_notes") or []) if n]
+    if notes:
+        final_resp = "\n\n".join(notes + ([final_resp] if final_resp else []))
+
     pending_steps = state.get("pending_followup_steps", [])
-    updates = {}
-    
+    updates = {"turn_notes": []}
+
     if state.get("is_workflow_complete"):
         if pending_steps:
             final_resp += f"\n\nNote: The remaining requested steps were NOT attempted due to the above result: {', '.join(pending_steps)}."
             updates["pending_followup_steps"] = []
-            
+
         # Clear chain state on completion (abort, success, decline, unrelated finished)
         updates["chain_plan"] = None
         updates["chain_step_index"] = None
         updates["chain_results"] = None
         updates["chain_aborted"] = None
         updates["chain_id"] = None
+        updates["chain_step_status"] = None
+        updates["chain_started_at"] = None
+        updates["chain_resumed"] = False
+        updates["confirmed_action"] = None
         updates["is_compound"] = False  # Never let this leak across turns
-        
+
+    updates["final_response"] = final_resp
     updates["messages"] = [AIMessage(content=final_resp)]
     return updates
+
+
+# =========================================================================
+# Chain Step Bookkeeping Helpers
+# =========================================================================
+
+_STEP_REF_RE = re.compile(r"^\$step(\d+)\.(\w+)$")
+
+# Step outcomes that block every step depending on them.
+_STEP_BLOCKING_STATES = ("failed", "skipped", "cancelled")
+
+
+def _step_scoped_reset() -> dict:
+    """Per-step fields that must never leak from one chain step into the next."""
+    return {
+        "detected_intent": "",
+        "collected_fields": {},
+        "resolved_entities": {},
+        "ambiguous_candidates": None,
+        "clarification_target": None,
+        "clarification_attempts": 0,
+        "missing_parameters": [],
+        "all_required_filled": False,
+        "read_rbac_passed": None,
+        "write_rbac_passed": None,
+        "write_rbac_operation": None,
+        "preconditions_validated": None,
+        "last_read_snapshot": None,
+        "bulk_operation_scope": None,
+        "target_tool": "",
+        "target_doctype": "",
+        "tool_raw_response": {},
+        "failure_classification": None,
+        "write_verified": None,
+        "idempotency_check_performed": False,
+        "retry_count": 0,
+        "escalated": False,
+        "escalation_reason": None,
+        "confirmation_result": None,
+        "final_response": "",
+    }
+
+
+def _get_step_status(state: AgentState) -> Dict[str, dict]:
+    """
+    Copy of the per-step status map. States written before per-step records existed
+    only carry chain_step_index; every step before it is treated as done and reported.
+    """
+    status = state.get("chain_step_status")
+    if status is not None:
+        return {k: dict(v) for k, v in status.items()}
+    idx = state.get("chain_step_index") or 0
+    return {str(i): {"status": "done", "message": "", "reported": True} for i in range(idx)}
+
+
+def _step_refs(step: dict) -> set:
+    """Indexes of earlier steps referenced by a step's 'uses' or 'condition'."""
+    refs = set()
+    for v in (step.get("uses") or {}).values():
+        m = _STEP_REF_RE.match(str(v))
+        if m:
+            refs.add(int(m.group(1)))
+    cond = step.get("condition")
+    if isinstance(cond, dict):
+        m = _STEP_REF_RE.match(str(cond.get("field", "")))
+        if m:
+            refs.add(int(m.group(1)))
+    return refs
+
+
+def _compute_depends_on(plan: list, i: int) -> List[int]:
+    """
+    A step depends on:
+      - every earlier step it references through 'uses' or 'condition';
+      - every earlier write step, if it is itself a write (writes are serialized, so
+        each consequential action is confirmed on its own and sees the result of the
+        previous one);
+      - every earlier write step on the same doctype, if it is a read (reading a
+        document type that an earlier step is changing must wait for that change).
+    """
+    step = plan[i]
+    deps = {r for r in _step_refs(step) if r < i}
+    skill_i = _get_skill_for_intent(step.get("skill", "")) or {}
+    for j in range(i):
+        skill_j = _get_skill_for_intent(plan[j].get("skill", "")) or {}
+        if not _is_write_intent(skill_j):
+            continue
+        if _is_write_intent(skill_i):
+            deps.add(j)
+        elif skill_i.get("doctype") and skill_i.get("doctype") == skill_j.get("doctype"):
+            deps.add(j)
+    return sorted(deps)
+
+
+def _deps_for(plan: list, i: int) -> List[int]:
+    deps = plan[i].get("depends_on")
+    return list(deps) if isinstance(deps, list) else _compute_depends_on(plan, i)
+
+
+def _step_label(step: dict, slots: Optional[dict] = None) -> str:
+    """Short human label for a plan step, e.g. 'Check inventory (MS-001)'."""
+    label = str(step.get("skill") or "step").replace("-", " ").capitalize()
+    slots = slots if slots is not None else (step.get("slots") or {})
+    for key in ("name", "id", "item_code", "supplier", "customer", "customer_name"):
+        val = slots.get(key)
+        if isinstance(val, (str, int, float)) and str(val).strip() and not str(val).startswith("$step"):
+            return f"{label} ({val})"
+    rows = slots.get("items")
+    if isinstance(rows, list):
+        codes = [str(r.get("item_code")) for r in rows if isinstance(r, dict) and r.get("item_code")]
+        if codes:
+            return f"{label} ({', '.join(codes)})"
+    return label
+
+
+def _select_next_step(plan: list, status: Dict[str, dict]) -> Optional[int]:
+    """
+    Return the index of the next queued step whose dependencies are all done, or None.
+    Mutates *status*: a queued step whose dependency failed, was skipped or was
+    cancelled is marked skipped. Steps waiting on an awaiting_confirmation step stay
+    queued.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for i, step in enumerate(plan):
+            if str(i) in status:
+                continue
+            blocked = [d for d in _deps_for(plan, i) if status.get(str(d), {}).get("status") in _STEP_BLOCKING_STATES]
+            if blocked:
+                d = blocked[0]
+                status[str(i)] = {
+                    "status": "skipped",
+                    "message": (
+                        f"It depends on step {d + 1} ({status[str(d)].get('label') or _step_label(plan[d])}), "
+                        f"which was {status[str(d)]['status']}."
+                    ),
+                    "label": _step_label(step),
+                    "reported": False,
+                }
+                changed = True
+    for i in range(len(plan)):
+        if str(i) in status:
+            continue
+        if all(status.get(str(d), {}).get("status") == "done" for d in _deps_for(plan, i)):
+            return i
+    return None
+
+
+def _safe_template(template: str, data: Any) -> Optional[str]:
+    """Fill a skill template from a dict; None when a placeholder is missing."""
+    if not template or not isinstance(data, dict):
+        return None
+    try:
+        return template.format(**data)
+    except (KeyError, IndexError, ValueError, AttributeError):
+        return None
+
+
+def _fmt_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _render_rows(rows: list, columns: Optional[list]) -> str:
+    cols = [c for c in (columns or list(rows[0].keys())) if any(c in r for r in rows)][:8]
+    if not cols:
+        cols = list(rows[0].keys())[:8]
+    lines = [
+        "| " + " | ".join(c.replace("_", " ").title() for c in cols) + " |",
+        "|" + "---|" * len(cols),
+    ]
+    for r in rows[:20]:
+        lines.append("| " + " | ".join(_fmt_cell(r.get(c)) for c in cols) + " |")
+    if len(rows) > 20:
+        lines.append(f"...and {len(rows) - 20} more rows.")
+    return "\n".join(lines)
+
+
+_SUMMARY_FIELD_ORDER = (
+    "name", "status", "docstatus", "supplier", "customer", "customer_name",
+    "transaction_date", "schedule_date", "grand_total", "currency",
+)
+
+
+def _render_done_step(step: dict, rec: dict) -> str:
+    """Deterministic rendering of a completed step's output."""
+    skill = _get_skill_for_intent(step.get("skill", "")) or {}
+    output = rec.get("output")
+    label = rec.get("label") or _step_label(step)
+
+    if _is_write_intent(skill):
+        operation = _TOOL_TO_OPERATION.get(skill.get("tool", ""), "update")
+        text = _safe_template(skill.get("response_template", ""), output)
+        if not text:
+            name = output.get("name") if isinstance(output, dict) else None
+            text = f"**{label}**: {operation} completed" + (f" ({name})." if name else ".")
+        if operation == "create" and isinstance(output, dict) and str(output.get("docstatus")) == "0":
+            text += " It is saved as a Draft."
+        return text
+
+    if isinstance(output, list):
+        if not output:
+            return f"**{label}**\nNo records found."
+        if all(isinstance(r, dict) for r in output):
+            columns = (skill.get("query_parameters") or {}).get("fields")
+            return f"**{label}**\n\n" + _render_rows(output, columns)
+        return f"**{label}**\n" + ", ".join(_fmt_cell(r) for r in output)
+    if isinstance(output, dict):
+        keys = [k for k in _SUMMARY_FIELD_ORDER if k in output]
+        if not keys:
+            keys = [k for k, v in output.items() if isinstance(v, (str, int, float))][:8]
+        return f"**{label}**\n" + "\n".join(
+            f"- **{k.replace('_', ' ').title()}**: {_fmt_cell(output[k])}" for k in keys
+        )
+    return f"**{label}**\n{_fmt_cell(output)}"
+
+
+def _not_executed_message(pending: dict) -> str:
+    op = pending.get("operation", "")
+    dt = pending.get("doctype", "record")
+    tgt = pending.get("target_name")
+    if pending.get("is_bulk"):
+        return f"The {op} of {pending.get('affected_count')} {dt} records was not executed."
+    return {
+        "submit": f"{dt} '{tgt}' was not submitted and remains a Draft.",
+        "cancel": f"{dt} '{tgt}' was not cancelled.",
+        "delete": f"{dt} '{tgt}' was not deleted.",
+        "create": f"No {dt} was created.",
+        "update": f"{dt} '{tgt}' was not changed.",
+    }.get(op, f"The {op} on {dt} '{tgt}' was not executed.")
+
+
+def _compose_chain_turn(state: AgentState, plan: list, status: Dict[str, dict]) -> dict:
+    """
+    End of a chain turn: one message with each newly finished step's outcome in plan
+    order, then the confirmation prompt (if an action is awaiting) as the last part.
+    Deterministic: no LLM call, so step outputs are shown exactly as returned.
+    """
+    sections = []
+    last_read_done = None
+    for i, step in enumerate(plan):
+        rec = status.get(str(i))
+        if not rec or rec.get("status") == "awaiting_confirmation":
+            continue
+        if rec.get("status") == "done":
+            skill = _get_skill_for_intent(step.get("skill", "")) or {}
+            if not _is_write_intent(skill):
+                last_read_done = (step, rec, skill)
+        if rec.get("reported"):
+            continue
+        st = rec.get("status")
+        label = rec.get("label") or _step_label(step)
+        msg = rec.get("message", "")
+        if st == "done":
+            sections.append(_render_done_step(step, rec))
+        elif st == "failed" and rec.get("verbatim"):
+            sections.append(msg)
+        elif st == "failed":
+            sections.append(f"**{label}**: could not be completed.\n{msg}".rstrip())
+        elif st == "skipped":
+            sections.append(f"**{label}**: skipped. {msg}".rstrip())
+        elif st == "cancelled":
+            sections.append(f"**{label}**: cancelled. {msg}".rstrip())
+        rec["reported"] = True
+
+    pending = state.get("pending_confirmation")
+    waiting = [i for i in range(len(plan)) if str(i) not in status]
+    if pending:
+        prompt = pending.get("scope_description", "")
+        if waiting:
+            prompt += "\n\nAfter that I will also run: " + "; ".join(_step_label(plan[i]) for i in waiting) + "."
+        prompt += "\n\nReply **Yes** to confirm, or **No** to cancel."
+        sections.append(prompt)
+    elif waiting:
+        # Nothing is pending yet steps are still queued: their dependencies can never
+        # complete. Report it instead of leaving them silently unrun.
+        logger.error(f"[Chain] Steps {waiting} are unrunnable with no pending action; marking skipped.")
+        for i in waiting:
+            label = _step_label(plan[i])
+            status[str(i)] = {"status": "skipped", "message": "Its prerequisites never completed.", "label": label, "reported": True}
+            sections.append(f"**{label}**: skipped. Its prerequisites never completed.")
+
+    updates = {
+        "chain_step_status": status,
+        "final_response": "\n\n".join(s for s in sections if s) or "There was nothing left to run for this request.",
+        "is_workflow_complete": not pending,
+        # Failures are per step; the chain itself is never aborted mid-way.
+        "chain_aborted": False,
+        "detected_intent": "",
+        "collected_fields": {},
+    }
+    if not pending and last_read_done:
+        step, rec, skill = last_read_done
+        if skill.get("follow_up_eligible", False):
+            updates["last_turn_context"] = build_last_turn_context(
+                skill_name=step.get("skill", ""),
+                collected_fields=rec.get("slots") or {},
+                turn_id=len(state.get("messages", [])),
+                follow_up_slots=skill.get("follow_up_slots", []),
+            )
+    return updates
+
+
+def _mark_current_step_failed(state: AgentState, message: str, classification: Optional[str] = None) -> dict:
+    """Record the current chain step as failed and reset per-step fields."""
+    plan = state.get("chain_plan") or []
+    idx = state.get("chain_step_index") or 0
+    collected = state.get("collected_fields") or {}
+    step = plan[idx] if 0 <= idx < len(plan) else {"skill": state.get("detected_intent", "")}
+    skill = _get_skill_for_intent(step.get("skill", "")) or {}
+    # A skill's own not-found text is a complete, user-facing result: show it as is.
+    verbatim = None
+    if classification == "not_found" and skill.get("not_found_message"):
+        verbatim = _safe_template(skill["not_found_message"], collected)
+
+    status = _get_step_status(state)
+    status[str(idx)] = {
+        "status": "failed",
+        "message": verbatim or message or "The step failed.",
+        "verbatim": bool(verbatim),
+        "label": _step_label(step, collected),
+        "reported": False,
+    }
+    log_audit_event(
+        "chain_step", step.get("skill", "unknown"), state.get("chain_id") or "unknown", "failed",
+        user_id=state.get("user_sub") or "unknown",
+        failure_classification=classification,
+        details=f"index={idx}, message={message}",
+    )
+    updates = _step_scoped_reset()
+    updates.update({"chain_step_status": status, "is_workflow_complete": False})
+    return updates
+
+
+# =========================================================================
+# Pending Action Gate (entry node)
+# =========================================================================
+
+# Exact, normalized replies only. "cancel purchase order X" is a new request, not a "no".
+_AFFIRMATIVE_REPLIES = frozenset({
+    "yes", "y", "yep", "yeah", "yes please", "sure", "ok", "okay", "confirm", "confirmed",
+    "proceed", "go ahead", "do it", "yes proceed", "yes go ahead", "yes do it", "yes confirm",
+})
+_NEGATIVE_REPLIES = frozenset({
+    "no", "n", "nope", "no thanks", "no thank you", "cancel", "cancel it", "don't", "dont",
+    "do not", "stop", "abort", "no cancel", "no don't", "no dont",
+})
+
+_CHAIN_CLEARED = {
+    "chain_plan": None,
+    "chain_step_index": None,
+    "chain_results": None,
+    "chain_aborted": None,
+    "chain_id": None,
+    "chain_step_status": None,
+    "chain_started_at": None,
+}
+
+
+def _classify_confirmation_reply(text: str) -> str:
+    """Deterministic yes/no detection. Returns 'yes', 'no' or 'other'."""
+    norm = " ".join(re.sub(r"[^\w\s']", " ", (text or "").lower()).split())
+    if norm in _AFFIRMATIVE_REPLIES:
+        return "yes"
+    if norm in _NEGATIVE_REPLIES:
+        return "no"
+    return "other"
+
+
+def _discard_pending(base: dict, note: str, reply_kind: str) -> dict:
+    """
+    Drop the pending action and any chain unexecuted. A bare yes/no reply gets the
+    note as the answer; any other message is then handled as a new request.
+    """
+    upd = dict(base)
+    upd.update(_CHAIN_CLEARED)
+    upd.update({
+        "pending_confirmation": None,
+        "detected_intent": "",
+        "collected_fields": {},
+        "resolved_entities": {},
+        "is_workflow_complete": True,
+    })
+    if reply_kind in ("yes", "no"):
+        upd.update({"gate_route": "format_response", "final_response": note})
+    else:
+        upd.update({"gate_route": "resolve_followup", "turn_notes": [note], "final_response": ""})
+    return upd
+
+
+def pending_action_gate_node(state: AgentState):
+    """
+    Entry node. Runs before the follow-up router, classifier and planner on every turn.
+
+    With a pending confirmation, the reply is interpreted in pure Python:
+      - only the requesting user (JWT sub) may answer it;
+      - expired or malformed pending records are discarded, never executed;
+      - "yes": restore the stored action and route to write_rbac_gate, so RBAC and
+        preconditions re-run with the current user's roles before execution; a chain
+        then resumes from its stored per-step slots;
+      - "no": cancel, keep completed results, skip dependent steps;
+      - anything else: re-ask once; on a second non-answer, cancel without executing
+        and handle the message as a new request.
+    """
+    pending = state.get("pending_confirmation")
+    messages = state.get("messages", [])
+    reply = messages[-1].content if messages else ""
+    base = {"turn_notes": [], "chain_resumed": False, "confirmed_action": None, "confirmation_result": None}
+
+    if not pending:
+        upd = dict(base)
+        if state.get("chain_plan"):
+            # Chains are only persisted while an action awaits confirmation.
+            logger.warning("[Gate] Persisted chain without a pending confirmation; clearing stale chain state.")
+            upd.update(_CHAIN_CLEARED)
+        awaiting_other_answer = (
+            state.get("clarification_target")
+            or state.get("ambiguous_candidates")
+            or state.get("pending_slot_clarification")
+        )
+        if not awaiting_other_answer and _classify_confirmation_reply(reply) != "other":
+            # A bare yes/no with nothing to answer: say so instead of guessing what it means.
+            upd.update({
+                "gate_route": "format_response",
+                "final_response": "There is no action waiting for confirmation right now, so nothing was done. What would you like to do?",
+                "is_workflow_complete": True,
+            })
+            return upd
+        upd["gate_route"] = "resolve_followup"
+        return upd
+
+    reply_kind = _classify_confirmation_reply(reply)
+    op = pending.get("operation", "")
+    doctype = pending.get("doctype", "")
+    target = str(pending.get("target_name"))
+    user_sub = state.get("user_sub")
+
+    # Malformed record (e.g. written by an earlier version): never execute it.
+    missing = [k for k in ("skill", "operation", "requested_by", "params", "requested_at_ts") if k not in pending]
+    if missing:
+        logger.error(f"[Gate] Pending confirmation is missing {missing}; discarding without executing.")
+        log_audit_event(op or "unknown", doctype or "unknown", target, "discarded",
+                        user_id=user_sub or "unknown", failure_classification="invalid_pending_record",
+                        details=f"missing={missing}")
+        return _discard_pending(
+            base,
+            "A pending confirmation from an earlier session could not be resumed and was discarded. Nothing was executed.",
+            reply_kind,
+        )
+
+    # Only the requester may confirm or cancel.
+    if not user_sub or pending.get("requested_by") != user_sub:
+        logger.warning(f"[Gate] {user_sub!r} tried to answer a confirmation requested by {pending.get('requested_by')!r}.")
+        log_audit_event(op, doctype, target, "denied", user_id=user_sub or "unknown",
+                        failure_classification="confirmation_owner_mismatch",
+                        details=f"requested_by={pending.get('requested_by')}")
+        return {
+            **base,
+            "gate_route": "format_response",
+            "final_response": (
+                "This conversation has an action awaiting confirmation from the user who requested it. "
+                "Only that user can confirm or cancel it."
+            ),
+            "is_workflow_complete": False,
+        }
+
+    # Expiry.
+    try:
+        requested_at = datetime.fromisoformat(pending["requested_at_ts"])
+        if requested_at.tzinfo is None:
+            requested_at = requested_at.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - requested_at).total_seconds() / 60
+    except (TypeError, ValueError) as exc:
+        logger.error(f"[Gate] Unparseable pending timestamp {pending.get('requested_at_ts')!r}: {exc}; treating as expired.")
+        age_minutes = None
+    if age_minutes is None or age_minutes > PENDING_CONFIRMATION_MAX_MINUTES:
+        log_audit_event(op, doctype, target, "expired", user_id=user_sub)
+        return _discard_pending(
+            base,
+            f"Your pending request expired after {PENDING_CONFIRMATION_MAX_MINUTES} minutes and was not executed. "
+            f"{_not_executed_message(pending)}",
+            reply_kind,
+        )
+
+    in_chain = pending.get("step_index") is not None
+    if in_chain and not state.get("chain_plan"):
+        logger.error("[Gate] Pending chain step has no persisted chain; discarding without executing.")
+        return _discard_pending(
+            base,
+            f"The request this confirmation belonged to could not be restored, so nothing was executed. "
+            f"{_not_executed_message(pending)}",
+            reply_kind,
+        )
+
+    if reply_kind == "yes":
+        log_audit_event(op, doctype, target, "confirmed", user_id=user_sub)
+        upd = dict(base)
+        upd.update(_step_scoped_reset())
+        upd.update({
+            "gate_route": "write_rbac_gate",
+            "detected_intent": pending["skill"],
+            "collected_fields": copy.deepcopy(pending.get("params") or {}),
+            "resolved_entities": copy.deepcopy(pending.get("resolved_entities") or {}),
+            "pending_confirmation": None,
+            "confirmation_result": "confirmed",
+            "confirmed_action": pending,
+            "chain_resumed": in_chain,
+            "is_workflow_complete": False,
+        })
+        if in_chain:
+            upd["chain_step_index"] = pending["step_index"]
+        if pending.get("is_bulk"):
+            upd["bulk_operation_scope"] = {
+                "doctype": doctype,
+                "filters": pending.get("filters"),
+                "affected_count": pending.get("affected_count"),
+                "confirmed": True,
+            }
+        return upd
+
+    if reply_kind == "no":
+        log_audit_event(op, doctype, target, "rejected", user_id=user_sub)
+        outcome = _not_executed_message(pending)
+        if in_chain:
+            plan = state.get("chain_plan") or []
+            idx = pending["step_index"]
+            status = _get_step_status(state)
+            status[str(idx)] = {
+                "status": "cancelled",
+                "message": outcome,
+                "label": _step_label(plan[idx], pending.get("params")) if idx < len(plan) else pending.get("skill", ""),
+                "reported": False,
+            }
+            upd = dict(base)
+            upd.update(_step_scoped_reset())
+            upd.update({
+                "gate_route": "prepare_chain_step",
+                "pending_confirmation": None,
+                "chain_step_status": status,
+                "chain_resumed": True,
+                "is_workflow_complete": False,
+            })
+            return upd
+        return {
+            **base,
+            "gate_route": "format_response",
+            "pending_confirmation": None,
+            "final_response": f"Cancelled. {outcome}",
+            "detected_intent": "",
+            "collected_fields": {},
+            "resolved_entities": {},
+            "is_workflow_complete": True,
+        }
+
+    # Neither yes nor no.
+    if (pending.get("reask_count") or 0) < 1:
+        reasked = dict(pending)
+        reasked["reask_count"] = 1
+        return {
+            **base,
+            "gate_route": "format_response",
+            "pending_confirmation": reasked,
+            "final_response": (
+                "I need a Yes or No before doing anything else.\n\n"
+                f"{pending.get('scope_description', '')}\n\n"
+                "Reply **Yes** to confirm, or **No** to cancel. If you send a different request again, "
+                "I will cancel this pending action without executing it and handle your new request."
+            ),
+            "is_workflow_complete": False,
+        }
+
+    log_audit_event(op, doctype, target, "rejected", user_id=user_sub, details="auto-cancelled after a second non-yes/no reply")
+    note = f"Cancelled the pending action without executing it: {_not_executed_message(pending)}"
+    if in_chain:
+        plan = state.get("chain_plan") or []
+        status = state.get("chain_step_status") or {}
+        unrun = [_step_label(plan[i]) for i in range(len(plan)) if str(i) not in status and i != pending["step_index"]]
+        if unrun:
+            note += " These queued steps were not run: " + "; ".join(unrun) + "."
+    return _discard_pending(base, note, "other")
 
 
 # =========================================================================
 # Compound Chaining Nodes (Phase 2)
 # =========================================================================
 
+def _planner_skill_line(skill: Dict[str, Any]) -> str:
+    kind = "write" if _is_write_intent(skill) else "read"
+    req = ", ".join(skill.get("required_fields", [])) or "none"
+    opt = ", ".join(skill.get("optional_fields", [])) or "none"
+    return f"- {skill['name']} ({kind}; required: {req}; optional: {opt}): {skill.get('description', '')}"
+
+
 def plan_compound_chain_node(state: AgentState):
     """Step 2.5: Plan complex compound requests."""
     messages = state.get("messages", [])
     if not messages:
         return {}
-        
+
     last_msg = messages[-1].content
-    skills_list = "\n".join([f"- {s['name']}: {s.get('description', '')}" for s in loaded_skills])
-    
+    skills_list = "\n".join(_planner_skill_line(s) for s in loaded_skills)
+
     prompt = f"""You are a compound request planner for an ERPNext AI assistant.
 The user has asked for a complex or multi-step request. Decompose it into an ordered list of steps.
 MAX_CHAIN_STEPS = {MAX_CHAIN_STEPS}.
-Available skills:
+Available skills (with their exact field names):
 {skills_list}
 
 For each step, provide:
 - "skill": the skill name
-- "slots": dictionary of parameters directly mentioned by the user (do NOT guess supplier or qty if not provided).
-- "uses": dictionary mapping a slot name to a previous step's output, e.g., {{"item_code": "$step0.item_code"}}
+- "slots": dictionary of parameters directly mentioned by the user, using the exact field names listed for that skill (do NOT guess supplier or qty if not provided). For a skill that requires "items", give a list of {{"item_code": ..., "qty": ..., "rate": ... (optional)}}.
+- "uses": dictionary mapping a slot name to a previous step's output, e.g., {{"name": "$step0.name"}}. Use this whenever a step needs a value produced by an earlier step. Never put $step references inside "slots".
 - "condition": optional dictionary if the step is conditional. e.g., {{"field": "$step0.actual_qty", "operator": "<="}} (Only specify "value" if the user explicitly provided a number in their message. Otherwise omit "value" and the system default will be used.)
+
+Only include steps the user asked for. Never add a submit, cancel or delete step unless the user explicitly asked for it.
 
 User request: "{last_msg}"
 
 Respond strictly with a JSON object: {{"steps": [{{ "skill": "...", "slots": {{}}, "uses": {{}}, "condition": null }}]}}
 """
     res = invoke_structured_llm(prompt)
-    
+
     def _abort(reason):
-        try:
-            from audit_logger import log_audit_event
-        except ImportError:
-            from agent.audit_logger import log_audit_event
-        log_audit_event("plan_compound_chain", "unknown", "unknown", "failed", details=reason)
+        log_audit_event("plan_compound_chain", "unknown", "unknown", "failed",
+                        user_id=state.get("user_sub") or "unknown", details=reason)
+        logger.warning(f"[Planner] Plan rejected: {reason}")
         return {
-            "chain_aborted": True, 
+            "chain_aborted": True,
             "final_response": "I couldn't plan the steps for this complex request.",
             "is_workflow_complete": True,
-            "messages": [AIMessage(content="I couldn't plan the steps for this complex request.")],
             "pending_followup_steps": [],
         }
 
-    if not res or "steps" not in res:
+    if not res or "steps" not in res or not isinstance(res.get("steps"), list):
         return _abort("Invalid plan generated")
-        
+
     steps = res["steps"]
     if len(steps) > MAX_CHAIN_STEPS:
         return _abort(f"Plan exceeded MAX_CHAIN_STEPS")
-        
+
     if len(steps) <= 1:
         # Fall back to single-step path (leave pending_followup_steps unchanged so they run sequentially)
         return {}
-        
+
     # Validate plan
     skill_map = {s["name"]: s for s in loaded_skills}
-    write_count = 0
     for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return _abort(f"Step {i} is not an object")
         skill = step.get("skill")
         if skill not in skill_map:
             return _abort(f"Unknown skill: {skill}")
-        if not isinstance(step.get("slots", {}), dict) or not isinstance(step.get("uses", {}), dict):
+        if step.get("slots") is None:
+            step["slots"] = {}
+        if step.get("uses") is None:
+            step["uses"] = {}
+        if not isinstance(step["slots"], dict) or not isinstance(step["uses"], dict):
             return _abort(f"Slots or uses not a dict in step {i}")
-            
-        tool_name = skill_map[skill].get("tool", "")
-        is_write = tool_name in _WRITE_TOOLS
-        if is_write:
-            write_count += 1
-            if write_count > 1:
-                return _abort("Max ONE write step allowed")
-            
+
+        # A $step reference placed in slots is a dependency, not a literal value.
+        for k in [k for k, v in step["slots"].items() if isinstance(v, str) and _STEP_REF_RE.match(v)]:
+            step["uses"][k] = step["slots"].pop(k)
+
         cond = step.get("condition")
         if cond:
             if not isinstance(cond, dict) or cond.get("operator") not in {"<", "<=", ">", ">=", "=="}:
                 return _abort(f"Invalid condition operator in step {i}")
-                
-        for k, v in step.get("uses", {}).items():
-            if not isinstance(v, str) or not v.startswith("$step"):
+
+        for k, v in step["uses"].items():
+            m = _STEP_REF_RE.match(v) if isinstance(v, str) else None
+            if not m:
                 return _abort(f"Invalid uses format in step {i}: {v}")
-            try:
-                ref_idx = int(v.replace("$step", "").split(".")[0])
-                if ref_idx >= i:
-                    return _abort(f"Forward reference in step {i}: {v}")
-            except:
-                return _abort(f"Invalid uses reference in step {i}: {v}")
-                
+            if int(m.group(1)) >= i:
+                return _abort(f"Forward reference in step {i}: {v}")
+
+    for i, step in enumerate(steps):
+        step["depends_on"] = _compute_depends_on(steps, i)
+
     # Start chain execution; clear is_compound now that the planner has consumed it.
-    import uuid
     return {
         "chain_plan": steps,
         "chain_step_index": 0,
         "chain_results": {},
+        "chain_step_status": {},
         "chain_aborted": False,
         "chain_id": str(uuid.uuid4()),
+        "chain_started_at": datetime.now(timezone.utc).isoformat(),
+        "chain_resumed": False,
         "pending_followup_steps": [],
         "is_compound": False,  # Consumed; reset so it doesn't leak into later turns.
     }
 
 
-def prepare_chain_step_node(state: AgentState):
-    """Prepares the state for the next chain step."""
-    plan = state.get("chain_plan", [])
-    idx = state.get("chain_step_index", 0)
-    results = state.get("chain_results", {})
-    chain_id = state.get("chain_id", "unknown")
-    user_id = state.get("user_id", "system")
-    
-    if idx >= len(plan):
-        return {"is_workflow_complete": True}
-        
+def _prepare_single_step(state: AgentState, plan: list, idx: int, results: dict) -> dict:
+    """
+    Evaluate a step's condition and resolve its 'uses'. Returns either
+    {"ready": True, "skill": str, "slots": dict} or
+    {"ready": False, "status": "skipped" | "failed", "message": str}.
+    """
     step = plan[idx]
     skill_name = step.get("skill", "")
-    slots = dict(step.get("slots") or {})
+    slots = copy.deepcopy(step.get("slots") or {})
     uses = step.get("uses") or {}
     condition = step.get("condition")
-    
-    def _abort(msg):
-        try:
-            from audit_logger import log_audit_event
-        except ImportError:
-            from agent.audit_logger import log_audit_event
-        log_audit_event("chain_step", skill_name, chain_id, "failed", user_id=user_id, details=f"index={idx}, condition_result=N/A, outcome=aborted, error={msg}")
-        return {
-            "chain_aborted": True,
-            "is_workflow_complete": True,
-            "final_response": f"Chain aborted: {msg}",
-            "messages": [AIMessage(content=f"Chain aborted: {msg}")]
-        }
-    
+    chain_id = state.get("chain_id", "unknown")
+    user_id = state.get("user_sub") or state.get("user_id") or "system"
+
+    def _fail(msg):
+        log_audit_event("chain_step", skill_name, chain_id, "failed", user_id=user_id,
+                        details=f"index={idx}, condition_result=N/A, outcome=failed, error={msg}")
+        return {"ready": False, "status": "failed", "message": msg}
+
     # Evaluate condition
     if condition and isinstance(condition, dict):
         field_ref = condition.get("field", "")
-        if field_ref.startswith("$step"):
-            try:
-                parts = field_ref.replace("$step", "").split(".")
-                ref_idx = parts[0]
-                ref_key = parts[1]
-                if str(ref_idx) not in results:
-                    return _abort(f"Unresolved condition reference: step {ref_idx} not found")
-                
-                step_res = results.get(str(ref_idx), {})
-                actual_val = step_res.get(ref_key)
-                
-                # special case for stock check
-                if ref_key == "actual_qty":
-                    if "list_data" in step_res:
-                        actual_val = sum([float(b.get("actual_qty", 0)) for b in step_res["list_data"]])
-                    elif "actual_qty" in step_res:
-                        actual_val = step_res["actual_qty"]
-                        
-                if actual_val is None:
-                    return _abort(f"Unresolved condition reference: field '{ref_key}' not found in step {ref_idx}")
+        m = _STEP_REF_RE.match(str(field_ref))
+        if m:
+            ref_idx, ref_key = m.group(1), m.group(2)
+            if str(ref_idx) not in results:
+                return _fail(f"Unresolved condition reference: step {ref_idx} not found")
 
-                op = condition.get("operator")
-                val = condition.get("value")
-                if val is not None:
-                    # Enforce that user-stated threshold appears in user's message
-                    messages = state.get("messages", [])
-                    user_msgs = " ".join([m.content for m in messages if getattr(m, "type", "") == "human" or m.__class__.__name__ == "HumanMessage"])
-                    if str(val) not in user_msgs:
-                        val = CHAIN_LOW_STOCK_THRESHOLD
-                else:
+            step_res = results.get(str(ref_idx), {})
+            actual_val = step_res.get(ref_key)
+
+            # special case for stock check
+            if ref_key == "actual_qty" and "list_data" in step_res:
+                try:
+                    actual_val = sum(float(b.get("actual_qty", 0)) for b in step_res["list_data"])
+                except (TypeError, ValueError) as exc:
+                    return _fail(f"Condition evaluation failed: non-numeric actual_qty ({exc})")
+
+            if actual_val is None:
+                return _fail(f"Unresolved condition reference: field '{ref_key}' not found in step {ref_idx}")
+
+            op = condition.get("operator")
+            val = condition.get("value")
+            if val is not None:
+                # Enforce that user-stated threshold appears in user's message
+                messages = state.get("messages", [])
+                user_msgs = " ".join([m.content for m in messages if getattr(m, "type", "") == "human" or m.__class__.__name__ == "HumanMessage"])
+                if str(val) not in user_msgs:
                     val = CHAIN_LOW_STOCK_THRESHOLD
-                
-                passed = False
+            else:
+                val = CHAIN_LOW_STOCK_THRESHOLD
+
+            try:
                 if op == "<=":
                     passed = float(actual_val) <= float(val)
                 elif op == "<":
@@ -3094,90 +3691,129 @@ def prepare_chain_step_node(state: AgentState):
                     passed = float(actual_val) >= float(val)
                 elif op == ">":
                     passed = float(actual_val) > float(val)
-                elif op == "==":
-                    passed = str(actual_val) == str(val)
-                    
-                if not passed:
-                    # Construct findings string
-                    findings = []
-                    for i_str, res in results.items():
-                        if isinstance(res, dict):
-                            res_info = ", ".join([f"{k}: {v}" for k, v in res.items() if k not in ("list_data", "success", "error") and v is not None])
-                            if res_info:
-                                findings.append(f"Step {i_str} findings: {res_info}")
-                    
-                    prefix = "\n".join(findings) + "\n\n" if findings else ""
-                    final_msg = f"{prefix}Condition not met (actual qty is {actual_val}). No PO needed."
-                    try:
-                        from audit_logger import log_audit_event
-                    except ImportError:
-                        from agent.audit_logger import log_audit_event
-                    log_audit_event("chain_step", skill_name, chain_id, "rejected", user_id=user_id, details=f"index={idx}, condition_result=false, outcome=rejected, condition={actual_val} {op} {val}")
-                    return {
-                        "chain_aborted": False,
-                        "is_workflow_complete": True,
-                        "final_response": final_msg,
-                        "messages": [AIMessage(content=final_msg)]
-                    }
                 else:
-                    try:
-                        from audit_logger import log_audit_event
-                    except ImportError:
-                        from agent.audit_logger import log_audit_event
-                    log_audit_event("chain_step", skill_name, chain_id, "passed", user_id=user_id, details=f"index={idx}, condition_result=true, outcome=passed, condition={actual_val} {op} {val}")
-            except Exception as e:
-                return _abort(f"Condition evaluation failed: {e}")
+                    passed = str(actual_val) == str(val)
+            except (TypeError, ValueError) as exc:
+                return _fail(f"Condition evaluation failed: {exc}")
+
+            if not passed:
+                log_audit_event("chain_step", skill_name, chain_id, "rejected", user_id=user_id,
+                                details=f"index={idx}, condition_result=false, outcome=rejected, condition={actual_val} {op} {val}")
+                return {
+                    "ready": False,
+                    "status": "skipped",
+                    "message": f"Condition not met ({ref_key.replace('_', ' ')} is {actual_val}, needed {op} {val}), so this step was not run.",
+                }
+            log_audit_event("chain_step", skill_name, chain_id, "passed", user_id=user_id,
+                            details=f"index={idx}, condition_result=true, outcome=passed, condition={actual_val} {op} {val}")
     else:
-        try:
-            from audit_logger import log_audit_event
-        except ImportError:
-            from agent.audit_logger import log_audit_event
-        log_audit_event("chain_step", skill_name, chain_id, "passed", user_id=user_id, details=f"index={idx}, condition_result=unconditional, outcome=passed")
-                
+        log_audit_event("chain_step", skill_name, chain_id, "passed", user_id=user_id,
+                        details=f"index={idx}, condition_result=unconditional, outcome=passed")
+
     # Resolve uses
     for k, v in uses.items():
-        if isinstance(v, str) and v.startswith("$step"):
-            try:
-                parts = v.replace("$step", "").split(".")
-                ref_idx = parts[0]
-                ref_key = parts[1]
-                if str(ref_idx) not in results:
-                    return _abort(f"Unresolved reference: step {ref_idx} not found for slot '{k}'")
-                
-                step_res = results.get(str(ref_idx), {})
-                val = step_res.get(ref_key)
-                
-                if val is None and "list_data" in step_res:
-                    ref_skill_name = plan[int(ref_idx)].get("skill")
-                    skill_map = {s["name"]: s for s in loaded_skills}
-                    ref_skill_def = skill_map.get(ref_skill_name, {})
-                    chain_exports = ref_skill_def.get("chain_exports", {})
-                    if ref_key in chain_exports:
-                        actual_field = chain_exports[ref_key]
-                        list_data = step_res["list_data"]
-                        if list_data and isinstance(list_data[0], dict):
-                            val = list_data[0].get(actual_field)
-                            
-                if val is None:
-                    return _abort(f"Unresolved reference: field '{ref_key}' not found in step {ref_idx} for slot '{k}'")
-                slots[k] = val
-            except Exception as e:
-                return _abort(f"Invalid reference format for slot '{k}': {v}")
+        m = _STEP_REF_RE.match(str(v))
+        if not m:
+            return _fail(f"Invalid reference format for slot '{k}': {v}")
+        ref_idx, ref_key = m.group(1), m.group(2)
+        if str(ref_idx) not in results:
+            return _fail(f"Unresolved reference: step {ref_idx} not found for slot '{k}'")
 
-    return {
-        "detected_intent": skill_name,
-        "collected_fields": slots,
-        "is_workflow_complete": False,
-        "clarification_attempts": 0,
-        "missing_parameters": [],
-        "all_required_filled": False,
-        "retry_count": 0,
-    }
+        step_res = results.get(str(ref_idx), {})
+        val = step_res.get(ref_key)
+
+        if val is None and "list_data" in step_res:
+            ref_skill_def = _get_skill_for_intent(plan[int(ref_idx)].get("skill", "")) or {}
+            chain_exports = ref_skill_def.get("chain_exports", {})
+            if ref_key in chain_exports:
+                list_data = step_res["list_data"]
+                if list_data and isinstance(list_data[0], dict):
+                    val = list_data[0].get(chain_exports[ref_key])
+
+        if val is None:
+            return _fail(f"Unresolved reference: field '{ref_key}' not found in step {ref_idx} for slot '{k}'")
+        slots[k] = val
+
+    skill = _get_skill_for_intent(skill_name)
+    if skill:
+        required = skill.get("required_fields", [])
+        # "Submit it, then show its status": a missing record name is taken from the
+        # earlier step this one depends on, when both act on the same doctype.
+        for id_field in ("name", "id"):
+            if id_field in required and not slots.get(id_field):
+                for d in sorted(_deps_for(plan, idx), reverse=True):
+                    dep_skill = _get_skill_for_intent(plan[d].get("skill", "")) or {}
+                    dep_out = results.get(str(d)) or {}
+                    if dep_skill.get("doctype") == skill.get("doctype") and dep_out.get("name"):
+                        slots[id_field] = dep_out["name"]
+                        break
+        # Child rows given as flat slots (item_code/qty) by the planner.
+        if "items" in required and not slots.get("items") and slots.get("item_code"):
+            row = {"item_code": slots["item_code"]}
+            qty = slots.get("qty", slots.get("quantity"))
+            if qty is not None:
+                row["qty"] = qty
+            for extra in ("rate", "uom"):
+                if slots.get(extra) is not None:
+                    row[extra] = slots[extra]
+            slots["items"] = [row]
+
+    return {"ready": True, "skill": skill_name, "slots": slots}
+
+
+def prepare_chain_step_node(state: AgentState):
+    """
+    Pick the next runnable chain step (all dependencies done) and load its isolated
+    slots. Steps whose dependencies failed or were cancelled are skipped. When nothing
+    else can run this turn, compose the turn's response (results in order, then the
+    confirmation prompt if an action awaits confirmation).
+    """
+    plan = state.get("chain_plan") or []
+    results = state.get("chain_results") or {}
+    status = _get_step_status(state)
+
+    while True:
+        idx = _select_next_step(plan, status)
+        if idx is None:
+            return _compose_chain_turn(state, plan, status)
+
+        prepared = _prepare_single_step(state, plan, idx, results)
+        if not prepared["ready"]:
+            status[str(idx)] = {
+                "status": prepared["status"],
+                "message": prepared["message"],
+                "label": _step_label(plan[idx]),
+                "reported": False,
+            }
+            continue
+
+        updates = _step_scoped_reset()
+        updates.update({
+            "detected_intent": prepared["skill"],
+            "collected_fields": prepared["slots"],
+            "chain_step_index": idx,
+            "chain_step_status": status,
+            "is_workflow_complete": False,
+        })
+        return updates
+
+
+def fail_chain_step_node(state: AgentState):
+    """A chain step stopped before execution (missing details, not found, ambiguity, lookup error)."""
+    message = state.get("final_response") or ""
+    missing = state.get("missing_parameters") or []
+    if not message and missing:
+        message = f"Missing required details: {', '.join(missing)}. Please ask again and include them."
+    return _mark_current_step_failed(state, message, state.get("failure_classification"))
 
 
 # =========================================================================
 # Router Functions
 # =========================================================================
+
+def route_after_gate(state: AgentState) -> str:
+    return state.get("gate_route") or "resolve_followup"
+
 
 def route_after_collect(state: AgentState) -> str:
     if state.get("failure_classification") == "llm_unavailable":
@@ -3204,6 +3840,8 @@ def route_after_classify(state: AgentState) -> str:
     if state.get("is_compound") or state.get("pending_followup_steps"):
         return "plan_compound_chain"
     return "collect_parameters"
+
+
 def route_after_plan(state: AgentState) -> str:
     """After plan_compound_chain_node: if aborted/completed return format_response, else prepare step."""
     if state.get("is_workflow_complete"):
@@ -3212,48 +3850,50 @@ def route_after_plan(state: AgentState) -> str:
         return "prepare_chain_step"
     return "collect_parameters"
 
+
 def route_after_prepare(state: AgentState) -> str:
-    if state.get("is_workflow_complete"):
+    """A prepared step continues the pipeline; a composed turn (no step loaded) ends it."""
+    if state.get("is_workflow_complete") or not state.get("detected_intent"):
         return "format_response"
     return "collect_parameters"
 
 
-
 def route_after_validation(state: AgentState) -> str:
-    """After validate_parameters: go to entity_resolution or ask for missing info."""
+    """After validate_parameters: go to entity_resolution, or ask (single request) / fail the step (chain)."""
     if state.get("all_required_filled"):
         return "entity_resolution_and_read_rbac"
-    else:
-        return "ask_for_missing_info"
+    if state.get("chain_plan"):
+        # Chain steps never pause to ask: other steps keep running and the gap is reported.
+        return "fail_chain_step"
+    return "ask_for_missing_info"
 
 
 def route_after_read_rbac(state: AgentState) -> str:
     """
     After entity_resolution_and_read_rbac (Step 3):
     - Read denied → retry_and_escalation
-    - Direct final response set (e.g. item not found friendly message) → format_response
+    - Direct final response set (e.g. item not found, lookup error) → format_response, or fail_chain_step in a chain
     - Everything else → disambiguation (Step 4 handles both the ambiguous and unambiguous cases)
     """
     if not state.get("read_rbac_passed", True):
         return "retry_and_escalation"
     if state.get("final_response") and state.get("is_workflow_complete"):
-        return "format_response"
+        return "fail_chain_step" if state.get("chain_plan") else "format_response"
     return "disambiguation"
 
 
 def route_after_disambiguation(state: AgentState) -> str:
     """
     After disambiguation_node (Step 4):
-    - HIGH-RISK pause OR failed candidate match OR final response set → format_response (pause or complete)
+    - HIGH-RISK pause OR failed candidate match OR final response set → format_response
+      (fail_chain_step in a chain: a chain step does not pause for a pick)
     - Resolved (either auto or user-selected) → check write intent:
         - Write intent  → write_rbac_gate (Step 5)
         - Read-only     → confirmation_node (skip Step 5)
     """
-    # If a final response or clarification question was generated, stop here.
     if state.get("final_response"):
-        return "format_response"
+        return "fail_chain_step" if state.get("chain_plan") else "format_response"
 
-    # Ambiguity is resolved (or was never present) — continue the pipeline.
     intent = state.get("detected_intent", "")
     skill = _get_skill_for_intent(intent)
     if skill and _is_write_intent(skill):
@@ -3285,16 +3925,20 @@ def route_after_preconditions(state: AgentState) -> str:
 def route_after_confirmation(state: AgentState) -> str:
     """
     After confirmation_node (Step 6):
-    - pending_confirmation is set and workflow is paused → format_response (wait for user reply)
-    - confirmation_result is 'rejected' → format_response (output cancellation message)
-    - confirmation_result is 'confirmed', or no confirmation was needed → call_generic_tool (Step 7)
+    - a failure was classified                      → retry_and_escalation
+    - confirmation requested for THIS chain step    → prepare_chain_step (keep running independent steps)
+    - confirmation requested for a single request   → format_response (wait for the reply)
+    - otherwise (no confirmation needed, or confirmed) → call_generic_tool (Step 7)
     """
-    if state.get("confirmation_result") == "rejected":
-        return "format_response"
-    
-    if state.get("pending_confirmation") and not state.get("is_workflow_complete"):
-        return "format_response"
-
+    if state.get("failure_classification"):
+        return "retry_and_escalation"
+    pending = state.get("pending_confirmation")
+    if pending:
+        if state.get("chain_plan") and pending.get("step_index") is not None:
+            if pending.get("step_index") == state.get("chain_step_index"):
+                return "prepare_chain_step"
+        else:
+            return "format_response"
     return "call_generic_tool"
 
 
@@ -3306,20 +3950,17 @@ def route_after_tool(state: AgentState) -> str:
 def route_after_result_validation(state: AgentState) -> str:
     """
     After result_validation_node:
-    - write failure -> retry_and_escalation
-    - loop-back needed (chain_plan or pending_followup_steps)
+    - failure -> retry_and_escalation
+    - chain in progress -> prepare_chain_step (it picks the next runnable step or composes the turn)
+    - legacy pending_followup_steps loop-back -> classify_intent
     - otherwise -> format_agent_message
     """
     if state.get("failure_classification"):
         return "retry_and_escalation"
-        
-    chain_plan = state.get("chain_plan")
-    if chain_plan and not state.get("chain_aborted"):
-        idx = state.get("chain_step_index", 0)
-        if idx < len(chain_plan):
-            return "prepare_chain_step"
-        return "format_agent_message"
-            
+
+    if state.get("chain_plan") and not state.get("chain_aborted"):
+        return "prepare_chain_step"
+
     if state.get("is_workflow_complete"):
         return "format_agent_message"
     if not state.get("detected_intent"): # cleared by loop-back logic
@@ -3328,7 +3969,11 @@ def route_after_result_validation(state: AgentState) -> str:
 
 
 def route_after_retry_and_escalation(state: AgentState) -> str:
-    """After retry_and_escalation_node: route to call_generic_tool (retry) or terminal formatters."""
+    """After retry_and_escalation_node: continue the chain, retry the tool, or finish."""
+    if state.get("chain_plan") and not state.get("chain_aborted"):
+        idx = state.get("chain_step_index") or 0
+        if (state.get("chain_step_status") or {}).get(str(idx), {}).get("status") == "failed":
+            return "prepare_chain_step"
     if not state.get("is_workflow_complete"):
         return "call_generic_tool"
     # Terminal failures
@@ -3344,17 +3989,19 @@ def route_after_retry_and_escalation(state: AgentState) -> str:
 workflow = StateGraph(AgentState)
 
 # --- Register nodes ---
+workflow.add_node("pending_action_gate",               pending_action_gate_node)        # Entry: pending yes/no (pure Python)
 workflow.add_node("resolve_followup",                  resolve_followup_node)           # Pre-classifier (Priority 1/2)
 workflow.add_node("classify_intent",                   classify_intent_node)
 workflow.add_node("plan_compound_chain",               plan_compound_chain_node)        # Compound step planner
-workflow.add_node("prepare_chain_step",                prepare_chain_step_node)         # Compound step preparer
+workflow.add_node("prepare_chain_step",                prepare_chain_step_node)         # Compound step selector / turn composer
+workflow.add_node("fail_chain_step",                   fail_chain_step_node)            # Chain step stopped before execution
 workflow.add_node("collect_parameters",                collect_parameters_node)
 workflow.add_node("validate_parameters",               validate_parameters_node)
 workflow.add_node("ask_for_missing_info",              ask_for_missing_info_node)
 workflow.add_node("entity_resolution_and_read_rbac",   entity_resolution_and_read_rbac_node)   # Step 3
 workflow.add_node("disambiguation",                    disambiguation_node)                     # Step 4
 workflow.add_node("write_rbac_gate",                   write_rbac_gate_node)                    # Step 5
-workflow.add_node("precondition_validation",           precondition_validation_node)            # Step 5.5 NEW
+workflow.add_node("precondition_validation",           precondition_validation_node)            # Step 5.5
 workflow.add_node("confirmation_node",               confirmation_node)                       # Step 6
 workflow.add_node("call_generic_tool",                 call_generic_tool_node)                  # Step 7
 workflow.add_node("result_validation",                 result_validation_node)                  # Step 8
@@ -3365,9 +4012,21 @@ workflow.add_node("fallback_response",                 fallback_response_node)
 workflow.add_node("format_response",                   format_response_node)                    # Step 9b
 
 # --- Entry point ---
-workflow.set_entry_point("resolve_followup")
+workflow.set_entry_point("pending_action_gate")
 
 # --- Edges ---
+
+# pending_action_gate → resolve_followup | write_rbac_gate (confirmed) | prepare_chain_step (chain cancel) | format_response
+workflow.add_conditional_edges(
+    "pending_action_gate",
+    route_after_gate,
+    {
+        "resolve_followup": "resolve_followup",
+        "write_rbac_gate": "write_rbac_gate",
+        "prepare_chain_step": "prepare_chain_step",
+        "format_response": "format_response",
+    }
+)
 
 # resolve_followup → classify_intent | collect_parameters | format_response
 workflow.add_conditional_edges(
@@ -3413,6 +4072,9 @@ workflow.add_conditional_edges(
     }
 )
 
+# fail_chain_step → prepare_chain_step (next runnable step, or compose the turn)
+workflow.add_edge("fail_chain_step", "prepare_chain_step")
+
 # collect_parameters → validate_parameters | format_response
 workflow.add_conditional_edges(
     "collect_parameters",
@@ -3423,17 +4085,18 @@ workflow.add_conditional_edges(
     }
 )
 
-# validate_parameters → ask_for_missing_info | entity_resolution_and_read_rbac (Step 3)
+# validate_parameters → ask_for_missing_info | fail_chain_step | entity_resolution_and_read_rbac (Step 3)
 workflow.add_conditional_edges(
     "validate_parameters",
     route_after_validation,
     {
         "ask_for_missing_info": "ask_for_missing_info",
+        "fail_chain_step": "fail_chain_step",
         "entity_resolution_and_read_rbac": "entity_resolution_and_read_rbac",
     }
 )
 
-# entity_resolution_and_read_rbac (Step 3) → retry_and_escalation | disambiguation (Step 4)
+# entity_resolution_and_read_rbac (Step 3) → retry_and_escalation | disambiguation (Step 4) | format_response | fail_chain_step
 workflow.add_conditional_edges(
     "entity_resolution_and_read_rbac",
     route_after_read_rbac,
@@ -3441,10 +4104,11 @@ workflow.add_conditional_edges(
         "retry_and_escalation": "retry_and_escalation",
         "disambiguation": "disambiguation",
         "format_response": "format_response",
+        "fail_chain_step": "fail_chain_step",
     }
 )
 
-# disambiguation (Step 4) → write_rbac_gate | confirmation_node | format_response
+# disambiguation (Step 4) → write_rbac_gate | confirmation_node | format_response | fail_chain_step
 workflow.add_conditional_edges(
     "disambiguation",
     route_after_disambiguation,
@@ -3452,6 +4116,7 @@ workflow.add_conditional_edges(
         "write_rbac_gate": "write_rbac_gate",
         "confirmation_node": "confirmation_node",
         "format_response": "format_response",
+        "fail_chain_step": "fail_chain_step",
     }
 )
 
@@ -3475,20 +4140,22 @@ workflow.add_conditional_edges(
     }
 )
 
-# confirmation_node (Step 6) → call_generic_tool (Step 7) | format_response
+# confirmation_node (Step 6) → call_generic_tool (Step 7) | prepare_chain_step | format_response | retry_and_escalation
 workflow.add_conditional_edges(
     "confirmation_node",
     route_after_confirmation,
     {
         "call_generic_tool": "call_generic_tool",
+        "prepare_chain_step": "prepare_chain_step",
         "format_response": "format_response",
+        "retry_and_escalation": "retry_and_escalation",
     }
 )
 
 # call_generic_tool (Step 7) → result_validation (Step 8)
 workflow.add_edge("call_generic_tool", "result_validation")
 
-# result_validation (Step 8) → format_agent_message (Step 9a) OR classify_intent (Loop-back) OR retry_and_escalation
+# result_validation (Step 8) → format_agent_message (Step 9a) OR classify_intent (Loop-back) OR retry_and_escalation OR prepare_chain_step
 workflow.add_conditional_edges(
     "result_validation",
     route_after_result_validation,
@@ -3500,12 +4167,13 @@ workflow.add_conditional_edges(
     }
 )
 
-# retry_and_escalation → call_generic_tool | rbac_denied_response | format_response
+# retry_and_escalation → call_generic_tool | prepare_chain_step | rbac_denied_response | format_response
 workflow.add_conditional_edges(
     "retry_and_escalation",
     route_after_retry_and_escalation,
     {
         "call_generic_tool": "call_generic_tool",
+        "prepare_chain_step": "prepare_chain_step",
         "rbac_denied_response": "rbac_denied_response",
         "format_response": "format_response",
     }

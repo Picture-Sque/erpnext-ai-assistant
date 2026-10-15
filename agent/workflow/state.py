@@ -108,7 +108,11 @@ class AgentState(TypedDict, total=False):
     # Step 6 Confirmation:
     # When a destructive/consequential operation (cancel/delete/submit, or any operation flagged as
     # requiring confirmation) is awaiting user approval, stores:
-    # {"operation": str, "doctype": str, "target_name": str, "scope_description": str, "requested_at": <timestamp/turn_id>}.
+    # {"operation": str, "doctype": str, "target_name": str, "scope_description": str, "requested_at": <turn_id>,
+    #  "requested_at_ts": iso str, "requested_by": str (JWT sub), "requested_roles": list,
+    #  "skill": str, "params": dict, "resolved_entities": dict, "step_index": int | None,
+    #  "chain_id": str | None, "reask_count": int, plus bulk keys when is_bulk}.
+    # Only one action is pending at a time; chained writes are serialized.
     # None when nothing is pending.
     pending_confirmation: Optional[dict]
 
@@ -242,12 +246,48 @@ class AgentState(TypedDict, total=False):
     # Unique ID for the current chain execution
     chain_id: Optional[str]
 
+    # ISO-8601 UTC timestamp of when the chain was planned.
+    chain_started_at: Optional[str]
+
+    # Per-step execution record, keyed by step index string.
+    # Schema: { "0": {"status": "done" | "failed" | "skipped" | "cancelled" | "awaiting_confirmation",
+    #                 "message": str, "reported": bool} }
+    # A step with no entry is still queued.
+    chain_step_status: Optional[dict]
+
+    # True on a turn that resumes a persisted chain after a yes/no reply.
+    # Resumed steps must use their stored slots and never re-extract from the reply.
+    chain_resumed: Optional[bool]
+
+    # -------------------------------------------------------------------------
+    # 11b. Pending Action Gate
+    # -------------------------------------------------------------------------
+
+    # Routing decision written by pending_action_gate_node (entry node).
+    gate_route: Optional[str]
+
+    # The pending_confirmation record the user just approved. confirmation_node lets
+    # exactly this action through to execution, after RBAC and preconditions re-run.
+    confirmed_action: Optional[dict]
+
+    # Notes generated earlier in the turn (e.g. an expired or auto-cancelled pending
+    # action) that format_response prepends to the final response.
+    turn_notes: Optional[list]
+
+    # Routing decision written by resolve_followup_node. Must be declared here or
+    # LangGraph drops it before route_after_followup_router reads it.
+    _followup_route: Optional[str]
+
     # -------------------------------------------------------------------------
     # 12. User Identity
     # -------------------------------------------------------------------------
     
     # Real user id for auditing
     user_id: Optional[str]
+
+    # Authenticated principal (JWT 'sub'). Used to scope pending confirmations so
+    # only the user who requested an action can confirm or cancel it.
+    user_sub: Optional[str]
 
     # -------------------------------------------------------------------------
     # 13. Compound Request Flag

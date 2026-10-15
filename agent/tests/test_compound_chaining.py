@@ -64,11 +64,12 @@ def test_non_low_stock():
     assert res["chain_aborted"] is False
     assert res["is_workflow_complete"] is True
     assert "condition not met" in res["final_response"].lower()
-    assert "no po needed" in res["final_response"].lower()
+    assert "was not run" in res["final_response"].lower()
 
 def test_mid_chain_failure():
-    # Mid-chain failure (e.g. not_found).
-
+    # Mid-chain failure (e.g. not_found) fails only that step; the chain is not aborted
+    # and routing continues with the next runnable step.
+    from workflow.graph import route_after_retry_and_escalation
     state = AgentState(
         chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
         chain_step_index=1,
@@ -76,13 +77,16 @@ def test_mid_chain_failure():
         failure_classification="not_found"
     )
     res = retry_and_escalation_node(state)
-    assert res["chain_aborted"] is True
-    assert "completed with item_code: SKU-001" in res["final_response"]
+    assert res.get("chain_aborted") is not True
+    assert res["chain_step_status"]["1"]["status"] == "failed"
+    assert res["chain_step_status"]["0"]["status"] == "done"
+    assert route_after_retry_and_escalation({**state, **res}) == "prepare_chain_step"
 
 def test_confirmation_logic():
-    # If a destructive operation needs confirmation, it includes findings in final_response.
+    # A chained create whose parameters come from an earlier step ('uses') needs
+    # confirmation, and the prompt includes the earlier findings.
     state = AgentState(
-        chain_plan=[{"skill": "step1"}, {"skill": "create-purchase-order"}],
+        chain_plan=[{"skill": "step1"}, {"skill": "create-purchase-order", "uses": {"item_code": "$step0.item_code"}}],
         chain_step_index=1,
         chain_results={"0": {"item_code": "SKU-001", "actual_qty": 5}},
         write_rbac_operation="create",
@@ -92,6 +96,8 @@ def test_confirmation_logic():
     )
     res = confirmation_node(state)
     assert "pending_confirmation" in res
+    assert res["pending_confirmation"]["step_index"] == 1
+    assert res["chain_step_status"]["1"]["status"] == "awaiting_confirmation"
     assert "Step 0 findings" in res["final_response"]
     assert "SKU-001" in res["final_response"]
     assert "actual_qty: 5" in res["final_response"]
@@ -106,7 +112,7 @@ def test_invalid_planning():
         assert "couldn't plan" in res["final_response"].lower()
 
 def test_rbac_denial():
-    # Similar to mid chain failure, RBAC denial should abort chain and output findings
+    # RBAC denial fails that step with the denial reason; the chain is not aborted.
     state = AgentState(
         chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
         chain_step_index=1,
@@ -115,10 +121,10 @@ def test_rbac_denial():
         messages=[AIMessage(content="Permission Denied")]
     )
     res = retry_and_escalation_node(state)
-    assert res["is_workflow_complete"] is True
-    assert res["chain_aborted"] is True
-    assert "completed with item_code: SKU-001" in res["final_response"]
-    assert "Repeated permission denial" in res["final_response"]
+    assert res.get("chain_aborted") is not True
+    assert res["escalated"] is True
+    assert res["chain_step_status"]["1"]["status"] == "failed"
+    assert "Repeated permission denial" in res["chain_step_status"]["1"]["message"]
 
 def test_single_step_request():
     state = AgentState(
@@ -156,9 +162,10 @@ def test_unresolved_ref_aborts():
         chain_aborted=False
     )
     res = prepare_chain_step_node(state)
-    assert res["chain_aborted"] is True
+    # The step with the bad reference fails and is reported; nothing else is left to run.
+    assert res["chain_step_status"]["1"]["status"] == "failed"
     assert res["is_workflow_complete"] is True
-    assert "chain aborted: unresolved" in res["final_response"].lower()
+    assert "unresolved reference" in res["final_response"].lower()
 
 def test_low_threshold_constant():
     # val is omitted; should fallback to CHAIN_LOW_STOCK_THRESHOLD
@@ -184,10 +191,12 @@ def test_invalid_plans():
         res = plan_compound_chain_node(state)
         assert res["chain_aborted"] is True
         
-        # 2 writes
+        # 2 writes are allowed; they are serialized so each is handled (and, if
+        # consequential, confirmed) on its own.
         mock_planner.return_value = {"steps": [{"skill": "create-purchase-order", "slots": {}}, {"skill": "create-sales-order", "slots": {}}]}
         res = plan_compound_chain_node(state)
-        assert res["chain_aborted"] is True
+        assert res.get("chain_aborted") is False
+        assert res["chain_plan"][1]["depends_on"] == [0]
 
         # Forward ref
         mock_planner.return_value = {"steps": [{"skill": "check-inventory", "slots": {}, "uses": {"item_code": "$step1.item_code"}}, {"skill": "sales-analytics-report", "slots": {}}]}
@@ -199,7 +208,7 @@ def test_multi_turn_chain():
     # We just ensure confirmation_node includes findings even if turn > 1.
     state = AgentState(
         messages=[HumanMessage(content="create PO"), AIMessage(content="qty?"), HumanMessage(content="50")],
-        chain_plan=[{"skill": "step1"}, {"skill": "create-purchase-order"}],
+        chain_plan=[{"skill": "step1"}, {"skill": "create-purchase-order", "uses": {"item_code": "$step0.item_code"}}],
         chain_step_index=1,
         chain_results={"0": {"item_code": "SKU-001", "actual_qty": 5}},
         write_rbac_operation="create",

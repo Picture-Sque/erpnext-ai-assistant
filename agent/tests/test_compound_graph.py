@@ -219,6 +219,8 @@ def test_chain_stops_at_confirmation_when_stock_low():
     # confirmation_node needs a record identifier (name/id in collected_fields or resolved_entities)
     # and target_doctype. For a chain create, we supply these explicitly to simulate what the
     # full graph would have populated by this point.
+    # prepare_chain_step resets per-step fields; write RBAC and preconditions would
+    # re-run in the graph before Step 6, so set what they produce.
     confirm_state = {
         **state,
         **prep_res,
@@ -227,6 +229,8 @@ def test_chain_stops_at_confirmation_when_stock_low():
             "name": "NEW-PO-DRAFT",  # simulated draft identifier for the new PO
         },
         "target_doctype": "Purchase Order",
+        "write_rbac_operation": "create",
+        "preconditions_validated": True,
     }
     confirm_res = confirmation_node(confirm_state)
     assert "pending_confirmation" in confirm_res, (
@@ -364,7 +368,10 @@ def test_result_validation_advances_chain_on_read_only_skill():
 
 
 def test_route_after_result_validation_chain_flow():
-    """route_after_result_validation routes to prepare_chain_step while steps remain, format_agent_message when done."""
+    """
+    In a chain, result_validation always hands over to prepare_chain_step, which picks
+    the next runnable step or, when none is left, composes the turn's response.
+    """
     state_in_progress = AgentState(
         chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
         chain_step_index=1,
@@ -376,6 +383,10 @@ def test_route_after_result_validation_chain_flow():
         chain_plan=[{"skill": "step1"}, {"skill": "step2"}],
         chain_step_index=2,
         chain_aborted=False,
+        chain_results={"0": {}, "1": {}},
     )
-    assert route_after_result_validation(state_completed) == "format_agent_message"
+    assert route_after_result_validation(state_completed) == "prepare_chain_step"
+    composed = prepare_chain_step_node(state_completed)
+    assert composed["is_workflow_complete"] is True
+    assert composed["detected_intent"] == ""
 

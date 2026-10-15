@@ -13,6 +13,14 @@ DEFAULT_DB_PATH = os.path.join(DB_DIR, "chat_history.db")
 DB_PATH = os.getenv("SQLITE_DB_PATH", DEFAULT_DB_PATH)
 
 
+class ChatStoreError(RuntimeError):
+    """Conversation state could not be read or written. Never swallowed silently."""
+
+
+class ConversationAccessError(PermissionError):
+    """The authenticated user does not own the requested conversation."""
+
+
 def get_db_connection() -> sqlite3.Connection:
     """
     Creates and returns a SQLite connection with busy timeout and Row factory.
@@ -81,6 +89,13 @@ def init_db() -> None:
         columns = [row["name"] for row in cursor.fetchall()]
         if "extra_state" not in columns:
             cursor.execute("ALTER TABLE conversation_state ADD COLUMN extra_state TEXT DEFAULT '{}';")
+
+        # Migration: conversation owner (JWT 'sub'), used to stop one user from loading
+        # or answering another user's conversation.
+        cursor.execute("PRAGMA table_info(conversations);")
+        conv_columns = [row["name"] for row in cursor.fetchall()]
+        if "owner_sub" not in conv_columns:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN owner_sub TEXT;")
         
         # Create index on session_id for fast lookup
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversations_session_id ON conversations(session_id);")
@@ -89,7 +104,7 @@ def init_db() -> None:
     logger.info("SQLite database initialization complete.")
 
 
-def get_or_create_conversation(session_id: str, user_id: str = "") -> int:
+def get_or_create_conversation(session_id: str, user_id: str = "", owner_sub: Optional[str] = None) -> int:
     """
     Retrieves the conversation_id for a given session_id, creating one if it doesn't exist.
     """
@@ -99,11 +114,11 @@ def get_or_create_conversation(session_id: str, user_id: str = "") -> int:
         row = cursor.fetchone()
         if row:
             return row["id"]
-        
+
         now = datetime.utcnow().isoformat()
         cursor.execute(
-            "INSERT INTO conversations (session_id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?);",
-            (session_id, user_id, now, now)
+            "INSERT INTO conversations (session_id, user_id, owner_sub, created_at, updated_at) VALUES (?, ?, ?, ?, ?);",
+            (session_id, user_id, owner_sub, now, now)
         )
         conversation_id = cursor.lastrowid
         
@@ -115,25 +130,67 @@ def get_or_create_conversation(session_id: str, user_id: str = "") -> int:
         return conversation_id
 
 
+def verify_conversation_owner(session_id: str, owner_sub: str, user_id: str = "") -> int:
+    """
+    Return the conversation id for session_id if owner_sub owns it, creating it (owned by
+    owner_sub) when new. Raises ConversationAccessError for another user's conversation.
+    Conversations created before ownership was recorded are claimed by their first
+    authenticated user after the migration, and the claim is logged.
+    """
+    if not owner_sub:
+        raise ConversationAccessError("Authenticated user has no 'sub'; cannot scope the conversation.")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, owner_sub FROM conversations WHERE session_id = ?;", (session_id,))
+        row = cursor.fetchone()
+        if row is None:
+            now = datetime.utcnow().isoformat()
+            cursor.execute(
+                "INSERT INTO conversations (session_id, user_id, owner_sub, created_at, updated_at) VALUES (?, ?, ?, ?, ?);",
+                (session_id, user_id, owner_sub, now, now)
+            )
+            conversation_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT OR IGNORE INTO conversation_state (conversation_id, detected_intent, current_skill, collected_fields, workflow_complete, extra_state, updated_at) VALUES (?, '', '', '{}', 0, '{}', ?);",
+                (conversation_id, now)
+            )
+            conn.commit()
+            return conversation_id
+        if row["owner_sub"] is None:
+            logger.warning(f"Conversation '{session_id}' had no recorded owner; assigning it to '{owner_sub}'.")
+            cursor.execute("UPDATE conversations SET owner_sub = ? WHERE id = ?;", (owner_sub, row["id"]))
+            conn.commit()
+            return row["id"]
+        if row["owner_sub"] != owner_sub:
+            logger.warning(f"User '{owner_sub}' denied access to conversation '{session_id}' owned by another user.")
+            raise ConversationAccessError(f"Conversation '{session_id}' belongs to another user.")
+        return row["id"]
+
+
 def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Loads conversation messages and slot state from SQLite for a session_id.
     Reconstructs LangChain HumanMessage and AIMessage objects.
+
+    Raises ChatStoreError if the state cannot be read or parsed. Returning an empty
+    state instead would silently drop a pending confirmation and its chain.
+    Expiry of pending confirmations (and their chains) is enforced by
+    pending_action_gate_node, not here.
     """
     user_roles = user_roles or []
     try:
         conversation_id = get_or_create_conversation(session_id)
-        
+
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            
+
             # Load messages
             cursor.execute(
                 "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC;",
                 (conversation_id,)
             )
             msg_rows = cursor.fetchall()
-            
+
             messages: List[BaseMessage] = []
             for r in msg_rows:
                 role = r["role"].lower()
@@ -142,98 +199,57 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
                     messages.append(HumanMessage(content=content))
                 elif role in ("assistant", "ai"):
                     messages.append(AIMessage(content=content))
-            
+
             # Load state
             cursor.execute(
                 "SELECT detected_intent, current_skill, collected_fields, workflow_complete, extra_state FROM conversation_state WHERE conversation_id = ?;",
                 (conversation_id,)
             )
             state_row = cursor.fetchone()
-            
-            detected_intent = ""
-            collected_fields = {}
-            workflow_complete = False
-            extra_state = {}
-            
-            if state_row:
-                detected_intent = state_row["detected_intent"] or ""
-                workflow_complete = bool(state_row["workflow_complete"])
-                fields_raw = state_row["collected_fields"]
-                if fields_raw:
-                    try:
-                        collected_fields = json.loads(fields_raw)
-                    except Exception as e:
-                        logger.error(f"Error parsing collected_fields JSON for session {session_id}: {e}")
-                        collected_fields = {}
-                
-                extra_raw = state_row["extra_state"] if "extra_state" in state_row.keys() else None
-                if extra_raw:
-                    try:
-                        extra_state = json.loads(extra_raw)
-                    except Exception as e:
-                        logger.error(f"Error parsing extra_state JSON for session {session_id}: {e}")
-                        extra_state = {}
-                from workflow.graph import CHAIN_MAX_MINUTES
-                from datetime import datetime, timezone
-                
-                chain_plan = extra_state.get("chain_plan")
-                chain_step_index = extra_state.get("chain_step_index")
-                chain_results = extra_state.get("chain_results")
-                
-                if chain_plan:
-                    started_at = extra_state.get("chain_started_at")
-                    if started_at:
-                        try:
-                            start_dt = datetime.fromisoformat(started_at)
-                            now = datetime.now(tz=timezone.utc)
-                            if (now - start_dt).total_seconds() / 60 > CHAIN_MAX_MINUTES:
-                                chain_plan = None
-                                chain_step_index = None
-                                chain_results = None
-                        except:
-                            pass
-                            
-            return {
-                "messages": messages,
-                "detected_intent": detected_intent,
-                "collected_fields": collected_fields,
-                "final_response": "",
-                "user_roles": user_roles,
-                "is_workflow_complete": workflow_complete,
-                "pending_confirmation": extra_state.get("pending_confirmation"),
-                "ambiguous_candidates": extra_state.get("ambiguous_candidates"),
-                "clarification_target": extra_state.get("clarification_target"),
-                "clarification_attempts": extra_state.get("clarification_attempts") or 0,
-                "resolved_entities": extra_state.get("resolved_entities") or {},
-                "bulk_operation_scope": extra_state.get("bulk_operation_scope"),
-                # Follow-up router state
-                "last_turn_context": extra_state.get("last_turn_context"),
-                "pending_slot_clarification": extra_state.get("pending_slot_clarification"),
-                # Chain state
-                "chain_plan": chain_plan,
-                "chain_step_index": chain_step_index,
-                "chain_results": chain_results,
-                "chain_started_at": extra_state.get("chain_started_at") if chain_plan else None,
-            }
-    except Exception as e:
-        logger.exception(f"Failed to load session state for {session_id}: {e}")
-        return {
-            "messages": [],
-            "detected_intent": "",
-            "collected_fields": {},
-            "final_response": "",
-            "user_roles": user_roles,
-            "is_workflow_complete": False,
-            "pending_confirmation": None,
-            "ambiguous_candidates": None,
-            "clarification_target": None,
-            "clarification_attempts": 0,
-            "resolved_entities": {},
-            "bulk_operation_scope": None,
-            # Follow-up router state
-            "last_turn_context": None,
-            "pending_slot_clarification": None,
-        }
+    except sqlite3.Error as e:
+        logger.exception(f"Failed to load session state for {session_id}")
+        raise ChatStoreError(f"Could not load conversation state: {e}") from e
+
+    detected_intent = ""
+    collected_fields: Dict[str, Any] = {}
+    workflow_complete = False
+    extra_state: Dict[str, Any] = {}
+
+    if state_row:
+        detected_intent = state_row["detected_intent"] or ""
+        workflow_complete = bool(state_row["workflow_complete"])
+        try:
+            collected_fields = json.loads(state_row["collected_fields"] or "{}")
+            extra_state = json.loads(state_row["extra_state"] or "{}")
+        except json.JSONDecodeError as e:
+            logger.exception(f"Corrupt conversation state JSON for session {session_id}")
+            raise ChatStoreError(f"Conversation state is corrupt: {e}") from e
+
+    return {
+        "messages": messages,
+        "detected_intent": detected_intent,
+        "collected_fields": collected_fields,
+        "final_response": "",
+        "user_roles": user_roles,
+        "is_workflow_complete": workflow_complete,
+        "pending_confirmation": extra_state.get("pending_confirmation"),
+        "ambiguous_candidates": extra_state.get("ambiguous_candidates"),
+        "clarification_target": extra_state.get("clarification_target"),
+        "clarification_attempts": extra_state.get("clarification_attempts") or 0,
+        "resolved_entities": extra_state.get("resolved_entities") or {},
+        "bulk_operation_scope": extra_state.get("bulk_operation_scope"),
+        "last_created_doc": extra_state.get("last_created_doc"),
+        # Follow-up router state
+        "last_turn_context": extra_state.get("last_turn_context"),
+        "pending_slot_clarification": extra_state.get("pending_slot_clarification"),
+        # Chain state (persisted only while an action in the chain awaits confirmation)
+        "chain_plan": extra_state.get("chain_plan"),
+        "chain_step_index": extra_state.get("chain_step_index"),
+        "chain_results": extra_state.get("chain_results"),
+        "chain_step_status": extra_state.get("chain_step_status"),
+        "chain_id": extra_state.get("chain_id"),
+        "chain_started_at": extra_state.get("chain_started_at"),
+    }
 
 
 def save_message(session_id: str, role: str, content: str, intent: str = "", skill: str = "") -> None:
@@ -255,8 +271,9 @@ def save_message(session_id: str, role: str, content: str, intent: str = "", ski
                 (now, conversation_id)
             )
             conn.commit()
-    except Exception as e:
-        logger.exception(f"Failed to save message for session {session_id}: {e}")
+    except sqlite3.Error as e:
+        logger.exception(f"Failed to save message for session {session_id}")
+        raise ChatStoreError(f"Could not save the message: {e}") from e
 
 
 def update_session_state(
@@ -299,8 +316,10 @@ def update_session_state(
                 (now, conversation_id)
             )
             conn.commit()
-    except Exception as e:
-        logger.exception(f"Failed to update session state for {session_id}: {e}")
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        # TypeError/ValueError: state that is not JSON-serializable.
+        logger.exception(f"Failed to update session state for {session_id}")
+        raise ChatStoreError(f"Could not save conversation state: {e}") from e
 
 
 def reset_session_state(session_id: str) -> None:

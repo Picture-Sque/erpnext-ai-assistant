@@ -27,6 +27,10 @@ query_parameters:
     - actual_qty
 defaults: []
 validation_rules: []
+follow_up_eligible: true
+follow_up_slots:
+  - item_code
+  - warehouse
 keywords:
   - check stock
   - stock for

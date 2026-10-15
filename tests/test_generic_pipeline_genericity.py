@@ -266,8 +266,22 @@ class TestAuditAndDestructiveSkills(unittest.TestCase):
             "resolved_entities": {"name": {"name": "SO-0001", "match_type": "exact"}},
             "preconditions_validated": True,
             "target_doctype": "Sales Order",
-            "write_rbac_operation": None
+            "write_rbac_operation": None,
+            "user_sub": "tester@example.com",
         }
+
+    def _answer_confirmation(self, state, reply):
+        """
+        The reply to a pending confirmation is handled by pending_action_gate_node (pure
+        Python), which then re-runs write RBAC and preconditions before Step 6 lets the
+        confirmed action through. Simulate that path.
+        """
+        state["messages"].append(HumanMessage(content=reply))
+        res_gate = graph.pending_action_gate_node(state)
+        state.update(res_gate)
+        state.update(graph.write_rbac_gate_node(state))
+        state["preconditions_validated"] = True  # precondition re-check (mocked docstatus) passes
+        return res_gate
 
     @patch("agent.workflow.graph.get_document")
     def test_cancel_sales_order_valid(self, mock_get):
@@ -285,9 +299,12 @@ class TestAuditAndDestructiveSkills(unittest.TestCase):
         
         # Step 6 Reply
         state["messages"].append(AIMessage(content=res_conf["final_response"]))
-        state["messages"].append(HumanMessage(content="yes"))
+        res_gate = self._answer_confirmation(state, "yes")
+        self.assertEqual(res_gate.get("confirmation_result"), "confirmed")
+        self.assertEqual(res_gate.get("gate_route"), "write_rbac_gate")
         res_conf_reply = graph.confirmation_node(state)
-        self.assertEqual(res_conf_reply.get("confirmation_result"), "confirmed")
+        self.assertIsNone(res_conf_reply.get("pending_confirmation"))
+        self.assertNotIn("failure_classification", res_conf_reply)
         state.update(res_conf_reply)
         
         # Step 7 (Simulate tool response)
@@ -327,7 +344,9 @@ class TestAuditAndDestructiveSkills(unittest.TestCase):
         self.assertTrue(res_rbac["write_rbac_passed"])
         state.update(res_rbac)
         
-        # Confirmation node should skip
+        # Confirmation node should skip (document is a draft; when docstatus cannot be
+        # read, Step 6 now asks for confirmation instead of writing blind)
+        mock_get.return_value = {"status": "success", "data": {"name": "SO-0001", "docstatus": 0}}
         res_conf = graph.confirmation_node(state)
         self.assertEqual(res_conf, {})
         
@@ -366,9 +385,11 @@ class TestAuditAndDestructiveSkills(unittest.TestCase):
 
         # Step 6: Confirmation Reply (User says 'confirm')
         state["messages"].append(AIMessage(content=res_conf["final_response"]))
-        state["messages"].append(HumanMessage(content="confirm"))
+        res_gate = self._answer_confirmation(state, "confirm")
+        self.assertEqual(res_gate.get("confirmation_result"), "confirmed")
         res_conf_reply = graph.confirmation_node(state)
-        self.assertEqual(res_conf_reply.get("confirmation_result"), "confirmed")
+        self.assertIsNone(res_conf_reply.get("pending_confirmation"))
+        self.assertNotIn("failure_classification", res_conf_reply)
         state.update(res_conf_reply)
 
         # Step 7: Tool Execution
