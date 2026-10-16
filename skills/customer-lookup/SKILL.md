@@ -1,7 +1,7 @@
 ---
 name: customer-lookup
 intent: customer-lookup
-description: Look up an ERPNext customer record by name, ID, or partial match, or list all customers when no specific customer is requested. Use when the user asks "show all customers", "show me all customer", "list customers", "find customer X", "who is X", needs customer details, or when another skill needs to confirm a customer exists.
+description: Look up an ERPNext customer record (customer group, territory, email, mobile) by name or partial name, or list all customers when no specific customer is requested. Use when the user asks "show all customers", "list customers", "find customer X", "who is X", or needs customer profile details. NOT for a customer's orders (use customer-order-history). NOT for ranking customers by sales (use sales-analytics-report).
 allowed_roles:
   - Sales User
   - Sales Manager
@@ -38,23 +38,17 @@ keywords:
   - "search customer"
   - "customer group"
   - "customer info"
-  - "customer"
   - "show all customer"
   - "show me all customer"
   - "show all customers"
   - "show me all customers"
   - "list customers"
   - "list all customers"
-  - details of
-  - details for
+  - details of customer
   - their customer group
-  - their group
   - their territory
   - their email
   - their contact
-  - who is their
-  - what is their
-  - what group
 context_pronouns:
   entity_field: customer_name
   triggers: ["their", "they", "group", "details", "contact", "who", "what"]
@@ -65,23 +59,27 @@ response_template: |
   - **Email**: {email_id}
   - **Mobile**: {mobile_no}
 not_found_message: "Customer Lookup Result:\n\nUnfortunately, we were unable to find any information on the customer \"{customer_name}\" in our database."
+error_template: "Failed to look up customer: {error}"
 examples:
   - "Show me all customers"
-  - "Show me all customer"
   - "List all customers"
   - "Look up customer West View Software Ltd."
-  - "Show me details of West View Software Ltd."
+  - "Show me customer details for West View Software Ltd."
   - "Find customer Acme"
 ---
 
 # Customer Lookup
 
 ## When to use
-Trigger this skill when the user wants to list all customers, or find and confirm details about a specific customer, or when another skill needs a customer confirmed before proceeding.
+Trigger this skill when the user wants to list all customers, or find and confirm details about a specific customer.
 
-## Required information
-- None for listing all customers.
-- **customer_name**: (Optional) customer name (full or partial), or customer ID for looking up a specific customer.
+**IMPORTANT intent boundaries:**
+- Use `customer-order-history` for the orders a named customer placed
+- Use `sales-analytics-report` for "who is our top customer?" style rankings
+- Use THIS skill for customer profile details or the customer list
+
+## Optional information
+- **customer_name**: Customer name (full or partial) for a specific customer. Leave it out to list all customers.
 
 ## ERPNext details
 - Doctype: `Customer`

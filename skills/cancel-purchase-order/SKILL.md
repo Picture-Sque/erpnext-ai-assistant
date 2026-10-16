@@ -37,8 +37,8 @@ response_template: "Successfully cancelled Purchase Order: {name}!"
 error_template: "Failed to cancel purchase order: {error}"
 examples:
   - "Cancel purchase order PUR-ORD-2026-00013"
-  - "Abort the purchase order for Summit Traders"
-  - "Cancel the PO for ITEM-DOCK-006"
+  - "Abort purchase order PUR-ORD-2026-00022"
+  - "Void PO PUR-ORD-2026-00023"
 ---
 
 # Cancel Purchase Order

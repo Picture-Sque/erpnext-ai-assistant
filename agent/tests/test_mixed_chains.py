@@ -62,6 +62,15 @@ class FakeERP:
                  "items": [{"item_code": "RM-001", "qty": 5}]},
             ],
             "Customer": [],
+            # Submitted sales: ITEM-DESK-001 is the best seller (30 units), MS-001 second.
+            "Sales Order": [
+                {"name": "SO-1", "docstatus": 1, "transaction_date": "2026-08-01",
+                 "items": [{"item_code": "ITEM-DESK-001", "qty": 20, "amount": 2000},
+                           {"item_code": "MS-001", "qty": 4, "amount": 400}]},
+                {"name": "SO-2", "docstatus": 1, "transaction_date": "2026-09-01",
+                 "items": [{"item_code": "ITEM-DESK-001", "qty": 10, "amount": 1000},
+                           {"item_code": "MS-001", "qty": 8, "amount": 800}]},
+            ],
         }
         self.calls = []
 
@@ -301,8 +310,11 @@ def test_plain_create_and_stock_needs_no_confirmation(env):
     out = env.text(msg)
     assert f"Successfully created Purchase Order: {PO2}" in out and "Draft" in out
     assert "42.0" in out
-    assert "Reply **Yes**" not in out
-    assert env.persisted()["pending_confirmation"] is None
+    # The create itself ran without a confirmation; the only question is the optional
+    # offer to submit the new draft, placed last.
+    assert env.erp.writes()[0][0] == "create_document"
+    assert out.rstrip().endswith("Reply **Yes** to submit it, or **No** to keep it as a Draft.")
+    assert env.persisted()["pending_confirmation"]["is_offer"] is True
 
 
 def test_stock_then_submit_reverse_order(env):
@@ -385,16 +397,147 @@ def test_mid_chain_failure_reports_and_continues(env):
     assert out.index("NOPE-999") < out.index("42.0")
 
 
-def test_missing_details_in_one_step_do_not_block_others(env):
+def test_missing_details_pause_the_step_and_the_reply_resumes_it(env):
     msg = "create a purchase order for 10 RM-001 and also check stock for MS-001"
     _compound(env.llm, msg, "create-purchase-order", [
         {"skill": "create-purchase-order", "slots": {"items": [{"item_code": "RM-001", "qty": 10}]}, "uses": {}, "condition": None},
         {"skill": "check-inventory", "slots": {"item_code": "MS-001"}, "uses": {}, "condition": None},
     ])
     out = env.text(msg)
-    assert "Missing required details: supplier" in out
+    # The independent read still runs; the write asks for what it lacks instead of failing.
     assert "42.0" in out
+    assert "I need: **supplier**" in out and out.rstrip().endswith("or **cancel** to skip this step.")
     assert env.erp.writes() == []
+    assert env.persisted()["pending_input"]["missing"] == ["supplier"]
+
+    env.llm.extract["Zuckerman Security Ltd."] = {"supplier": "Zuckerman Security Ltd."}
+    out2 = env.text("Zuckerman Security Ltd.", max_llm_calls=1)
+    created = [c for c in env.erp.writes() if c[0] == "create_document"]
+    assert len(created) == 1
+    assert created[0][2]["supplier"] == "Zuckerman Security Ltd."
+    assert created[0][2]["items"][0]["item_code"] == "RM-001"
+    assert "PUR-ORD-2026-00002" in out2
+    assert env.persisted()["pending_input"] is None
+
+
+BEST_SELLER_MSG = ("find the best seller item in the last 4 months, check if its current stock is low, "
+                   "if the stock is less than 5 then create a purchase order for 50 quantities")
+
+
+def _best_seller_plan(llm, msg=BEST_SELLER_MSG, query_type="best_selling_item_qty"):
+    _compound(llm, msg, "sales-analytics-report", [
+        {"skill": "sales-analytics-report",
+         "slots": {"query_type": query_type, "date_from": "2026-06-16", "date_to": "2026-10-16"},
+         "uses": {}, "condition": None},
+        {"skill": "check-inventory", "slots": {}, "uses": {"item_code": "$step0.item_code"}, "condition": None},
+        {"skill": "create-purchase-order", "slots": {"qty": 50}, "uses": {"item_code": "$step0.item_code"},
+         "condition": {"field": "$step1.actual_qty", "operator": "<", "value": 5}},
+    ])
+
+
+def test_best_seller_low_stock_conditional_po_runs_end_to_end(env):
+    _best_seller_plan(env.llm)
+    out1 = env.text(BEST_SELLER_MSG)
+    # Steps 1 and 2 report their results, then the PO step asks for the supplier it needs.
+    assert out1.index("ITEM-DESK-001") < out1.index("3.0") < out1.index("I need: **supplier**")
+    assert env.erp.writes() == []
+
+    env.llm.extract["Zuckerman Security Ltd."] = {"supplier": "Zuckerman Security Ltd."}
+    out2 = env.text("Zuckerman Security Ltd.", max_llm_calls=1)
+    # A create built from earlier results is confirmed before it runs.
+    assert "Reply **Yes**" in out2 and env.erp.writes() == []
+
+    out3 = env.text("yes", max_llm_calls=0)
+    created = [c for c in env.erp.writes() if c[0] == "create_document"]
+    assert len(created) == 1
+    assert created[0][2]["supplier"] == "Zuckerman Security Ltd."
+    assert created[0][2]["items"][0]["item_code"] == "ITEM-DESK-001"
+    assert float(created[0][2]["items"][0]["qty"]) == 50
+    assert "PUR-ORD-2026-00002" in out3
+    persisted = env.persisted()
+    assert persisted["pending_input"] is None
+    assert persisted["pending_confirmation"]["skill"] == "submit-purchase-order"  # the submit offer
+    assert persisted["chain_plan"] is None
+
+
+def test_conditional_po_is_skipped_when_stock_is_not_low(env):
+    env.erp.db["Bin"][2]["actual_qty"] = 40.0  # ITEM-DESK-001
+    _best_seller_plan(env.llm)
+    out = env.text(BEST_SELLER_MSG)
+    assert "Condition not met (actual qty is 40.0, needed < 5)" in out
+    assert "supplier" not in out
+    assert env.erp.writes() == []
+    assert env.persisted()["pending_input"] is None
+
+
+def test_no_stock_rows_count_as_zero_stock(env):
+    env.erp.db["Bin"] = [b for b in env.erp.db["Bin"] if b["item_code"] != "ITEM-DESK-001"]
+    _best_seller_plan(env.llm)
+    out = env.text(BEST_SELLER_MSG)
+    # The empty stock check is a result (no stock), so the "< 5" condition passes.
+    assert "No stock found" in out
+    assert "I need: **supplier**" in out
+
+
+def test_invalid_fixed_value_is_asked_for_not_sent_to_erpnext(env):
+    _best_seller_plan(env.llm, query_type="best-selling-item")
+    out = env.text(BEST_SELLER_MSG)
+    assert "'best-selling-item' is not a valid query type" in out
+    assert "one of: best_selling_item_qty" in out
+    assert not [c for c in env.erp.calls if c[1] == "Sales Order"]
+    # Dependent steps wait for the answer instead of failing.
+    assert "After that I will also run" in out
+
+
+def test_item_row_from_planner_is_completed_with_the_referenced_item(env):
+    # Shape the live planner produced: qty inside items, the item itself from step 0.
+    _compound(env.llm, BEST_SELLER_MSG, "sales-analytics-report", [
+        {"skill": "sales-analytics-report", "slots": {"query_type": "best_selling_item_qty"}, "uses": {}, "condition": None},
+        {"skill": "check-inventory", "slots": {}, "uses": {"item_code": "$step0.item_code"}, "condition": None},
+        {"skill": "create-purchase-order", "slots": {"items": [{"qty": 50}]}, "uses": {"item_code": "$step0.item_code"},
+         "condition": {"field": "$step1.actual_qty", "operator": "<", "value": 5}},
+    ])
+    out = env.text(BEST_SELLER_MSG)
+    assert "I need: **supplier**." in out
+    assert env.persisted()["pending_input"]["slots"]["items"] == [{"item_code": "ITEM-DESK-001", "qty": 50}]
+
+
+def test_hyphenated_fixed_value_is_normalized(env):
+    _best_seller_plan(env.llm, query_type="Best-Selling-Item-Qty")
+    out = env.text(BEST_SELLER_MSG)
+    assert "ITEM-DESK-001" in out and "I need: **supplier**" in out
+
+
+def test_cancel_reply_skips_the_step_and_its_dependents(env):
+    msg = "check stock for MS-001, create a purchase order for 10 RM-001 and then submit it"
+    _compound(env.llm, msg, "check-inventory", [
+        {"skill": "check-inventory", "slots": {"item_code": "MS-001"}, "uses": {}, "condition": None},
+        {"skill": "create-purchase-order", "slots": {"items": [{"item_code": "RM-001", "qty": 10}]}, "uses": {}, "condition": None},
+        {"skill": "submit-purchase-order", "slots": {}, "uses": {"name": "$step1.name"}, "condition": None},
+    ])
+    out1 = env.text(msg)
+    assert "42.0" in out1 and "I need: **supplier**" in out1
+
+    out2 = env.text("cancel", max_llm_calls=0)
+    assert "You chose not to provide the details" in out2
+    assert "**Submit purchase order**: skipped" in out2
+    assert env.erp.writes() == []
+    assert env.persisted()["pending_input"] is None and env.persisted()["chain_plan"] is None
+
+
+def test_second_reply_without_the_details_cancels_the_step(env):
+    msg = "create a purchase order for 10 RM-001 and also check stock for MS-001"
+    _compound(env.llm, msg, "create-purchase-order", [
+        {"skill": "create-purchase-order", "slots": {"items": [{"item_code": "RM-001", "qty": 10}]}, "uses": {}, "condition": None},
+        {"skill": "check-inventory", "slots": {"item_code": "MS-001"}, "uses": {}, "condition": None},
+    ])
+    env.text(msg)
+    out2 = env.text("not sure yet", max_llm_calls=1)
+    assert "I still need: **supplier**" in out2
+    out3 = env.text("hmm", max_llm_calls=1)
+    assert "were still missing, so this step was not run" in out3
+    assert env.erp.writes() == []
+    assert env.persisted()["pending_input"] is None
 
 
 def test_rbac_denied_on_yes_blocks_destructive_action(env):
@@ -609,3 +752,89 @@ def test_free_text_slot_question_does_not_swallow_a_new_request():
     res = followup_router.resolve_followup_node(state)
     assert res["_followup_route"] == "classify_intent"
     assert res["pending_slot_clarification"] is None
+
+
+def test_submit_it_after_chain_created_po_submits_that_po(env):
+    """Screenshot case: after a chain creates a draft PO, "submit it" must submit that PO,
+    not be taken as a follow-up to the chain's earlier stock check."""
+    _best_seller_plan(env.llm)
+    env.text(BEST_SELLER_MSG)
+    env.llm.extract["Zuckerman Security Ltd."] = {"supplier": "Zuckerman Security Ltd."}
+    env.text("Zuckerman Security Ltd.", max_llm_calls=1)
+    out = env.text("yes", max_llm_calls=0)
+    new_po = "PUR-ORD-2026-00002"
+    assert new_po in out
+    assert env.persisted()["last_turn_context"] is None
+
+    env.llm.classify["submit it"] = {"intent": "submit-purchase-order", "is_compound": False, "pending_followup_steps": []}
+    env.llm.extract["submit it"] = {}  # the name comes from the document just created
+    ask = env.text("submit it")
+    assert new_po in ask and "Reply **Yes**" in ask
+    assert not any(c[0] == "followup" for c in env.llm.calls)
+
+    done = env.text("yes", max_llm_calls=1)
+    assert ("submit_document", "Purchase Order", new_po) in env.erp.writes()
+    assert env.erp.po(new_po)["docstatus"] == 1
+    assert done  # final wording comes from the (stubbed) formatter
+
+
+def test_action_verb_is_never_a_read_followup(env):
+    env.llm.classify["check stock for MS-001"] = {"intent": "check-inventory", "is_compound": False, "pending_followup_steps": []}
+    env.llm.extract["check stock for MS-001"] = {"item_code": "MS-001"}
+    env.text("check stock for MS-001")
+    env.llm.classify["cancel it"] = {"intent": "fallback", "is_compound": False, "pending_followup_steps": []}
+    env.text("cancel it")
+    assert not any(c[0] == "followup" for c in env.llm.calls)
+
+
+def _create_draft_via_chain(env):
+    _best_seller_plan(env.llm)
+    env.text(BEST_SELLER_MSG)
+    env.llm.extract["Zuckerman Security Ltd."] = {"supplier": "Zuckerman Security Ltd."}
+    env.text("Zuckerman Security Ltd.", max_llm_calls=1)
+    return env.text("yes", max_llm_calls=0), "PUR-ORD-2026-00002"
+
+
+def test_created_draft_offers_submit_and_yes_submits_it(env):
+    out, po = _create_draft_via_chain(env)
+    assert f"Do you want me to submit" not in out  # prompt text is the offer, not a generic confirm
+    assert f"**Submit it now?** Purchase Order '{po}' stays a Draft" in out
+    env.text("yes", max_llm_calls=1)
+    assert ("submit_document", "Purchase Order", po) in env.erp.writes()
+    assert env.erp.po(po)["docstatus"] == 1
+    assert env.persisted()["pending_confirmation"] is None
+
+
+def test_declining_the_submit_offer_keeps_the_draft(env):
+    _, po = _create_draft_via_chain(env)
+    out = env.text("no", max_llm_calls=0)
+    assert out.startswith(f"OK, Purchase Order '{po}' stays a Draft.")
+    assert env.erp.po(po)["docstatus"] == 0
+    assert env.persisted()["pending_confirmation"] is None
+
+
+def test_unrelated_message_drops_the_offer_without_reasking(env):
+    _, po = _create_draft_via_chain(env)
+    env.llm.classify["check stock for MS-001"] = {"intent": "check-inventory", "is_compound": False, "pending_followup_steps": []}
+    env.llm.extract["check stock for MS-001"] = {"item_code": "MS-001"}
+    out = env.text("check stock for MS-001")
+    assert "I need a Yes or No" not in out
+    assert env.erp.po(po)["docstatus"] == 0
+    assert env.persisted()["pending_confirmation"] is None
+
+
+def test_standalone_create_also_offers_submit(env):
+    msg = "create a purchase order for Zuckerman Security Ltd. for 10 RM-001 at 100"
+    env.llm.classify[msg] = {"intent": "create-purchase-order", "is_compound": False, "pending_followup_steps": []}
+    env.llm.extract[msg] = copy.deepcopy(ZUCK_ITEMS)
+    out = env.text(msg)
+    assert [c[0] for c in env.erp.writes()] == ["create_document"]
+    assert "Reply **Yes** to submit it" in out
+    env.text("yes", max_llm_calls=1)
+    assert env.erp.po("PUR-ORD-2026-00002")["docstatus"] == 1
+
+
+def test_no_offer_when_the_plan_already_submits(env):
+    msg = _setup_po_submit_stock(env.llm)
+    out = env.text(msg)
+    assert "Submit it now?" not in out

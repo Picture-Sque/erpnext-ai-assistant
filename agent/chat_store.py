@@ -96,6 +96,9 @@ def init_db() -> None:
         conv_columns = [row["name"] for row in cursor.fetchall()]
         if "owner_sub" not in conv_columns:
             cursor.execute("ALTER TABLE conversations ADD COLUMN owner_sub TEXT;")
+        # Migration: user-chosen conversation title (NULL = derive from the first message).
+        if "title" not in conv_columns:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN title TEXT;")
         
         # Create index on session_id for fast lookup
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversations_session_id ON conversations(session_id);")
@@ -233,6 +236,7 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
         "user_roles": user_roles,
         "is_workflow_complete": workflow_complete,
         "pending_confirmation": extra_state.get("pending_confirmation"),
+        "pending_input": extra_state.get("pending_input"),
         "ambiguous_candidates": extra_state.get("ambiguous_candidates"),
         "clarification_target": extra_state.get("clarification_target"),
         "clarification_attempts": extra_state.get("clarification_attempts") or 0,
@@ -242,7 +246,7 @@ def load_session_state(session_id: str, user_roles: Optional[List[str]] = None) 
         # Follow-up router state
         "last_turn_context": extra_state.get("last_turn_context"),
         "pending_slot_clarification": extra_state.get("pending_slot_clarification"),
-        # Chain state (persisted only while an action in the chain awaits confirmation)
+        # Chain state (persisted only while a chain step awaits confirmation or details)
         "chain_plan": extra_state.get("chain_plan"),
         "chain_step_index": extra_state.get("chain_step_index"),
         "chain_results": extra_state.get("chain_results"),
@@ -320,6 +324,130 @@ def update_session_state(
         # TypeError/ValueError: state that is not JSON-serializable.
         logger.exception(f"Failed to update session state for {session_id}")
         raise ChatStoreError(f"Could not save conversation state: {e}") from e
+
+
+CONVERSATION_TITLE_MAX_CHARS = 60
+CUSTOM_TITLE_MAX_CHARS = 100
+
+
+def _title_from(first_message: Optional[str]) -> str:
+    text = " ".join((first_message or "").split())
+    if len(text) <= CONVERSATION_TITLE_MAX_CHARS:
+        return text or "New chat"
+    return text[:CONVERSATION_TITLE_MAX_CHARS].rstrip() + "…"
+
+
+def _owned_conversation_id(cursor: sqlite3.Cursor, session_id: str, owner_sub: str) -> Optional[int]:
+    """Row id of session_id if owner_sub owns it, None if it does not exist. Raises for another user's."""
+    cursor.execute("SELECT id, owner_sub FROM conversations WHERE session_id = ?;", (session_id,))
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    if row["owner_sub"] != owner_sub:
+        logger.warning(f"User '{owner_sub}' denied access to conversation '{session_id}' owned by another user.")
+        raise ConversationAccessError(f"Conversation '{session_id}' belongs to another user.")
+    return row["id"]
+
+
+def list_conversations(owner_sub: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    The owner's conversations that have at least one user message, newest activity first.
+    The title is the one the user set, else the first user message, shortened.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT c.session_id, c.title, c.created_at, c.updated_at,
+                       (SELECT m.content FROM messages m
+                         WHERE m.conversation_id = c.id AND m.role = 'user'
+                         ORDER BY m.id ASC LIMIT 1) AS first_message,
+                       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count
+                  FROM conversations c
+                 WHERE c.owner_sub = ?
+                   AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND m.role = 'user')
+                 ORDER BY c.updated_at DESC
+                 LIMIT ?;
+                """,
+                (owner_sub, limit),
+            )
+            return [
+                {
+                    "id": row["session_id"],
+                    "title": row["title"] or _title_from(row["first_message"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "message_count": row["message_count"],
+                }
+                for row in cursor.fetchall()
+            ]
+    except sqlite3.Error as e:
+        logger.exception(f"Failed to list conversations for {owner_sub}")
+        raise ChatStoreError(f"Could not list conversations: {e}") from e
+
+
+def get_conversation_messages(session_id: str, owner_sub: str) -> List[Dict[str, Any]]:
+    """Messages of one conversation, oldest first. Empty for a conversation that does not exist yet."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            conversation_id = _owned_conversation_id(cursor, session_id, owner_sub)
+            if conversation_id is None:
+                return []
+            cursor.execute(
+                "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC;",
+                (conversation_id,),
+            )
+            return [
+                {"id": row["id"], "role": row["role"], "content": row["content"], "created_at": row["created_at"]}
+                for row in cursor.fetchall()
+            ]
+    except sqlite3.Error as e:
+        logger.exception(f"Failed to load messages for {session_id}")
+        raise ChatStoreError(f"Could not load the conversation: {e}") from e
+
+
+def rename_conversation(session_id: str, owner_sub: str, title: str) -> bool:
+    """
+    Set the owner's title for a conversation. False if it does not exist. Does not touch
+    updated_at, so renaming does not move the chat to the top of the history.
+    """
+    title = " ".join((title or "").split())
+    if not title:
+        raise ValueError("The title cannot be empty.")
+    if len(title) > CUSTOM_TITLE_MAX_CHARS:
+        raise ValueError(f"The title can be at most {CUSTOM_TITLE_MAX_CHARS} characters.")
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            conversation_id = _owned_conversation_id(cursor, session_id, owner_sub)
+            if conversation_id is None:
+                return False
+            cursor.execute("UPDATE conversations SET title = ? WHERE id = ?;", (title, conversation_id))
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logger.exception(f"Failed to rename conversation {session_id}")
+        raise ChatStoreError(f"Could not rename the conversation: {e}") from e
+
+
+def delete_conversation(session_id: str, owner_sub: str) -> bool:
+    """Delete one of the owner's conversations with its messages and state. False if it did not exist."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            conversation_id = _owned_conversation_id(cursor, session_id, owner_sub)
+            if conversation_id is None:
+                return False
+            cursor.execute("DELETE FROM messages WHERE conversation_id = ?;", (conversation_id,))
+            cursor.execute("DELETE FROM conversation_state WHERE conversation_id = ?;", (conversation_id,))
+            cursor.execute("DELETE FROM conversations WHERE id = ?;", (conversation_id,))
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logger.exception(f"Failed to delete conversation {session_id}")
+        raise ChatStoreError(f"Could not delete the conversation: {e}") from e
 
 
 def reset_session_state(session_id: str) -> None:

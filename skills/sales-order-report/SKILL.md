@@ -55,26 +55,18 @@ follow_up_slots:
   - docstatus
 keywords:
   - list sales orders
-  - list orders
+  - list all sales orders
   - show all sales orders
-  - show all orders
   - sales orders from
-  - orders from last month
-  - orders from july
-  - orders from august
-  - orders in draft
-  - draft orders
-  - submitted orders
-  - cancelled orders
-  - pending orders
-  - orders between
-  - orders this month
-  - orders last month
-  - orders last week
-  - filter orders
-  - orders by date
+  - sales orders in draft
+  - draft sales orders
+  - submitted sales orders
+  - cancelled sales orders
+  - sales orders between
+  - sales orders this month
+  - sales orders last month
+  - sales orders last week
   - sales order list
-  - all orders
 response_template: "Sales Order List"
 error_template: "Failed to retrieve sales orders: {error}"
 not_found_message: "No Sales Orders found matching the specified filters."

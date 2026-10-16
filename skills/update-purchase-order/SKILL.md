@@ -1,7 +1,7 @@
 ---
 name: update-purchase-order
 intent: update-purchase-order
-description: Update fields on an existing Purchase Order in ERPNext. Use when the user asks to change, modify, or update a purchase order — for example, changing the schedule date or quantity. NOT for cancelling (use cancel-purchase-order) or submitting (use submit-purchase-order). No confirmation required (mirrors update-sales-order pattern — updates are reversible and non-destructive).
+description: Update the schedule (delivery) date of an existing Purchase Order in ERPNext. Use when the user asks to change, modify, reschedule, or update a purchase order's schedule or delivery date. NOT for Sales Orders (use update-sales-order). NOT for cancelling (use cancel-purchase-order) or submitting (use submit-purchase-order). A plain update of a draft needs no confirmation; updating a submitted PO is confirmed first.
 allowed_roles:
   # Updating a PO is less risky than cancelling/submitting; purchasing team + admins
   # NOTE: Broader than cancel/submit (same reasoning as update-sales-order vs cancel/submit-sales-order)
@@ -16,7 +16,6 @@ required_fields:
   - schedule_date
 optional_fields:
   - transaction_date
-  - supplier
 payload_structure:
   fixed: {}
   field_mappings:
@@ -28,12 +27,11 @@ defaults: []
 validation_rules:
   - field: schedule_date
     must_be_after: transaction_date
-    on_fail: schedule_date must be strictly after transaction_date
+    on_fail: must be strictly after transaction_date
 keywords:
   - update purchase order
   - change purchase order
   - modify purchase order
-  - change delivery date
   - change schedule date
   - update po
   - change po
@@ -44,7 +42,7 @@ response_template: "Successfully updated Purchase Order: {name}!"
 error_template: "Failed to update purchase order: {error}"
 examples:
   - "Update schedule date of PUR-ORD-2026-00013 to 2026-10-01"
-  - "Change the delivery date on the purchase order for Summit Traders"
+  - "Reschedule purchase order PUR-ORD-2026-00020 to 2026-11-15"
   - "Modify PO PUR-ORD-2026-00014 schedule date to next Friday"
 ---
 
@@ -57,11 +55,12 @@ Trigger this skill when the user wants to update (modify) an existing Purchase O
 - Use `cancel-purchase-order` when the user wants to CANCEL a PO
 - Use `submit-purchase-order` when the user wants to SUBMIT/FINALIZE a PO
 - Use `purchase-order-lookup` to VIEW a PO without changing it
-- Use THIS skill for field updates (schedule_date, etc.)
+- Use `update-sales-order` when changing a Sales Order
+- Use THIS skill for schedule date changes on a Purchase Order
 
 ## Required information
 - **name**: The Purchase Order ID to update
-- **schedule_date**: The new schedule/delivery date
+- **schedule_date**: The new schedule/delivery date, as YYYY-MM-DD
 
 ## Optional information
 - **transaction_date**: The transaction date (if being changed)

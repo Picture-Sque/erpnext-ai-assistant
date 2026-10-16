@@ -33,7 +33,7 @@ defaults:
 validation_rules:
   - field: schedule_date
     must_be_after: transaction_date
-    on_fail: schedule_date must be strictly after transaction_date
+    on_fail: must be strictly after transaction_date
 keywords:
   - create purchase order
   - place purchase order

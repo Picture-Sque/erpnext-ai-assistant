@@ -20,6 +20,7 @@ from workflow.followup_router import (
     build_last_turn_context,
     FOLLOWUP_MAX_TURNS,
     FOLLOWUP_MAX_MINUTES,
+    _BACK_REFERENCE_RE,
 )
 from tools.generic_tools import (
     create_document,
@@ -138,6 +139,10 @@ def load_skills() -> List[Dict[str, Any]]:
                                     "follow_up_eligible": bool(data.get("follow_up_eligible", False)),
                                     "follow_up_slots": data.get("follow_up_slots", []),
                                     "chain_exports": data.get("chain_exports", {}),
+                                    # Fields restricted to a fixed set of values: {field: [allowed, ...]}
+                                    "field_values": data.get("field_values") or {},
+                                    # Result fields later chain steps can reference; defaults to query_parameters.fields
+                                    "outputs": data.get("outputs") or [],
                                 })
                 except OSError as e:
                     logger.error(f"Failed to read skill {skill_md}; skill not loaded: {e}")
@@ -436,6 +441,24 @@ def _build_intent_updates(new_intent: str, state: AgentState, extra_updates: Opt
 
     return updates
 
+def match_skill_keyword(message: str) -> Optional[str]:
+    """
+    Deterministic keyword routing: the skill whose longest keyword appears in the message
+    (whole words), or None. Messages that look compound ("and", "then", "if", "after", a
+    comma) are left to the LLM classifier, which also decides is_compound.
+    """
+    cleaned = (message or "").lower()
+    if re.search(r'\b(and|then|if|after)\b|,', cleaned):
+        return None
+    all_kw = [(str(kw).lower(), skill["name"]) for skill in loaded_skills for kw in skill.get("keywords", [])]
+    all_kw.sort(key=lambda x: len(x[0]), reverse=True)
+    for kw, skill_name in all_kw:
+        # Word boundaries so "sell" does not match inside "selling".
+        if re.search(r'\b' + re.escape(kw) + r'\b', cleaned):
+            return skill_name
+    return None
+
+
 def classify_intent_node(state: AgentState):
     """Step 2a: Classify user intent from message."""
     messages = state.get("messages", [])
@@ -458,8 +481,15 @@ def classify_intent_node(state: AgentState):
         last_assistant_msg = next((m.content for m in reversed(messages[:-1]) if isinstance(m, AIMessage)), "")
         if last_assistant_msg:
             last_params = state.get("collected_fields", {})
+            last_doc = state.get("last_created_doc") or {}
+            last_doc_line = (
+                f"- Most recently created or changed document: {last_doc.get('doctype')} '{last_doc.get('name')}' "
+                f"(pronouns like 'it' or 'that' usually refer to this)\n"
+                if last_doc.get("doctype") and last_doc.get("name") else ""
+            )
             context_str = (
                 f"\n\nCONTEXT FOR SHORT FOLLOW-UP:\n"
+                f"{last_doc_line}"
                 f"- Previous assistant message: '{last_assistant_msg}'\n"
                 f"- Previous intent: '{current_intent}'\n"
                 f"- Previous parameters: {json.dumps(last_params)}\n"
@@ -470,18 +500,10 @@ def classify_intent_node(state: AgentState):
     # so we don't accidentally match "sell" inside "Standard Selling" or other false positives.
     # ALSO skip if it looks like a compound request (contains 'and', 'then', 'if', or commas),
     # so the LLM can correctly set is_compound.
-    is_compound_candidate = bool(re.search(r'\b(and|then|if|after)\b|,', cleaned))
-    
-    if not context_str and not is_compound_candidate:
-        all_kw = []
-        for skill in loaded_skills:
-            for kw in skill.get("keywords", []):
-                all_kw.append((kw, skill["name"]))
-        all_kw.sort(key=lambda x: len(x[0]), reverse=True)
-        for kw, skill_name in all_kw:
-            # Use regex for word boundary to prevent partial matches like "sell" in "selling"
-            if re.search(r'\b' + re.escape(kw) + r'\b', cleaned):
-                return _build_intent_updates(skill_name, state)
+    if not context_str:
+        keyword_skill = match_skill_keyword(last_msg)
+        if keyword_skill:
+            return _build_intent_updates(keyword_skill, state)
 
     # 3. Multi-turn continuation: if currently in an incomplete workflow, preserve active intent
     if current_intent and current_intent in [s["name"] for s in loaded_skills] and not is_complete:
@@ -578,7 +600,12 @@ def collect_parameters_node(state: AgentState):
     # A resumed chain step runs on the turn of a yes/no reply. It must use its stored
     # per-step slots only; extracting from the reply ("yes") would corrupt them.
     is_resumed_chain_step = bool(chain_plan and state.get("chain_resumed"))
-    if last_msg.strip() and not (chain_plan and has_all_required) and not is_clarifying and not is_resumed_chain_step:
+    # Except the step that asked for missing details: this reply is its answer.
+    is_step_input_reply = bool(chain_plan and state.get("step_input_reply"))
+    should_extract = bool(last_msg.strip()) and not is_clarifying and (
+        is_step_input_reply or (not (chain_plan and has_all_required) and not is_resumed_chain_step)
+    )
+    if should_extract:
         opt_fields = skill.get("optional_fields", [])
         last_created_doc = state.get("last_created_doc")
         last_created_msg = f"Last created document: {json.dumps(last_created_doc)}\nIf the user uses pronouns (it, that, the PO) or just says 'submit'/'cancel', use this document's name for the 'name' or 'id' field if it matches the expected doctype." if last_created_doc else ""
@@ -629,6 +656,20 @@ def collect_parameters_node(state: AgentState):
                 fields["customer_name"] = fields.pop("search_term")
             if "customer" in fields and "customer_name" not in fields and "customer_name" in req_fields:
                 fields["customer_name"] = fields["customer"]
+
+    # "submit it" / "cancel that" right after a document was created: the reference is
+    # that document when its type matches this skill. Explicit, logged, and shown to the
+    # user in the confirmation prompt before anything runs.
+    last_doc = state.get("last_created_doc") or {}
+    if (
+        "name" in req_fields
+        and not str(fields.get("name") or fields.get("id") or "").strip()
+        and last_doc.get("name")
+        and last_doc.get("doctype") == skill.get("doctype")
+        and _BACK_REFERENCE_RE.search(last_msg or "")
+    ):
+        fields["name"] = last_doc["name"]
+        logger.info(f"[Collect] '{last_msg}' refers to the last {last_doc['doctype']}: using name={last_doc['name']}")
 
     defaults = skill.get("defaults", [])
     if defaults:
@@ -697,21 +738,67 @@ def validate_parameters_node(state: AgentState):
                     if m not in missing_parameters:
                         missing_parameters.append(m)
 
-    return {
+    # 3. Fields restricted to a fixed set of values. A value outside the set is never sent
+    #    to ERPNext: it is dropped and reported as missing, so the user is asked for it.
+    invalid_values = {}
+    for field, allowed in (skill.get("field_values") or {}).items():
+        val = collected.get(field)
+        if val is None or str(val).strip() == "":
+            continue
+        normalized = _normalize_choice(val, allowed)
+        if normalized is None:
+            logger.warning(f"[Validate] {field}={val!r} is not one of {allowed} for skill '{intent}'.")
+            invalid_values[field] = val
+            collected.pop(field, None)
+            all_required_filled = False
+            if field not in missing_parameters:
+                missing_parameters.append(field)
+        else:
+            collected[field] = normalized
+
+    updates = {
         "all_required_filled": all_required_filled,
         "missing_parameters": missing_parameters,
-        "collected_fields": collected
+        "invalid_parameters": invalid_values,
+        "collected_fields": collected,
     }
+    if all_required_filled and state.get("step_input_reply"):
+        # The step now has the details it asked for.
+        updates["pending_input"] = None
+    return updates
+
+
+def _normalize_choice(value: Any, allowed: list) -> Optional[str]:
+    """
+    Match a value to one of a field's allowed values, ignoring case and the separator
+    style ("best-selling item" == "best_selling_item"). None when nothing matches.
+    """
+    def norm(v):
+        return re.sub(r"[\s\-]+", "_", str(v).strip().lower())
+    target = norm(value)
+    for option in allowed:
+        if norm(option) == target:
+            return option
+    return None
+
+
+def _describe_field(skill: Dict[str, Any], field: str) -> str:
+    """'supplier' -> 'supplier'; a fixed-value field also lists its options."""
+    name = field.replace("_", " ")
+    options = (skill.get("field_values") or {}).get(field)
+    return f"{name} (one of: {', '.join(options)})" if options else name
 
 
 def ask_for_missing_info_node(state: AgentState):
     intent = state.get("detected_intent", "")
     missing = state.get("missing_parameters", [])
 
+    skill = _get_skill_for_intent(intent) or {}
+    described = [_describe_field(skill, f) for f in missing]
     prompt = (
         f"You are an ERPNext AI Assistant.\n"
         f"We are running the skill: '{intent}'.\n"
-        f"The following required parameters are missing: {missing}.\n"
+        f"The following required parameters are missing or invalid: {described}.\n"
         f"Write a friendly, concise request asking the user to provide these missing details."
     )
 
@@ -2079,15 +2166,19 @@ def call_generic_tool_node(state: AgentState):
                         val = val.replace(f"%{{{k}}}%", f"%{v}%").replace(f"{{{k}}}", str(v))
                 formatted_filters.append([field_name, op, val])
 
-        # Optional filters
+        # Optional filters. Three elements filter the doctype itself; four elements
+        # ([child doctype, field, op, value]) filter on a child table row, e.g. POs that
+        # contain an item: ["Purchase Order Item", "item_code", "=", "{item_code}"].
         for opt in query_def.get("optional_filters", []):
             field_name = opt.get("field")
             if field_name and collected.get(field_name):
                 flt = opt.get("filter")
-                if isinstance(flt, list) and len(flt) == 3:
-                    f_name, op, template_val = flt
+                if isinstance(flt, list) and len(flt) in (3, 4):
+                    template_val = flt[-1]
                     val = str(template_val).replace(f"%{{{field_name}}}%", f"%{collected.get(field_name)}%").replace(f"{{{field_name}}}", str(collected.get(field_name)))
-                    formatted_filters.append([f_name, op, val])
+                    formatted_filters.append(list(flt[:-1]) + [val])
+                else:
+                    logger.error(f"[Step 7] Skill '{intent}' has a malformed optional filter {flt!r}; it was not applied.")
 
         parameters = {
             "filters": formatted_filters,
@@ -2130,7 +2221,7 @@ def call_generic_tool_node(state: AgentState):
         # The LLM extracts these from the user's query during collect_parameters_node.
         # Defaults (docstatus=1 filter for "submitted only") are applied in the skill instructions
         # and surfaced here for the tool call.
-        query_type = collected.get("query_type", "best_selling_item_qty")
+        query_type = collected.get("query_type") or "best_selling_item_qty"
         # Determine group_by and metric based on query_type
         _agg_variant_map = {
             "best_selling_item_qty":  {"group_by": "item_code", "metric": "qty",         "aggregation_fn": "sum", "sort": "qty desc"},
@@ -2141,20 +2232,32 @@ def call_generic_tool_node(state: AgentState):
             "total_sales_period":     {"group_by": "transaction_date", "metric": "grand_total", "aggregation_fn": "sum", "sort": "transaction_date asc"},
             "order_count_by_status":  {"group_by": "status",     "metric": "name",        "aggregation_fn": "count", "sort": "name desc"},
         }
-        # Allow LLM-extracted overrides to take precedence over variant defaults
-        variant_defaults = _agg_variant_map.get(query_type, _agg_variant_map["best_selling_item_qty"])
-        agg_group_by = collected.get("group_by") or variant_defaults["group_by"]
-        agg_metric = collected.get("metric") or variant_defaults["metric"]
-        agg_fn = collected.get("aggregation_fn") or variant_defaults["aggregation_fn"]
-        agg_sort = collected.get("sort") or variant_defaults["sort"]
-
-        # Enforce correct parent-level metric mappings (LLM might incorrectly extract 'amount' from 'value' for parent-level aggregate)
-        if query_type in ("top_customer_value", "total_sales_period"):
-            if agg_metric == "amount":
-                agg_metric = "grand_total"
-            if agg_sort and "amount" in agg_sort:
-                agg_sort = agg_sort.replace("amount", "grand_total")
-        agg_limit = int(collected.get("limit") or 10)
+        if query_type not in _agg_variant_map:
+            msg = (f"Unknown analytics report type '{query_type}'. "
+                   f"Supported types: {', '.join(_agg_variant_map)}.")
+            logger.error(f"[Step 7] {msg}")
+            return {
+                "target_tool": tool,
+                "target_doctype": doctype_name,
+                "tool_raw_response": {"success": False, "data": None, "error": msg},
+                "failure_classification": "validation_error",
+                "final_response": msg,
+            }
+        # query_type alone decides grouping, metric and sort. Free-form overrides from the
+        # LLM (e.g. metric="count") produced queries ERPNext rejects, so they are ignored.
+        variant_defaults = _agg_variant_map[query_type]
+        ignored = {k: collected[k] for k in ("group_by", "metric", "aggregation_fn", "sort") if collected.get(k)}
+        if ignored:
+            logger.info(f"[Step 7] Ignoring analytics overrides {ignored}; query_type '{query_type}' defines them.")
+        agg_group_by = variant_defaults["group_by"]
+        agg_metric = variant_defaults["metric"]
+        agg_fn = variant_defaults["aggregation_fn"]
+        agg_sort = variant_defaults["sort"]
+        try:
+            agg_limit = int(collected.get("limit") or 10)
+        except (TypeError, ValueError):
+            logger.warning(f"[Step 7] Unusable limit {collected.get('limit')!r}; using 10.")
+            agg_limit = 10
         # Use the doctype declared by the skill (e.g. 'Sales Order Item' or 'Sales Order')
         # For top_customer_value/count and total_sales_period, the skill should declare 'Sales Order'
         if query_type in ("top_customer_value", "top_customer_count", "total_sales_period", "order_count_by_status"):
@@ -2164,13 +2267,19 @@ def call_generic_tool_node(state: AgentState):
         date_from = collected.get("date_from")
         date_to = collected.get("date_to")
         status_filter = collected.get("status_filter", "submitted")  # default: submitted only
+        if query_type == "order_count_by_status" and status_filter == "submitted":
+            # Counting orders per status only makes sense across statuses; restricting it
+            # to submitted orders would always report zero drafts.
+            status_filter = "all"
         # Apply docstatus filter: submitted=1 (ERP convention for "actual sales")
-        # IMPORTANT: This default is intentional — see SKILL.md for override instructions.
+        # IMPORTANT: This default is intentional; see SKILL.md for override instructions.
         if status_filter == "submitted":
             agg_filters.append(["docstatus", "=", "1"])
         elif status_filter == "draft":
             agg_filters.append(["docstatus", "=", "0"])
-        # "all" means no docstatus filter
+        else:
+            # "all": drafts and submitted orders. Cancelled orders are never sales.
+            agg_filters.append(["docstatus", "<", "2"])
         if date_from:
             agg_filters.append(["transaction_date", ">=", str(date_from)])
         if date_to:
@@ -2327,7 +2436,11 @@ def call_generic_tool_node(state: AgentState):
     tool_status = tool_res.get("status")
     failure_classification = None
 
-    if tool_status == "not_found" or tool_status == "empty":
+    if tool_status == "empty" and state.get("chain_plan") and tool in ("get_list", "aggregate"):
+        # Inside a chain an empty list is a result later steps can use: no Bin rows means
+        # no stock, which a condition like "if stock < 5" must see as 0, not as a failure.
+        failure_classification = None
+    elif tool_status == "not_found" or tool_status == "empty":
         failure_classification = "not_found"
     elif tool_status == "permission_denied":
         failure_classification = "permission_denied"
@@ -2562,7 +2675,8 @@ def result_validation_node(state: AgentState):
             updates["resolved_entities"] = {}
             updates["preconditions_validated"] = None
             updates["bulk_operation_scope"] = None
-            updates["pending_confirmation"] = None
+            # pending_confirmation is left alone: it may belong to an earlier step that is
+            # still awaiting the user's answer (only the gate clears it).
         
     elif write_verified and pending_steps:
         messages = state.get("messages", [])
@@ -2698,7 +2812,18 @@ def format_agent_message_node(state: AgentState):
     # Write intents must never be stored here — the router will never resume them.
     tool_name = skill.get("tool", "")
     is_write = tool_name in _WRITE_TOOLS
-    if not is_write and skill.get("follow_up_eligible", False):
+    if is_write:
+        # The newest result is this write; an older read is no longer the thing the
+        # user is following up on.
+        updates["last_turn_context"] = None
+        if (tool_name == "create_document" and not state.get("chain_plan") and isinstance(data, dict)
+                and str(data.get("docstatus")) == "0" and data.get("name")):
+            offer = _submit_offer(state, doctype_name, data["name"])
+            if offer:
+                updates["pending_confirmation"] = offer[0]
+                updates["final_response"] = f"{updates['final_response']}\n\n{offer[1]}"
+                updates["messages"] = [AIMessage(content=updates["final_response"])]
+    elif skill.get("follow_up_eligible", False):
         follow_up_slots = skill.get("follow_up_slots", [])
         updates["last_turn_context"] = build_last_turn_context(
             skill_name=intent,
@@ -2976,6 +3101,8 @@ def _step_scoped_reset() -> dict:
         "escalation_reason": None,
         "confirmation_result": None,
         "final_response": "",
+        "invalid_parameters": {},
+        "step_input_reply": False,
     }
 
 
@@ -3071,7 +3198,7 @@ def _select_next_step(plan: list, status: Dict[str, dict]) -> Optional[int]:
                     "status": "skipped",
                     "message": (
                         f"It depends on step {d + 1} ({status[str(d)].get('label') or _step_label(plan[d])}), "
-                        f"which was {status[str(d)]['status']}."
+                        f"which {'failed' if status[str(d)]['status'] == 'failed' else 'was ' + status[str(d)]['status']}."
                     ),
                     "label": _step_label(step),
                     "reported": False,
@@ -3139,7 +3266,8 @@ def _render_done_step(step: dict, rec: dict) -> str:
 
     if isinstance(output, list):
         if not output:
-            return f"**{label}**\nNo records found."
+            text = _safe_template(skill.get("not_found_message", ""), rec.get("slots") or {})
+            return text or f"**{label}**\nNo records found."
         if all(isinstance(r, dict) for r in output):
             columns = (skill.get("query_parameters") or {}).get("fields")
             return f"**{label}**\n\n" + _render_rows(output, columns)
@@ -3152,6 +3280,53 @@ def _render_done_step(step: dict, rec: dict) -> str:
             f"- **{k.replace('_', ' ').title()}**: {_fmt_cell(output[k])}" for k in keys
         )
     return f"**{label}**\n{_fmt_cell(output)}"
+
+
+def _submit_offer(state: AgentState, doctype: str, name: str) -> Optional[Tuple[dict, str]]:
+    """
+    After a document is created as a Draft, offer to submit it as a pending action, so
+    the user is reminded and a plain "yes" submits it. Only when a submit skill exists
+    for the doctype and the user's roles allow it. The offer goes through the same
+    gate, RBAC re-check and preconditions as any other confirmation.
+    Returns (pending record, prompt text) or None.
+    """
+    if not doctype or not name:
+        return None
+    submit_skill = next(
+        (sk for sk in loaded_skills if sk.get("tool") == "submit_document" and sk.get("doctype") == doctype),
+        None,
+    )
+    if not submit_skill:
+        return None
+    allowed, _ = _check_role_access(state.get("user_roles") or [], submit_skill)
+    if not allowed:
+        return None
+    pending = {
+        "operation": "submit",
+        "doctype": doctype,
+        "target_name": name,
+        "is_bulk": False,
+        "is_offer": True,
+        "scope_description": f"Do you want me to submit {doctype} '{name}' now?",
+        "requested_at": len(state.get("messages", [])),
+        "requested_at_ts": datetime.now(timezone.utc).isoformat(),
+        "requested_by": state.get("user_sub"),
+        "requested_roles": list(state.get("user_roles") or []),
+        "skill": submit_skill["name"],
+        "params": {"name": name},
+        "resolved_entities": {},
+        "step_index": None,
+        "chain_id": None,
+        "reask_count": 0,
+    }
+    prompt = (
+        f"**Submit it now?** {doctype} '{name}' stays a Draft until it is submitted, and a submitted "
+        f"{doctype} can only be cancelled, not edited.\n\n"
+        f"Reply **Yes** to submit it, or **No** to keep it as a Draft."
+    )
+    log_audit_event("submit", doctype, name, "pending", user_id=state.get("user_sub") or "unknown",
+                    details="offered after create")
+    return pending, prompt
 
 
 def _not_executed_message(pending: dict) -> str:
@@ -3177,9 +3352,11 @@ def _compose_chain_turn(state: AgentState, plan: list, status: Dict[str, dict]) 
     """
     sections = []
     last_read_done = None
+    wrote_this_turn = False
+    created_draft = None
     for i, step in enumerate(plan):
         rec = status.get(str(i))
-        if not rec or rec.get("status") == "awaiting_confirmation":
+        if not rec or rec.get("status") in ("awaiting_confirmation", "awaiting_input", "deferred"):
             continue
         if rec.get("status") == "done":
             skill = _get_skill_for_intent(step.get("skill", "")) or {}
@@ -3192,6 +3369,13 @@ def _compose_chain_turn(state: AgentState, plan: list, status: Dict[str, dict]) 
         msg = rec.get("message", "")
         if st == "done":
             sections.append(_render_done_step(step, rec))
+            step_skill = _get_skill_for_intent(step.get("skill", "")) or {}
+            if _is_write_intent(step_skill):
+                wrote_this_turn = True
+                out = rec.get("output")
+                if (step_skill.get("tool") == "create_document" and isinstance(out, dict)
+                        and str(out.get("docstatus")) == "0" and out.get("name")):
+                    created_draft = (step_skill.get("doctype"), out["name"])
         elif st == "failed" and rec.get("verbatim"):
             sections.append(msg)
         elif st == "failed":
@@ -3203,13 +3387,16 @@ def _compose_chain_turn(state: AgentState, plan: list, status: Dict[str, dict]) 
         rec["reported"] = True
 
     pending = state.get("pending_confirmation")
-    waiting = [i for i in range(len(plan)) if str(i) not in status]
+    pending_input = state.get("pending_input")
+    waiting = [i for i in range(len(plan)) if str(i) not in status or status[str(i)].get("status") == "deferred"]
+    after = ("\n\nAfter that I will also run: " + "; ".join(_step_label(plan[i]) for i in waiting) + ".") if waiting else ""
     if pending:
-        prompt = pending.get("scope_description", "")
-        if waiting:
-            prompt += "\n\nAfter that I will also run: " + "; ".join(_step_label(plan[i]) for i in waiting) + "."
-        prompt += "\n\nReply **Yes** to confirm, or **No** to cancel."
-        sections.append(prompt)
+        sections.append(pending.get("scope_description", "") + after + "\n\nReply **Yes** to confirm, or **No** to cancel.")
+    elif pending_input:
+        sections.append(
+            pending_input.get("question", "") + after
+            + "\n\nReply with the details, or **cancel** to skip this step."
+        )
     elif waiting:
         # Nothing is pending yet steps are still queued: their dependencies can never
         # complete. Report it instead of leaving them silently unrun.
@@ -3222,13 +3409,25 @@ def _compose_chain_turn(state: AgentState, plan: list, status: Dict[str, dict]) 
     updates = {
         "chain_step_status": status,
         "final_response": "\n\n".join(s for s in sections if s) or "There was nothing left to run for this request.",
-        "is_workflow_complete": not pending,
+        "is_workflow_complete": not (pending or pending_input),
         # Failures are per step; the chain itself is never aborted mid-way.
         "chain_aborted": False,
         "detected_intent": "",
         "collected_fields": {},
     }
-    if not pending and last_read_done:
+    if created_draft and not pending and not pending_input and not waiting:
+        plan_submits = any(
+            (_get_skill_for_intent(st.get("skill", "")) or {}).get("tool") == "submit_document"
+            and (_get_skill_for_intent(st.get("skill", "")) or {}).get("doctype") == created_draft[0]
+            for st in plan
+        )
+        offer = None if plan_submits else _submit_offer(state, *created_draft)
+        if offer:
+            updates["pending_confirmation"] = offer[0]
+            updates["final_response"] += "\n\n" + offer[1]
+    if wrote_this_turn:
+        updates["last_turn_context"] = None
+    elif not pending and not pending_input and last_read_done:
         step, rec, skill = last_read_done
         if skill.get("follow_up_eligible", False):
             updates["last_turn_context"] = build_last_turn_context(
@@ -3315,6 +3514,7 @@ def _discard_pending(base: dict, note: str, reply_kind: str) -> dict:
     upd.update(_CHAIN_CLEARED)
     upd.update({
         "pending_confirmation": None,
+        "pending_input": None,
         "detected_intent": "",
         "collected_fields": {},
         "resolved_entities": {},
@@ -3344,7 +3544,11 @@ def pending_action_gate_node(state: AgentState):
     pending = state.get("pending_confirmation")
     messages = state.get("messages", [])
     reply = messages[-1].content if messages else ""
-    base = {"turn_notes": [], "chain_resumed": False, "confirmed_action": None, "confirmation_result": None}
+    base = {"turn_notes": [], "chain_resumed": False, "confirmed_action": None, "confirmation_result": None,
+            "step_input_reply": False}
+
+    if not pending and state.get("pending_input"):
+        return _answer_pending_input(state, reply, base)
 
     if not pending:
         upd = dict(base)
@@ -3403,6 +3607,12 @@ def pending_action_gate_node(state: AgentState):
             "is_workflow_complete": False,
         }
 
+    # An offer (e.g. "submit the draft you just created?") is optional: a reply that is not
+    # yes/no drops it without a re-ask and is handled as a new request.
+    if pending.get("is_offer") and reply_kind == "other":
+        log_audit_event(op, doctype, target, "rejected", user_id=user_sub, details="offer not taken up")
+        return _discard_pending(base, "", "other")
+
     # Expiry.
     try:
         requested_at = datetime.fromisoformat(pending["requested_at_ts"])
@@ -3448,6 +3658,7 @@ def pending_action_gate_node(state: AgentState):
         })
         if in_chain:
             upd["chain_step_index"] = pending["step_index"]
+            upd["chain_step_status"] = _requeue_deferred(_get_step_status(state))
         if pending.get("is_bulk"):
             upd["bulk_operation_scope"] = {
                 "doctype": doctype,
@@ -3463,7 +3674,7 @@ def pending_action_gate_node(state: AgentState):
         if in_chain:
             plan = state.get("chain_plan") or []
             idx = pending["step_index"]
-            status = _get_step_status(state)
+            status = _requeue_deferred(_get_step_status(state))
             status[str(idx)] = {
                 "status": "cancelled",
                 "message": outcome,
@@ -3480,11 +3691,16 @@ def pending_action_gate_node(state: AgentState):
                 "is_workflow_complete": False,
             })
             return upd
+        if pending.get("is_offer"):
+            outcome = (f"OK, {doctype} '{target}' stays a Draft. "
+                       f"You can submit it later by asking me to submit {doctype} {target}.")
+        else:
+            outcome = f"Cancelled. {outcome}"
         return {
             **base,
             "gate_route": "format_response",
             "pending_confirmation": None,
-            "final_response": f"Cancelled. {outcome}",
+            "final_response": outcome,
             "detected_intent": "",
             "collected_fields": {},
             "resolved_entities": {},
@@ -3523,11 +3739,23 @@ def pending_action_gate_node(state: AgentState):
 # Compound Chaining Nodes (Phase 2)
 # =========================================================================
 
+def _skill_outputs(skill: Dict[str, Any]) -> List[str]:
+    """Fields a later step can reference as $stepN.<field>."""
+    if _is_write_intent(skill):
+        return ["name"]
+    fields = list(skill.get("outputs") or (skill.get("query_parameters") or {}).get("fields") or [])
+    return fields or ["name"]
+
+
 def _planner_skill_line(skill: Dict[str, Any]) -> str:
     kind = "write" if _is_write_intent(skill) else "read"
     req = ", ".join(skill.get("required_fields", [])) or "none"
     opt = ", ".join(skill.get("optional_fields", [])) or "none"
-    return f"- {skill['name']} ({kind}; required: {req}; optional: {opt}): {skill.get('description', '')}"
+    line = (f"- {skill['name']} ({kind}; required: {req}; optional: {opt}; "
+            f"outputs: {', '.join(_skill_outputs(skill))}): {' '.join(str(skill.get('description', '')).split())}")
+    for field, options in (skill.get("field_values") or {}).items():
+        line += f"\n    {field} must be exactly one of: {', '.join(options)}"
+    return line
 
 
 def plan_compound_chain_node(state: AgentState):
@@ -3539,19 +3767,38 @@ def plan_compound_chain_node(state: AgentState):
     last_msg = messages[-1].content
     skills_list = "\n".join(_planner_skill_line(s) for s in loaded_skills)
 
+    today = datetime.now().date()
     prompt = f"""You are a compound request planner for an ERPNext AI assistant.
-The user has asked for a complex or multi-step request. Decompose it into an ordered list of steps.
-MAX_CHAIN_STEPS = {MAX_CHAIN_STEPS}.
-Available skills (with their exact field names):
+The user has asked for a multi-step request. Decompose it into an ordered list of steps.
+MAX_CHAIN_STEPS = {MAX_CHAIN_STEPS}. Today's date is {today.isoformat()}.
+Available skills (exact field names; "outputs" are the fields later steps can reference):
 {skills_list}
 
 For each step, provide:
-- "skill": the skill name
-- "slots": dictionary of parameters directly mentioned by the user, using the exact field names listed for that skill (do NOT guess supplier or qty if not provided). For a skill that requires "items", give a list of {{"item_code": ..., "qty": ..., "rate": ... (optional)}}.
-- "uses": dictionary mapping a slot name to a previous step's output, e.g., {{"name": "$step0.name"}}. Use this whenever a step needs a value produced by an earlier step. Never put $step references inside "slots".
-- "condition": optional dictionary if the step is conditional. e.g., {{"field": "$step0.actual_qty", "operator": "<="}} (Only specify "value" if the user explicitly provided a number in their message. Otherwise omit "value" and the system default will be used.)
+- "skill": the skill name.
+- "slots": parameters for this step that the user stated, using that skill's exact field names.
+  Fields with a fixed list of values must use one of those values exactly.
+  Resolve relative dates ("last 4 months", "this year") to YYYY-MM-DD using today's date (date_from / date_to).
+  Never guess values the user did not give (supplier, customer, quantities); leave them out and the
+  system will ask the user. For a skill that requires "items", give [{{"item_code": ..., "qty": ...}}];
+  if the item comes from an earlier step, put "qty" in slots and the item in "uses".
+- "uses": slot name -> an earlier step's output, as "$stepN.<output field>" (N is the 0-based step index).
+  When an earlier step returns a ranked list, $stepN.<field> is its first (top) row. Never put
+  $step references inside "slots".
+- "condition": null, or {{"field": "$stepN.<output field>", "operator": "<" | "<=" | ">" | ">=" | "==", "value": <number>}}
+  when the user asked for the step only if something holds. Use the number the user gave; omit
+  "value" only if they gave none. For stock conditions use the check-inventory output actual_qty
+  (the system totals it across warehouses).
 
-Only include steps the user asked for. Never add a submit, cancel or delete step unless the user explicitly asked for it.
+Rules:
+- Include every step the user asked for, in order, even when details are missing. Never drop a step.
+- Never add a step the user did not ask for. Never add submit, cancel or delete unless explicitly asked.
+
+Example: "find our top customer this year and show their order history" ->
+{{"steps": [
+  {{"skill": "sales-analytics-report", "slots": {{"query_type": "top_customer_value", "date_from": "{today.year}-01-01", "date_to": "{today.isoformat()}"}}, "uses": {{}}, "condition": null}},
+  {{"skill": "customer-order-history", "slots": {{}}, "uses": {{"customer": "$step0.customer"}}, "condition": null}}
+]}}
 
 User request: "{last_msg}"
 
@@ -3747,16 +3994,22 @@ def _prepare_single_step(state: AgentState, plan: list, idx: int, results: dict)
                     if dep_skill.get("doctype") == skill.get("doctype") and dep_out.get("name"):
                         slots[id_field] = dep_out["name"]
                         break
-        # Child rows given as flat slots (item_code/qty) by the planner.
-        if "items" in required and not slots.get("items") and slots.get("item_code"):
-            row = {"item_code": slots["item_code"]}
+        # Child rows given as flat slots (item_code/qty) by the planner, or a single row
+        # whose item comes from an earlier step ("items": [{"qty": 50}] + uses item_code).
+        if "items" in required and slots.get("item_code"):
+            flat = {"item_code": slots["item_code"]}
             qty = slots.get("qty", slots.get("quantity"))
             if qty is not None:
-                row["qty"] = qty
+                flat["qty"] = qty
             for extra in ("rate", "uom"):
                 if slots.get(extra) is not None:
-                    row[extra] = slots[extra]
-            slots["items"] = [row]
+                    flat[extra] = slots[extra]
+            rows = slots.get("items")
+            if not rows:
+                slots["items"] = [flat]
+            elif isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
+                # Only an unambiguous single row is completed; existing values win.
+                slots["items"] = [{**flat, **{k: v for k, v in rows[0].items() if v not in (None, "")}}]
 
     return {"ready": True, "skill": skill_name, "slots": slots}
 
@@ -3777,6 +4030,13 @@ def prepare_chain_step_node(state: AgentState):
         if idx is None:
             return _compose_chain_turn(state, plan, status)
 
+        # One question to the user at a time: while a confirmation or a request for details
+        # is open, a write step waits and is re-queued when the user answers.
+        if (state.get("pending_confirmation") or state.get("pending_input")) and \
+                _is_write_intent(_get_skill_for_intent(plan[idx].get("skill", "")) or {}):
+            status[str(idx)] = {"status": "deferred", "label": _step_label(plan[idx]), "reported": False}
+            continue
+
         prepared = _prepare_single_step(state, plan, idx, results)
         if not prepared["ready"]:
             status[str(idx)] = {
@@ -3796,6 +4056,143 @@ def prepare_chain_step_node(state: AgentState):
             "is_workflow_complete": False,
         })
         return updates
+
+
+def _requeue_deferred(status: Dict[str, dict]) -> Dict[str, dict]:
+    """Steps deferred while the user was being asked something run again once they answer."""
+    return {k: v for k, v in status.items() if v.get("status") != "deferred"}
+
+
+def _input_question(skill: Dict[str, Any], label: str, missing: list, invalid: dict, again: bool) -> str:
+    wanted = ", ".join(f"**{_describe_field(skill, f)}**" for f in missing)
+    bad = "".join(f" '{v}' is not a valid {f.replace('_', ' ')}." for f, v in (invalid or {}).items())
+    lead = "I still need" if again else "I need"
+    return f"To run **{label}**, {lead}: {wanted}.{bad}"
+
+
+def request_step_input_node(state: AgentState):
+    """
+    A chain step lacks required details. Ask the user instead of failing it: the step
+    pauses (awaiting_input), independent steps keep running, and the user's next reply
+    fills the gap before the step and everything that depends on it resumes.
+    A second reply that still lacks the details cancels the step. Pure Python.
+    """
+    plan = state.get("chain_plan") or []
+    idx = state.get("chain_step_index") or 0
+    step = plan[idx] if 0 <= idx < len(plan) else {"skill": state.get("detected_intent", "")}
+    skill = _get_skill_for_intent(step.get("skill", "")) or {}
+    collected = {k: v for k, v in (state.get("collected_fields") or {}).items() if not str(k).startswith("_")}
+    missing = list(state.get("missing_parameters") or [])
+    label = _step_label(step, collected)
+    status = _get_step_status(state)
+    existing = state.get("pending_input")
+    answering = bool(state.get("step_input_reply")) and bool(existing) and existing.get("step_index") == idx
+
+    updates = _step_scoped_reset()
+    if answering and (existing.get("reask_count") or 0) >= 1:
+        fields = ", ".join(f.replace("_", " ") for f in missing)
+        status[str(idx)] = {
+            "status": "cancelled",
+            "message": f"The required details ({fields}) were still missing, so this step was not run.",
+            "label": label,
+            "reported": False,
+        }
+        log_audit_event("chain_step", step.get("skill", "unknown"), state.get("chain_id") or "unknown", "rejected",
+                        user_id=state.get("user_sub") or "unknown", details=f"index={idx}, missing={missing}")
+        updates.update({"chain_step_status": status, "pending_input": None, "is_workflow_complete": False})
+        return updates
+
+    if not answering and (state.get("pending_confirmation") or existing):
+        # Another question is already open this turn; ask this one after it is answered.
+        status[str(idx)] = {"status": "deferred", "label": label, "reported": False}
+        updates.update({"chain_step_status": status, "is_workflow_complete": False})
+        return updates
+
+    status[str(idx)] = {"status": "awaiting_input", "label": label, "reported": False}
+    updates.update({
+        "chain_step_status": status,
+        "pending_input": {
+            "skill": step.get("skill", ""),
+            "step_index": idx,
+            "chain_id": state.get("chain_id"),
+            "slots": copy.deepcopy(collected),
+            "missing": missing,
+            "question": _input_question(skill, label, missing, state.get("invalid_parameters") or {}, answering),
+            "requested_by": state.get("user_sub"),
+            "requested_at_ts": datetime.now(timezone.utc).isoformat(),
+            "reask_count": ((existing.get("reask_count") or 0) + 1) if answering else 0,
+        },
+        "is_workflow_complete": False,
+    })
+    return updates
+
+
+def _answer_pending_input(state: AgentState, reply: str, base: dict) -> dict:
+    """Gate branch for a reply to a chain step's request for missing details."""
+    pending = state["pending_input"]
+    user_sub = state.get("user_sub")
+    skill_name = pending.get("skill") or "unknown"
+    plan = state.get("chain_plan") or []
+    reply_kind = _classify_confirmation_reply(reply)
+
+    def _drop(note):
+        upd = _discard_pending(base, note, reply_kind)
+        upd["pending_input"] = None
+        return upd
+
+    malformed = [k for k in ("skill", "step_index", "requested_by", "requested_at_ts") if k not in pending]
+    if malformed or not plan or not (0 <= int(pending.get("step_index", -1)) < len(plan)):
+        logger.error(f"[Gate] Pending input request is unusable (missing={malformed}, plan={bool(plan)}); discarding.")
+        return _drop("The earlier request that was waiting for details could not be resumed and was discarded. Nothing was executed.")
+
+    if not user_sub or pending.get("requested_by") != user_sub:
+        logger.warning(f"[Gate] {user_sub!r} tried to answer a request for details made by {pending.get('requested_by')!r}.")
+        return {**base, "gate_route": "format_response", "is_workflow_complete": False,
+                "final_response": "This conversation is waiting for details from the user who made the request. Only that user can continue it."}
+
+    try:
+        asked_at = datetime.fromisoformat(pending["requested_at_ts"])
+        if asked_at.tzinfo is None:
+            asked_at = asked_at.replace(tzinfo=timezone.utc)
+        expired = (datetime.now(timezone.utc) - asked_at).total_seconds() / 60 > PENDING_CONFIRMATION_MAX_MINUTES
+    except (TypeError, ValueError) as exc:
+        logger.error(f"[Gate] Unparseable pending input timestamp {pending.get('requested_at_ts')!r}: {exc}; treating as expired.")
+        expired = True
+    if expired:
+        log_audit_event("chain_step", skill_name, pending.get("chain_id") or "unknown", "expired", user_id=user_sub)
+        return _drop(f"The earlier request was waiting for details for more than {PENDING_CONFIRMATION_MAX_MINUTES} minutes "
+                     "and was discarded. Its remaining steps were not run.")
+
+    idx = int(pending["step_index"])
+    status = _requeue_deferred(_get_step_status(state))
+    upd = dict(base)
+    upd.update(_step_scoped_reset())
+
+    if reply_kind == "no":
+        status[str(idx)] = {
+            "status": "cancelled",
+            "message": "You chose not to provide the details, so this step was not run.",
+            "label": _step_label(plan[idx], pending.get("slots")),
+            "reported": False,
+        }
+        log_audit_event("chain_step", skill_name, pending.get("chain_id") or "unknown", "rejected", user_id=user_sub)
+        upd.update({"gate_route": "prepare_chain_step", "pending_input": None, "chain_step_status": status,
+                    "chain_resumed": True, "is_workflow_complete": False})
+        return upd
+
+    # The reply is the answer for this one step: extract from it on top of the step's
+    # stored slots. Later steps this turn still use only their own stored slots.
+    upd.update({
+        "gate_route": "collect_parameters",
+        "detected_intent": skill_name,
+        "collected_fields": copy.deepcopy(pending.get("slots") or {}),
+        "chain_step_index": idx,
+        "chain_step_status": status,
+        "chain_resumed": True,
+        "step_input_reply": True,
+        "is_workflow_complete": False,
+    })
+    return upd
 
 
 def fail_chain_step_node(state: AgentState):
@@ -3863,8 +4260,8 @@ def route_after_validation(state: AgentState) -> str:
     if state.get("all_required_filled"):
         return "entity_resolution_and_read_rbac"
     if state.get("chain_plan"):
-        # Chain steps never pause to ask: other steps keep running and the gap is reported.
-        return "fail_chain_step"
+        # The step pauses and asks; independent steps keep running meanwhile.
+        return "request_step_input" if state.get("missing_parameters") else "fail_chain_step"
     return "ask_for_missing_info"
 
 
@@ -3995,6 +4392,7 @@ workflow.add_node("classify_intent",                   classify_intent_node)
 workflow.add_node("plan_compound_chain",               plan_compound_chain_node)        # Compound step planner
 workflow.add_node("prepare_chain_step",                prepare_chain_step_node)         # Compound step selector / turn composer
 workflow.add_node("fail_chain_step",                   fail_chain_step_node)            # Chain step stopped before execution
+workflow.add_node("request_step_input",                request_step_input_node)         # Chain step asks for missing details
 workflow.add_node("collect_parameters",                collect_parameters_node)
 workflow.add_node("validate_parameters",               validate_parameters_node)
 workflow.add_node("ask_for_missing_info",              ask_for_missing_info_node)
@@ -4024,6 +4422,7 @@ workflow.add_conditional_edges(
         "resolve_followup": "resolve_followup",
         "write_rbac_gate": "write_rbac_gate",
         "prepare_chain_step": "prepare_chain_step",
+        "collect_parameters": "collect_parameters",
         "format_response": "format_response",
     }
 )
@@ -4074,6 +4473,7 @@ workflow.add_conditional_edges(
 
 # fail_chain_step → prepare_chain_step (next runnable step, or compose the turn)
 workflow.add_edge("fail_chain_step", "prepare_chain_step")
+workflow.add_edge("request_step_input", "prepare_chain_step")
 
 # collect_parameters → validate_parameters | format_response
 workflow.add_conditional_edges(
@@ -4092,6 +4492,7 @@ workflow.add_conditional_edges(
     {
         "ask_for_missing_info": "ask_for_missing_info",
         "fail_chain_step": "fail_chain_step",
+        "request_step_input": "request_step_input",
         "entity_resolution_and_read_rbac": "entity_resolution_and_read_rbac",
     }
 )

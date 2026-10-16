@@ -2,39 +2,38 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatLogoIcon } from "../chat/chat-icons";
 import { ChatUI } from "../chat/chat-ui";
 
+const FOCUSABLE = "textarea, input, button, [href], select, [tabindex]:not([tabindex='-1'])";
+
 export function DeskAssistantShell() {
 	const [isOpen, setIsOpen] = useState(false);
-	const [isExpanded, setIsExpanded] = useState(false);
 	const toggleButtonRef = useRef<HTMLButtonElement>(null);
-	const sidebarRef = useRef<HTMLDivElement>(null);
+	const windowRef = useRef<HTMLDivElement>(null);
+	const wasOpenRef = useRef(false);
 
 	const closeAssistant = useCallback(() => {
 		setIsOpen(false);
 	}, []);
 
-	const toggleAssistant = useCallback(() => {
-		setIsOpen(previousState => !previousState);
+	const openAssistant = useCallback(() => {
+		setIsOpen(true);
 	}, []);
 
-	const toggleExpand = useCallback(() => {
-		setIsExpanded(previousState => !previousState);
-	}, []);
-
+	// Return focus to the launcher when the window closes.
 	useEffect(() => {
-		if (!isOpen) {
-			toggleButtonRef.current?.focus();
-			return;
-		}
+		if (!isOpen && wasOpenRef.current) toggleButtonRef.current?.focus();
+		wasOpenRef.current = isOpen;
+	}, [isOpen]);
 
-		const frame = window.requestAnimationFrame(() => {
-			const firstFocusable = sidebarRef.current?.querySelector<HTMLElement>(
-				"textarea, button, [href], input, select, [tabindex]:not([tabindex='-1'])"
-			);
+	// The window covers the whole Desk, so the page behind it should not scroll.
+	useEffect(() => {
+		if (!isOpen) return;
 
-			firstFocusable?.focus();
-		});
+		const previousOverflow = document.body.style.overflow;
+		document.body.style.overflow = "hidden";
 
-		return () => window.cancelAnimationFrame(frame);
+		return () => {
+			document.body.style.overflow = previousOverflow;
+		};
 	}, [isOpen]);
 
 	useEffect(() => {
@@ -42,24 +41,24 @@ export function DeskAssistantShell() {
 			if (!isOpen) return;
 
 			if (event.key === "Escape") {
+				// Fields such as the chat rename box use Escape to cancel their own edit.
+				if ((event.target as HTMLElement | null)?.closest?.("[data-local-escape]")) return;
 				event.preventDefault();
+				event.stopPropagation();
 				closeAssistant();
 				return;
 			}
 
 			if (event.key !== "Tab") return;
 
-			const focusableElements = sidebarRef.current?.querySelectorAll<HTMLElement>(
-				"textarea, button, [href], input, select, [tabindex]:not([tabindex='-1'])"
-			);
+			const focusable = Array.from(
+				windowRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []
+			).filter(element => !element.hasAttribute("disabled") && element.offsetParent !== null);
 
-			if (!focusableElements || focusableElements.length === 0) return;
-
-			const focusable = Array.from(focusableElements).filter(element => !element.hasAttribute("disabled"));
 			if (focusable.length === 0) return;
 
 			const activeElement = document.activeElement as HTMLElement | null;
-			const currentIndex = focusable.indexOf(activeElement ?? focusable[0]);
+			const currentIndex = activeElement ? focusable.indexOf(activeElement) : -1;
 			const nextIndex = event.shiftKey
 				? (currentIndex - 1 + focusable.length) % focusable.length
 				: (currentIndex + 1) % focusable.length;
@@ -74,40 +73,30 @@ export function DeskAssistantShell() {
 	}, [closeAssistant, isOpen]);
 
 	return (
-		<div className="desk-assistant" data-open={isOpen} data-expanded={isExpanded}>
+		<div className="desk-assistant" data-open={isOpen}>
 			<div
-				className="desk-assistant__overlay"
+				ref={windowRef}
+				className="desk-assistant__window"
 				data-open={isOpen}
-				onClick={closeAssistant}
-				aria-hidden={!isOpen}
-			/>
-
-			<aside
-				ref={sidebarRef}
-				className="desk-assistant__sidebar"
-				data-open={isOpen}
-				data-expanded={isExpanded}
-				id="ai-assistant-sidebar"
+				id="ai-assistant-window"
 				role="dialog"
 				aria-modal="true"
-				aria-label="AI assistant sidebar"
+				aria-label="AI assistant"
+				aria-hidden={!isOpen}
+				inert={!isOpen}
 			>
-				<ChatUI
-					isActive={isOpen}
-					isExpanded={isExpanded}
-					onClose={closeAssistant}
-					onToggleExpand={toggleExpand}
-				/>
-			</aside>
+				<ChatUI isActive={isOpen} onClose={closeAssistant} />
+			</div>
 
 			<button
 				ref={toggleButtonRef}
 				className="desk-assistant__toggle"
 				type="button"
-				onClick={toggleAssistant}
+				onClick={openAssistant}
 				aria-expanded={isOpen}
-				aria-controls="ai-assistant-sidebar"
-				aria-label={isOpen ? "Close AI assistant" : "Open AI assistant"}
+				aria-controls="ai-assistant-window"
+				aria-label="Open AI assistant"
+				hidden={isOpen}
 			>
 				<ChatLogoIcon className="desk-assistant__toggle-icon" size={18} />
 				<span className="desk-assistant__toggle-text">AI</span>

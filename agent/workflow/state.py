@@ -266,6 +266,17 @@ class AgentState(TypedDict, total=False):
     # Routing decision written by pending_action_gate_node (entry node).
     gate_route: Optional[str]
 
+    # A chain step paused because it lacks required details; the next reply supplies them.
+    # {skill, step_index, chain_id, slots, missing, question, requested_by, requested_at_ts, reask_count}
+    pending_input: Optional[dict]
+
+    # Fields whose value was outside the skill's field_values, {field: rejected value}.
+    invalid_parameters: Optional[dict]
+
+    # True on the turn that answers pending_input: collect_parameters extracts the missing
+    # details from the reply for that one step, on top of its stored slots.
+    step_input_reply: Optional[bool]
+
     # The pending_confirmation record the user just approved. confirmation_node lets
     # exactly this action through to execution, after RBAC and preconditions re-run.
     confirmed_action: Optional[dict]

@@ -36,7 +36,7 @@ response_template: "Successfully submitted Purchase Order: {name}!"
 error_template: "Failed to submit purchase order: {error}"
 examples:
   - "Submit purchase order PUR-ORD-2026-00013"
-  - "Finalize the draft PO for Summit Traders"
+  - "Finalize the draft PO PUR-ORD-2026-00026"
   - "Approve the purchase order PUR-ORD-2026-00014"
 ---
 

@@ -191,19 +191,21 @@ _WRITE_TOOLS = ("create_document", "update_document", "delete_document", "cancel
 
 def build_persisted_state(updated_state: dict) -> dict:
     """
-    What survives to the next request. A pending confirmation and the chain it belongs
-    to are always persisted while pending, regardless of is_workflow_complete, so the
-    next turn can confirm, cancel and resume it. Everything else follows the
-    complete/incomplete rules below.
+    What survives to the next request. A pending confirmation or a pending request for
+    missing details, and the chain it belongs to, are always persisted while pending,
+    regardless of is_workflow_complete, so the next turn can answer it and resume.
+    Everything else follows the complete/incomplete rules below.
     """
     complete = bool(updated_state.get("is_workflow_complete"))
     pending = updated_state.get("pending_confirmation")
+    pending_input = updated_state.get("pending_input")
 
     extra_state = {
         # Survive completed turns: follow-up resolution and "submit it" style references.
         "last_turn_context": updated_state.get("last_turn_context"),
         "last_created_doc": updated_state.get("last_created_doc"),
         "pending_confirmation": pending,
+        "pending_input": pending_input,
     }
     if not complete:
         extra_state.update({
@@ -214,7 +216,7 @@ def build_persisted_state(updated_state: dict) -> dict:
             "bulk_operation_scope": updated_state.get("bulk_operation_scope"),
             "pending_slot_clarification": updated_state.get("pending_slot_clarification"),
         })
-    if pending and updated_state.get("chain_plan") and not updated_state.get("chain_aborted"):
+    if (pending or pending_input) and updated_state.get("chain_plan") and not updated_state.get("chain_aborted"):
         extra_state.update({
             "chain_plan": updated_state.get("chain_plan"),
             "chain_step_index": updated_state.get("chain_step_index"),
@@ -228,7 +230,7 @@ def build_persisted_state(updated_state: dict) -> dict:
     # are not reused by the next request. Read results keep intent/fields so pronoun
     # follow-ups ("what is their customer group?") still work.
     failure = updated_state.get("failure_classification") or ""
-    should_reset = complete and not pending and (
+    should_reset = complete and not pending and not pending_input and (
         updated_state.get("target_tool", "") in _WRITE_TOOLS
         or updated_state.get("detected_intent") == "fallback"
         or failure.startswith("permission_denied")
@@ -319,6 +321,73 @@ async def reset_session(payload: dict = Depends(verify_token)):
         )
     chat_store.reset_session_state(session_id)
     return {"status": "session reset successful"}
+
+
+def _require_sub(payload: dict) -> str:
+    user_sub = payload.get("sub")
+    if not user_sub:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token payload missing required 'sub' claim"
+        )
+    return user_sub
+
+
+@app.get("/conversations")
+async def list_conversations_endpoint(payload: dict = Depends(verify_token)):
+    """The caller's past conversations for the chat history sidebar, newest first."""
+    user_sub = _require_sub(payload)
+    try:
+        return {"conversations": chat_store.list_conversations(user_sub)}
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def conversation_messages_endpoint(conversation_id: str, payload: dict = Depends(verify_token)):
+    user_sub = _require_sub(payload)
+    try:
+        return {"messages": chat_store.get_conversation_messages(conversation_id, user_sub)}
+    except chat_store.ConversationAccessError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+class RenameConversationRequest(BaseModel):
+    title: str
+
+
+@app.patch("/conversations/{conversation_id}")
+async def rename_conversation_endpoint(
+    conversation_id: str, request: RenameConversationRequest, payload: dict = Depends(verify_token)
+):
+    user_sub = _require_sub(payload)
+    try:
+        renamed = chat_store.rename_conversation(conversation_id, user_sub, request.title)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except chat_store.ConversationAccessError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    if not renamed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return {"status": "renamed", "title": " ".join(request.title.split())}
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation_endpoint(conversation_id: str, payload: dict = Depends(verify_token)):
+    user_sub = _require_sub(payload)
+    try:
+        deleted = chat_store.delete_conversation(conversation_id, user_sub)
+    except chat_store.ConversationAccessError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return {"status": "deleted"}
 
 
 # Standalone endpoints for Generic CRUD Tools

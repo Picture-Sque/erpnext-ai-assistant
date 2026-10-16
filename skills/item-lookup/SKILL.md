@@ -1,7 +1,7 @@
 ---
 name: item-lookup
 intent: item-lookup
-description: Look up an ERPNext item record by item code, name, or item group.
+description: Look up an ERPNext item master record (item name, item group, stock UOM, whether it is a stock item) by item code or partial code. Use when the user asks to find, look up, or get details of an item. NOT for stock quantities (use check-inventory).
 allowed_roles:
   - Stock User
   - Stock Manager
@@ -13,8 +13,7 @@ tool: get_list
 doctype: Item
 required_fields:
   - item_code
-optional_fields:
-  - price_list
+optional_fields: []
 query_parameters:
   filters:
     - ["item_code", "like", "%{item_code}%"]
@@ -29,7 +28,6 @@ validation_rules: []
 follow_up_eligible: true
 follow_up_slots:
   - item_code
-  - price_list
 keywords:
   - look up item
   - lookup item
@@ -46,6 +44,7 @@ response_template: |
   - **Item Group**: {item_group}
   - **UOM**: {stock_uom}
 not_found_message: "Item Lookup Result:\n\nUnfortunately, we were unable to find any item matching \"{item_code}\" in our database."
+error_template: "Failed to look up item: {error}"
 examples:
   - "Look up item SKU001"
   - "Find item details for SKU005"
@@ -57,8 +56,12 @@ examples:
 ## When to use
 Trigger this skill when the user wants to look up or verify details about an item in ERPNext.
 
+**IMPORTANT intent boundaries:**
+- Use `check-inventory` for how much of an item is in stock
+- Use THIS skill for item master details
+
 ## Required information
-- **Item Code** or partial name
+- **item_code**: Item code or part of it (matched with LIKE). Entity resolution maps an item name to its code.
 
 ## ERPNext details
 - Doctype: `Item`

@@ -1,88 +1,115 @@
+import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ChatMessage } from "../../types/chat";
-import { UserCircleIcon } from "./chat-icons";
+import { ChatLogoIcon, CheckIcon, CopyIcon } from "./chat-icons";
 
 interface ChatMessageProps {
 	message: ChatMessage;
 }
 
 export function ChatMessageView({ message }: ChatMessageProps) {
-	const isAssistant = message.role === "assistant";
+	if (message.role === "user") {
+		return (
+			<article className="chat-message chat-message--user">
+				<div className="chat-message__bubble" title={message.timestamp}>
+					{message.content}
+				</div>
+			</article>
+		);
+	}
 
 	return (
-		<article className={`chat-message chat-message--${message.role}`}>
-			<div className="chat-message__avatar">
-				{isAssistant ? (
-					<div className="chat-message__avatar-mark" aria-hidden="true">
-						<ChatbotBubbleMark />
-					</div>
-				) : (
-					<div className="chat-message__avatar-user" aria-hidden="true">
-						<UserCircleIcon className="chat-message__user-icon" />
-					</div>
-				)}
-			</div>
+		<article className="chat-message chat-message--assistant" data-error={message.isError ? "true" : undefined}>
+			<span className="chat-message__avatar" aria-hidden="true">
+				<ChatLogoIcon size={16} />
+			</span>
 
 			<div className="chat-message__body">
-				<div className="chat-message__meta">
-					<span className="chat-message__role">{isAssistant ? "Assistant" : "You"}</span>
-					<span className="chat-message__timestamp">{message.timestamp}</span>
+				<div className="chat-markdown">
+					<ReactMarkdown
+						remarkPlugins={[remarkGfm]}
+						components={{
+							table: ({ children }) => (
+								<div className="chat-markdown__table-wrapper">
+									<table className="chat-markdown__table">{children}</table>
+								</div>
+							),
+							pre: ({ children }) => (
+								<pre className="chat-markdown__code-block">{children}</pre>
+							),
+							code: ({ className, children, ...props }: any) => (
+								<code
+									className={className ? `chat-markdown__block-code ${className}` : "chat-markdown__inline-code"}
+									{...props}
+								>
+									{children}
+								</code>
+							),
+							a: ({ href, children }) => (
+								<a
+									href={href}
+									target="_blank"
+									rel="noopener noreferrer"
+									className="chat-markdown__link"
+								>
+									{children}
+								</a>
+							)
+						}}
+					>
+						{message.content}
+					</ReactMarkdown>
 				</div>
 
-				<div className="chat-message__bubble">
-					{isAssistant ? (
-						<div className="chat-markdown">
-							<ReactMarkdown
-								remarkPlugins={[remarkGfm]}
-								components={{
-									table: ({ children }) => (
-										<div className="chat-markdown__table-wrapper">
-											<table className="chat-markdown__table">{children}</table>
-										</div>
-									),
-									pre: ({ children }) => (
-										<pre className="chat-markdown__code-block">{children}</pre>
-									),
-									code: ({ className, children, ...props }: any) => (
-										<code
-											className={className ? `chat-markdown__block-code ${className}` : "chat-markdown__inline-code"}
-											{...props}
-										>
-											{children}
-										</code>
-									),
-									a: ({ href, children }) => (
-										<a
-											href={href}
-											target="_blank"
-											rel="noopener noreferrer"
-											className="chat-markdown__link"
-										>
-											{children}
-										</a>
-									)
-								}}
-							>
-								{message.content}
-							</ReactMarkdown>
-						</div>
-					) : (
-						message.content.split("\n").map((line, index) => (
-							<p key={`${message.id}-${index}`}>{line}</p>
-						))
-					)}
+				<div className="chat-message__actions">
+					<CopyButton text={message.content} />
+					<span className="chat-message__timestamp">{message.timestamp}</span>
 				</div>
 			</div>
 		</article>
 	);
 }
 
-function ChatbotBubbleMark() {
+function CopyButton({ text }: { text: string }) {
+	const [copied, setCopied] = useState(false);
+
+	const copy = async () => {
+		try {
+			await navigator.clipboard.writeText(text);
+			setCopied(true);
+			window.setTimeout(() => setCopied(false), 1500);
+		} catch (error) {
+			console.warn("[Chat Widget] Clipboard write failed:", error);
+		}
+	};
+
 	return (
-		<svg aria-hidden="true" fill="none" height="16" viewBox="0 0 24 24" width="16">
-			<path d="M6.75 4.5h10.5a3.75 3.75 0 0 1 3.75 3.75v2.25a3.75 3.75 0 0 1-3.75 3.75H12l-4.5 3v-3H6.75A3.75 3.75 0 0 1 3 10.5V8.25A3.75 3.75 0 0 1 6.75 4.5Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-			<path d="M8.75 9.75h.01M12 9.75h.01M15.25 9.75h.01" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.2" />
-		</svg>
+		<button
+			className="chat-icon-btn chat-icon-btn--small"
+			type="button"
+			onClick={copy}
+			aria-label={copied ? "Copied" : "Copy response"}
+			title={copied ? "Copied" : "Copy"}
+		>
+			{copied ? <CheckIcon /> : <CopyIcon />}
+		</button>
+	);
+}
+
+export function ChatTypingIndicator() {
+	return (
+		<article className="chat-message chat-message--assistant" aria-live="polite">
+			<span className="chat-message__avatar" aria-hidden="true">
+				<ChatLogoIcon size={16} />
+			</span>
+			<div className="chat-message__body">
+				<div className="chat-typing" aria-label="Assistant is thinking">
+					<span />
+					<span />
+					<span />
+				</div>
+			</div>
+		</article>
 	);
 }

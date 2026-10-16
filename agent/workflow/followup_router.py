@@ -231,6 +231,13 @@ _BACK_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A message that names a document action is a new request for that action, never a
+# parameter tweak of the previous read ("submit it" after a stock check).
+_ACTION_VERB_RE = re.compile(
+    r"\b(?:submit|cancel|delete|create|update|amend)\b",
+    re.IGNORECASE,
+)
+
 # A free-text slot answer longer than this is treated as the user moving on to a new
 # request, not as the value of the slot.
 FREE_VALUE_MAX_WORDS: int = 4
@@ -465,6 +472,10 @@ def resolve_followup_node(state: AgentState) -> dict:
 
         if not _could_be_followup(last_msg):
             logger.info("[FollowupRouter] Priority 2: not elliptical and no back-reference — falling through")
+            return {"_followup_route": "classify_intent"}
+
+        if _ACTION_VERB_RE.search(last_msg):
+            logger.info("[FollowupRouter] Priority 2: message names a document action — new request, falling through")
             return {"_followup_route": "classify_intent"}
 
         skill_name = last_turn_context.get("skill", "")

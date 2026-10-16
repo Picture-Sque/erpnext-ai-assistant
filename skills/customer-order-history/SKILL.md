@@ -56,9 +56,6 @@ keywords:
   - orders from customer
   - orders for customer
   - order history for
-  - all orders from
-  - show orders for
-  - show me orders from
   - orders placed by
   - what has customer ordered
   - customer order history

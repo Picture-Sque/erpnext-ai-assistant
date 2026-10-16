@@ -25,20 +25,20 @@ doctype: Sales Order Item
 required_fields:
   - query_type
 optional_fields:
-  - metric
-  - group_by
-  - sort
   - date_from
   - date_to
   - limit
   - status_filter
 query_parameters:
-  # Computed dynamically by the LLM from query_type
+  # Columns shown for a result, in this order. Which ones appear depends on query_type.
   fields:
     - item_code
+    - customer
+    - transaction_date
+    - status
     - qty
     - amount
-    - parent
+    - grand_total
 defaults:
   # Default: aggregate submitted orders only (docstatus=1), best-selling by quantity, top 10
   - field: query_type
@@ -48,6 +48,32 @@ defaults:
   - field: status_filter
     value: submitted
 validation_rules: []
+# Result columns later chain steps can reference ($stepN.<field>). The group column depends
+# on query_type: item_code for item reports, customer for customer reports,
+# transaction_date for total_sales_period, status for order_count_by_status.
+outputs:
+  - item_code
+  - customer
+  - transaction_date
+  - status
+  - qty
+  - amount
+  - grand_total
+# Fields that accept only these values. Checked before the tool runs; anything else is
+# reported as invalid instead of being sent to ERPNext.
+field_values:
+  query_type:
+    - best_selling_item_qty
+    - best_selling_item_revenue
+    - worst_selling_item
+    - top_customer_value
+    - top_customer_count
+    - total_sales_period
+    - order_count_by_status
+  status_filter:
+    - submitted
+    - draft
+    - all
 follow_up_eligible: true
 follow_up_slots:
   - query_type
@@ -73,7 +99,6 @@ keywords:
   - sales by month
   - sales total
   - sales summary
-  - sales report
   - sales ranking
   - revenue report
   - most ordered
@@ -83,7 +108,6 @@ keywords:
   - top products
   - order count by status
   - sales performance
-  - our best
 response_template: "Sales Analytics Report"
 error_template: "Failed to generate sales analytics: {error}"
 examples:
@@ -99,37 +123,41 @@ examples:
 # Sales Analytics Report
 
 ## When to use
-Trigger this skill for ALL computed/aggregate sales queries — best sellers, top customers, revenue totals, slow movers, period summaries. This skill maps one of several variants:
+Trigger this skill for ALL computed/aggregate sales queries: best sellers, top customers, revenue totals, slow movers, period summaries. Pick the `query_type` that matches the question; the system derives grouping, metric and sort from it. The variants are:
 
-**Variant a — Best-selling item by QUANTITY** (default for "best seller"):
-- group_by: item_code, metric: qty, aggregation_fn: sum, sort: qty desc
+**`best_selling_item_qty`: best-selling item by QUANTITY** (default for "best seller"):
+- Sum of qty per item_code, highest first
 - Example: "What's our best-selling item?", "Most popular item last 4 months"
 
-**Variant b — Best-selling item by REVENUE**:
-- group_by: item_code, metric: amount, aggregation_fn: sum, sort: amount desc
+**`best_selling_item_revenue`: best-selling item by REVENUE**:
+- Sum of amount per item_code, highest first
 - Example: "Which item generates the most revenue?", "Top items by sales value"
 
-**Variant c — Worst-selling / slow-moving items**:
-- Same as a/b but sort: asc
+**`worst_selling_item`: worst-selling / slow-moving items**:
+- Sum of qty per item_code, lowest first
 - Example: "Slow-moving items", "Worst sellers"
 
-**Variant d — Top customer by order count or value**:
-- group_by: customer (on Sales Order, not Sales Order Item), metric: grand_total or count
+**`top_customer_value`: top customer by order VALUE**:
+- Sum of grand_total per customer (on Sales Order), highest first
 - Example: "Who's our top customer?", "Which customer buys the most from us?"
 
-**Variant e — Total sales for a period**:
-- Sum of grand_total with date range filter on Sales Order
+**`top_customer_count`: top customer by NUMBER of orders**:
+- Count of orders per customer (on Sales Order), highest first
+- Example: "Which customer places the most orders with us?"
+
+**`total_sales_period`: total sales for a period**:
+- Sum of grand_total per transaction_date, with the date range filter
 - Example: "What's our total sales in August?", "Revenue last quarter"
 
-**Variant f — Order count by status**:
-- group_by: status or docstatus on Sales Order
+**`order_count_by_status`: order count by status**:
+- Count of orders per status on Sales Order, across drafts and submitted orders
 - Example: "How many draft orders do we have?", "Order count by status"
 
 ## Default behavior
-- Status filter: **Submitted orders only (docstatus=1)** — this is the ERP convention for "actual sales".
-  If the user explicitly says "including drafts" or "all orders", include docstatus in [0, 1].
-  # NOTE: This default is intentional and clearly commented here. To override, the parameter
-  # extraction should set status_filter = "all" if user's intent includes non-submitted orders.
+- Status filter: **Submitted orders only (docstatus=1)**, the ERP convention for "actual sales".
+  - "including drafts" or "all orders" -> status_filter = "all" (drafts and submitted; cancelled orders are never counted)
+  - "only drafts" -> status_filter = "draft"
+  - order_count_by_status always counts across statuses (status_filter "submitted" is treated as "all")
 - Default metric: quantity (qty sum)
 - Default limit: top 10 results
 - Date range: last 4 months if user says "last 4 months", last 30 days for "recent", etc.
@@ -138,15 +166,12 @@ Trigger this skill for ALL computed/aggregate sales queries — best sellers, to
 - **query_type**: Inferred from user's question. One of: best_selling_item_qty, best_selling_item_revenue, worst_selling_item, top_customer_value, top_customer_count, total_sales_period, order_count_by_status
 
 ## Parameter extraction
-Extract from the user's message:
-- `query_type`: What kind of report? (best seller, top customer, total, worst seller, etc.)
-- `metric`: "qty" (default) or "amount" for revenue-based ranking
-- `group_by`: "item_code" (default for item-level) or "customer" for customer-level
-- `sort`: "qty desc" (default best-seller), "qty asc" (worst-seller), "amount desc" (revenue), etc.
+Extract from the user's message (do not extract metric, group_by or sort; query_type defines them):
+- `query_type`: One of the values above (best seller by qty or revenue, worst seller, top customer by value or order count, total sales for a period, order count by status)
 - `date_from`: Start date filter (e.g. "2026-05-11" for "last 4 months")
 - `date_to`: End date filter (e.g. "2026-09-11" for current date)
 - `limit`: Number of results (default 10)
-- `status_filter`: "submitted" (default) or "all"
+- `status_filter`: "submitted" (default), "draft" or "all"
 
 ## ERPNext details
 - Primary Doctype: `Sales Order Item` (for item-level aggregation)
@@ -158,7 +183,7 @@ Tool name: `aggregate` on DocType `Sales Order Item` (or `Sales Order` for custo
 
 ## Steps
 1. Identify the query_type from the user's question.
-2. Set group_by, metric, aggregation_fn, sort based on variant.
+2. The system sets group_by, metric, aggregation_fn and sort from the query_type.
 3. Apply date range and status filters if specified.
 4. Call `aggregate` tool with the assembled parameters.
 5. Return ranked results formatted clearly.

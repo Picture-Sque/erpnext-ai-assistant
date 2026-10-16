@@ -1,18 +1,46 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChatMessage } from "../types/chat";
+import { ChatMessage, ConnectionState, ConversationSummary } from "../types/chat";
 
 // Configure the backend URL using environment variable VITE_BACKEND_URL or defaulting to http://localhost:8000/chat
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string) || "http://localhost:8000/chat";
+const API_BASE = BACKEND_URL.replace(/\/chat\/?$/, "");
+
+const ACTIVE_CONVERSATION_KEY = "ai_assistant.activeConversation";
 
 const createId = () =>
     globalThis.crypto?.randomUUID?.() ??
     `message-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-const createTimestamp = () =>
+const formatTime = (date: Date) =>
     new Intl.DateTimeFormat("en-US", {
         hour: "numeric",
         minute: "2-digit"
-    }).format(new Date());
+    }).format(date);
+
+const createTimestamp = () => formatTime(new Date());
+
+// The backend stores naive UTC ISO timestamps.
+export const parseServerDate = (value: string) => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(value) ? value : `${value}Z`);
+
+// Remembers the open conversation per user so reopening the widget returns to it.
+// Browser storage can be unavailable (private mode, blocked site data); the widget works without it.
+const readActiveConversation = (user: string): string | null => {
+    try {
+        return window.localStorage.getItem(`${ACTIVE_CONVERSATION_KEY}.${user}`);
+    } catch {
+        return null;
+    }
+};
+
+const writeActiveConversation = (user: string, conversationId: string | null) => {
+    try {
+        const key = `${ACTIVE_CONVERSATION_KEY}.${user}`;
+        if (conversationId) window.localStorage.setItem(key, conversationId);
+        else window.localStorage.removeItem(key);
+    } catch {
+        // Storage unavailable: the active chat is simply not remembered across reloads.
+    }
+};
 
 // Safe Frappe resolver supporting window, parent frame, and top window (handles Desk iframe context)
 const getFrappe = () => {
@@ -20,418 +48,403 @@ const getFrappe = () => {
     return (window as any).frappe || (window as any).parent?.frappe || (window as any).top?.frappe || null;
 };
 
-// Utility to parse human-readable messages out of complex Frappe error objects
-const extractFrappeErrorMessage = (err: any): string => {
-    if (!err) return "Unknown authentication error";
-    if (typeof err === "string") return err;
-    if (err._server_messages) {
-        try {
-            const messages = JSON.parse(err._server_messages);
-            const parsed = messages
-                .map((m: string) => {
-                    try {
-                        return JSON.parse(m).message;
-                    } catch {
-                        return m;
-                    }
-                })
-                .filter(Boolean)
-                .join("; ");
-            if (parsed) return parsed;
-        } catch {
-            // fallback to stringifying
+// Helper to resolve Frappe session user across standard, cookie, and iframe contexts
+const getFrappeSessionUser = () => {
+    const frappe = getFrappe();
+    let user = "";
+    let fullName = "";
+
+    if (frappe) {
+        user = frappe.session?.user || frappe.boot?.user?.name || frappe.boot?.user?.email || frappe.user?.name || "";
+        fullName =
+            frappe.boot?.user?.full_name ||
+            frappe.session?.user_fullname ||
+            frappe.user_info?.[user]?.full_name ||
+            frappe.user_info?.[user]?.fullname ||
+            "";
+    }
+
+    // Fallback: check document.cookie for user_id and full_name
+    if (typeof document !== "undefined") {
+        if (!user || user === "Guest") {
+            const cookieUser = document.cookie.match(/(?:^|; )user_id=([^;]*)/);
+            if (cookieUser && cookieUser[1]) {
+                const decodedUser = decodeURIComponent(cookieUser[1]);
+                if (decodedUser && decodedUser !== "Guest") {
+                    user = decodedUser;
+                }
+            }
+        }
+        if (!fullName || fullName === "Guest") {
+            const cookieName = document.cookie.match(/(?:^|; )full_name=([^;]*)/);
+            if (cookieName && cookieName[1]) {
+                const decodedName = decodeURIComponent(cookieName[1]);
+                if (decodedName && decodedName !== "Guest") {
+                    fullName = decodedName;
+                }
+            }
         }
     }
-    if (err.message) return err.message;
-    if (err.exception) return err.exception;
-    return JSON.stringify(err);
+
+    if (user && user !== "Guest") {
+        return { username: user, fullName: fullName || user };
+    }
+
+    // Default to Guest if no user session is detected
+    return { username: "Guest", fullName: "Guest" };
 };
 
-export function useDemoChat() {
-    // Helper to resolve Frappe session user across standard, cookie, and iframe contexts
-    const getFrappeSessionUser = () => {
+interface AuthUser {
+    username: string;
+    fullName: string;
+    roles: string[];
+    token: string;
+}
+
+const GUEST: AuthUser = { username: "Guest", fullName: "Guest", roles: [], token: "" };
+
+// Requests a JWT for the logged-in Desk user. Resolves to null when there is no session.
+const requestChatToken = (): Promise<AuthUser | null> =>
+    new Promise(resolve => {
         const frappe = getFrappe();
-        let user = "";
-        let fullName = "";
-
-        if (frappe) {
-            user = frappe.session?.user || frappe.boot?.user?.name || frappe.boot?.user?.email || frappe.user?.name || "";
-            fullName =
-                frappe.boot?.user?.full_name ||
-                frappe.session?.user_fullname ||
-                frappe.user_info?.[user]?.full_name ||
-                frappe.user_info?.[user]?.fullname ||
-                "";
+        if (!frappe || !frappe.call) {
+            console.warn("[Chat Widget] frappe.call is not available. Running outside ERPNext Desk.");
+            resolve(null);
+            return;
         }
 
-        // Fallback: check document.cookie for user_id and full_name
-        if (typeof document !== "undefined") {
-            if (!user || user === "Guest") {
-                const cookieUser = document.cookie.match(/(?:^|; )user_id=([^;]*)/);
-                if (cookieUser && cookieUser[1]) {
-                    const decodedUser = decodeURIComponent(cookieUser[1]);
-                    if (decodedUser && decodedUser !== "Guest") {
-                        user = decodedUser;
-                    }
+        const sessionUser = getFrappeSessionUser();
+
+        frappe.call({
+            method: "ai_assistant.ai_assistant.api.get_chat_token",
+            callback: (r: any) => {
+                if (!r || !r.message || !r.message.token) {
+                    console.warn("[Chat Widget] Token request returned an empty or unauthenticated response.");
+                    resolve(null);
+                    return;
                 }
+                const rawUser = r.message.user;
+                const rawFullName = r.message.full_name;
+                const resolvedUser = (rawUser && rawUser !== "Guest")
+                    ? rawUser
+                    : (sessionUser.username !== "Guest" ? sessionUser.username : "Guest");
+                const resolvedFullName = (rawFullName && rawFullName !== "Guest")
+                    ? rawFullName
+                    : (resolvedUser !== "Guest" ? resolvedUser : "Guest");
+
+                resolve({
+                    username: resolvedUser,
+                    fullName: resolvedFullName,
+                    roles: r.message.roles || [],
+                    token: r.message.token
+                });
+            },
+            error: (err: any) => {
+                console.error("[Chat Widget] Error fetching chat token:", err);
+                resolve(null);
             }
-            if (!fullName || fullName === "Guest") {
-                const cookieName = document.cookie.match(/(?:^|; )full_name=([^;]*)/);
-                if (cookieName && cookieName[1]) {
-                    const decodedName = decodeURIComponent(cookieName[1]);
-                    if (decodedName && decodedName !== "Guest") {
-                        fullName = decodedName;
-                    }
-                }
-            }
-        }
-
-        if (user && user !== "Guest") {
-            return { username: user, fullName: fullName || user };
-        }
-
-        // Default to Guest if no user session is detected
-        return { username: "Guest", fullName: "Guest" };
-    };
-
-    const initialUser = getFrappeSessionUser();
-
-    const [authUser, setAuthUser] = useState<{
-        username: string;
-        fullName: string;
-        roles: string[];
-        token: string;
-    }>({
-        username: initialUser.username,
-        fullName: initialUser.fullName,
-        roles: [],
-        token: "",
+        });
     });
 
+const describeFetchError = (error: any) => {
+    if (error?.message?.includes("Failed to fetch") || error?.name === "TypeError") {
+        return `Unable to reach the assistant backend at ${API_BASE}. Make sure the server is running.`;
+    }
+    return error?.message || String(error);
+};
+
+const toSummary = (raw: any): ConversationSummary => ({
+    id: raw.id,
+    title: raw.title,
+    createdAt: raw.created_at,
+    updatedAt: raw.updated_at
+});
+
+export function useDemoChat() {
+    const initialUser = getFrappeSessionUser();
+
+    const [authUser, setAuthUser] = useState<AuthUser>({ ...GUEST, ...initialUser });
+    const [connection, setConnection] = useState<ConnectionState>("connecting");
     const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const [conversationId, setConversationId] = useState<string>(() => createId());
+    const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+    const [historyStatus, setHistoryStatus] = useState<"idle" | "loading" | "error">("idle");
+    const [isLoadingConversation, setIsLoadingConversation] = useState(false);
+    const [sendingConversationId, setSendingConversationId] = useState<string | null>(null);
+
     const isMountedRef = useRef(true);
     const tokenRef = useRef<string>("");
+    const conversationIdRef = useRef(conversationId);
+    const restoredForUserRef = useRef<string | null>(null);
 
-    // Sync tokenRef whenever authUser.token changes (avoids stale closure in sendMessage)
     useEffect(() => {
-        tokenRef.current = authUser.token;
-    }, [authUser.token]);
+        conversationIdRef.current = conversationId;
+    }, [conversationId]);
 
-    // Helper promise to fetch token directly on-demand if missing or expired
-    const fetchTokenOnDemand = (): Promise<string> => {
-        return new Promise((resolve) => {
-            const frappe = getFrappe();
-            if (!frappe || !frappe.call) {
-                console.warn("[Chat Widget] Cannot fetch token on-demand: frappe.call unavailable.");
-                resolve("");
-                return;
-            }
-
-            const currentSession = getFrappeSessionUser();
-
-            console.log("[Chat Widget] Fetching fresh token on-demand from Frappe...");
-            frappe.call({
-                method: "ai_assistant.ai_assistant.api.get_chat_token",
-                callback: (r: any) => {
-                    if (r && r.message && r.message.token) {
-                        const rawUser = r.message.user;
-                        const rawFullName = r.message.full_name;
-                        const resolvedUser = (rawUser && rawUser !== "Guest")
-                            ? rawUser
-                            : (currentSession.username !== "Guest" ? currentSession.username : "Guest");
-                        const resolvedFullName = (rawFullName && rawFullName !== "Guest")
-                            ? rawFullName
-                            : (resolvedUser !== "Guest" ? resolvedUser : "Guest");
-
-                        const userObj = {
-                            username: resolvedUser,
-                            fullName: resolvedFullName,
-                            roles: r.message.roles || [],
-                            token: r.message.token,
-                        };
-                        tokenRef.current = userObj.token;
-                        setAuthUser(userObj);
-                        resolve(userObj.token);
-                    } else {
-                        console.warn("[Chat Widget] On-demand token request returned empty token.");
-                        resolve("");
-                    }
-                },
-                error: (err: any) => {
-                    console.error("[Chat Widget] Error fetching token on-demand:", err);
-                    resolve("");
-                }
-            });
-        });
-    };
-
-    const authenticateWithFrappe = useCallback(() => {
-        const frappe = getFrappe();
-
-        // Step 1: Immediately read session values if available
-        const sessionUser = getFrappeSessionUser();
-        console.log("[Chat Widget] Direct session read:", sessionUser);
-        if (sessionUser.username !== "Guest") {
-            setAuthUser(prev => ({
-                ...prev,
-                username: sessionUser.username,
-                fullName: sessionUser.fullName,
-            }));
-        } else {
-            setAuthUser({
-                username: "Guest",
-                fullName: "Guest",
-                roles: [],
-                token: "",
-            });
+    const authenticate = useCallback(async () => {
+        const user = await requestChatToken();
+        if (!isMountedRef.current) return "";
+        if (!user) {
+            tokenRef.current = "";
+            setAuthUser(prev => (prev.token ? prev : { ...GUEST, ...getFrappeSessionUser() }));
+            setConnection(prev => (tokenRef.current ? prev : "signed-out"));
+            return "";
         }
-
-        // Step 2: Fetch JWT token via frappe.call
-        if (frappe && frappe.call) {
-            console.log("[Chat Widget] Calling ai_assistant.ai_assistant.api.get_chat_token");
-            frappe.call({
-                method: "ai_assistant.ai_assistant.api.get_chat_token",
-                callback: (r: any) => {
-                    console.log("[Chat Widget] frappe.call callback response:", r);
-                    if (r && r.message && r.message.token) {
-                        console.log("[Chat Widget] Successfully authenticated user:", r.message.user);
-                        const rawUser = r.message.user;
-                        const rawFullName = r.message.full_name;
-                        const resolvedUser = (rawUser && rawUser !== "Guest")
-                            ? rawUser
-                            : (sessionUser.username !== "Guest" ? sessionUser.username : "Guest");
-                        const resolvedFullName = (rawFullName && rawFullName !== "Guest")
-                            ? rawFullName
-                            : (resolvedUser !== "Guest" ? resolvedUser : "Guest");
-
-                        const userObj = {
-                            username: resolvedUser,
-                            fullName: resolvedFullName,
-                            roles: r.message.roles || [],
-                            token: r.message.token || "",
-                        };
-                        tokenRef.current = userObj.token;
-                        setAuthUser(userObj);
-
-                        if (isMountedRef.current) {
-                            setMessages(prev => {
-                                if (prev.length === 0) {
-                                    return [
-                                        {
-                                            id: createId(),
-                                            role: "assistant",
-                                            content: `Welcome, ${userObj.fullName}! Connected to ERPNext. How can I assist you today?`,
-                                            timestamp: createTimestamp()
-                                        }
-                                    ];
-                                }
-                                return prev;
-                            });
-                        }
-                    } else {
-                        console.warn("[Chat Widget] frappe.call returned empty or unauthenticated response.");
-                        setAuthUser({
-                            username: "Guest",
-                            fullName: "Guest",
-                            roles: [],
-                            token: "",
-                        });
-                    }
-                },
-                error: (err: any) => {
-                    console.error("[Chat Widget] frappe.call error fetching token:", err);
-                    setAuthUser({
-                        username: "Guest",
-                        fullName: "Guest",
-                        roles: [],
-                        token: "",
-                    });
-                }
-            });
-        } else {
-            console.warn("[Chat Widget] frappe.call is not available. Running outside ERPNext Desk.");
-            if (isMountedRef.current) {
-                setMessages(prev => {
-                    if (prev.length === 0) {
-                        return [
-                            {
-                                id: createId(),
-                                role: "assistant",
-                                content: "Running in standalone mode. Log into ERPNext Desk to enable user identity sync.",
-                                timestamp: createTimestamp()
-                            }
-                        ];
-                    }
-                    return prev;
-                });
-            }
-        }
+        tokenRef.current = user.token;
+        setAuthUser(user);
+        setConnection("connected");
+        return user.token;
     }, []);
 
+    // Sends an authenticated request to the backend, refreshing the token once on 401.
+    const apiFetch = useCallback(
+        async (path: string, init: RequestInit = {}) => {
+            const send = (token: string) =>
+                fetch(`${API_BASE}${path}`, {
+                    ...init,
+                    headers: {
+                        "Content-Type": "application/json",
+                        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                        ...(init.headers || {})
+                    }
+                });
+
+            let token = tokenRef.current || (await authenticate());
+            let response = await send(token);
+
+            if (response.status === 401) {
+                console.warn("[Chat Widget] Received 401 Unauthorized. Refreshing the token and retrying once.");
+                token = await authenticate();
+                if (token) response = await send(token);
+            }
+            if (response.status === 401) {
+                throw new Error("Your session could not be verified. Reload ERPNext and sign in again.");
+            }
+            if (!response.ok) {
+                let detail = response.statusText;
+                try {
+                    const body = await response.json();
+                    detail = body?.detail || detail;
+                } catch {
+                    // Body was not JSON; keep the status text.
+                }
+                throw new Error(`HTTP ${response.status}: ${detail}`);
+            }
+            return response.json();
+        },
+        [authenticate]
+    );
+
+    const refreshConversations = useCallback(async () => {
+        if (!tokenRef.current) return;
+        setHistoryStatus(prev => (prev === "error" ? "loading" : prev));
+        try {
+            const data = await apiFetch("/conversations");
+            if (!isMountedRef.current) return;
+            setConversations((data.conversations || []).map(toSummary));
+            setHistoryStatus("idle");
+        } catch (error) {
+            console.error("[Chat Widget] Could not load chat history:", error);
+            if (isMountedRef.current) setHistoryStatus("error");
+        }
+    }, [apiFetch]);
+
+    const loadConversation = useCallback(
+        async (id: string) => {
+            setConversationId(id);
+            conversationIdRef.current = id;
+            setMessages([]);
+            setIsLoadingConversation(true);
+            writeActiveConversation(authUser.username, id);
+            try {
+                const data = await apiFetch(`/conversations/${encodeURIComponent(id)}/messages`);
+                if (!isMountedRef.current || conversationIdRef.current !== id) return;
+                setMessages(
+                    (data.messages || []).map((m: any) => ({
+                        id: `server-${m.id}`,
+                        role: m.role === "user" ? "user" : "assistant",
+                        content: m.content,
+                        timestamp: formatTime(parseServerDate(m.created_at))
+                    }))
+                );
+            } catch (error) {
+                if (!isMountedRef.current || conversationIdRef.current !== id) return;
+                setMessages([
+                    {
+                        id: createId(),
+                        role: "assistant",
+                        content: `Could not load this conversation. ${describeFetchError(error)}`,
+                        timestamp: createTimestamp(),
+                        isError: true
+                    }
+                ]);
+            } finally {
+                if (isMountedRef.current && conversationIdRef.current === id) setIsLoadingConversation(false);
+            }
+        },
+        [apiFetch, authUser.username]
+    );
+
+    // Initial sign-in, retried once Frappe reports ready.
     useEffect(() => {
         isMountedRef.current = true;
-        let cleanupTimer: ReturnType<typeof setTimeout> | null = null;
-
-        authenticateWithFrappe();
+        authenticate();
 
         const frappe = getFrappe();
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
         if (frappe && frappe.ready) {
             frappe.ready(() => {
-                authenticateWithFrappe();
+                if (!tokenRef.current) authenticate();
             });
         } else {
-            cleanupTimer = setTimeout(() => {
-                authenticateWithFrappe();
+            retryTimer = setTimeout(() => {
+                if (!tokenRef.current) authenticate();
             }, 1000);
         }
 
         return () => {
             isMountedRef.current = false;
-            if (cleanupTimer !== null) {
-                clearTimeout(cleanupTimer);
-            }
+            if (retryTimer !== null) clearTimeout(retryTimer);
         };
-    }, [authenticateWithFrappe]);
+    }, [authenticate]);
+
+    // Once signed in: load the history and reopen the chat the user had open last.
+    useEffect(() => {
+        if (connection !== "connected" || restoredForUserRef.current === authUser.username) return;
+        restoredForUserRef.current = authUser.username;
+
+        setHistoryStatus("loading");
+        refreshConversations();
+
+        const lastActive = readActiveConversation(authUser.username);
+        if (lastActive) loadConversation(lastActive);
+    }, [authUser.username, connection, loadConversation, refreshConversations]);
 
     const sendMessage = useCallback(
         async (rawMessage: string) => {
             const content = rawMessage.trim();
-            if (!content) return false;
+            if (!content || sendingConversationId) return false;
 
-            const userMessage: ChatMessage = {
-                id: createId(),
-                role: "user",
-                content,
-                timestamp: createTimestamp()
-            };
+            const targetConversation = conversationIdRef.current;
+            const isFirstMessage = !conversations.some(c => c.id === targetConversation);
 
-            setMessages(prev => [...prev, userMessage]);
+            setMessages(prev => [
+                ...prev,
+                { id: createId(), role: "user", content, timestamp: createTimestamp() }
+            ]);
+            setSendingConversationId(targetConversation);
+            writeActiveConversation(authUser.username, targetConversation);
 
-            // Read token from ref or state
-            let activeToken = tokenRef.current || authUser.token;
-
-            // If activeToken is missing, fetch it on-demand before executing fetch
-            if (!activeToken) {
-                console.log("[Chat Widget] Token empty during sendMessage, fetching on-demand...");
-                activeToken = await fetchTokenOnDemand();
+            if (isFirstMessage) {
+                const now = new Date().toISOString();
+                setConversations(prev => [
+                    { id: targetConversation, title: content.replace(/\s+/g, " ").slice(0, 60), createdAt: now, updatedAt: now },
+                    ...prev
+                ]);
             }
 
-            const sendHttpRequest = async (tokenToUse: string): Promise<Response> => {
-                const headers: HeadersInit = {
-                    "Content-Type": "application/json"
-                };
-                if (tokenToUse) {
-                    headers["Authorization"] = `Bearer ${tokenToUse}`;
-                }
-                return fetch(BACKEND_URL, {
-                    method: "POST",
-                    headers,
-                    body: JSON.stringify({ message: content })
-                });
-            };
-
+            let reply: ChatMessage;
             try {
-                let response = await sendHttpRequest(activeToken);
-
-                // If 401 Unauthorized occurs, clear token and attempt single automatic refresh retry
-                if (response.status === 401) {
-                    console.warn("[Chat Widget] Received 401 Unauthorized. Attempting automatic token refresh...");
-                    const freshToken = await fetchTokenOnDemand();
-                    if (freshToken) {
-                        console.log("[Chat Widget] Retrying chat request with fresh token...");
-                        response = await sendHttpRequest(freshToken);
-                    }
-                }
-
-                if (response.status === 401) {
-                    throw new Error("401 Unauthorized: JWT token missing, expired, or invalid signature.");
-                }
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
-
-                const data = await response.json();
-                const replyText = data.response || "No response field returned from backend.";
-
-                if (isMountedRef.current) {
-                    setMessages(prev => [
-                        ...prev,
-                        {
-                            id: createId(),
-                            role: "assistant",
-                            content: replyText,
-                            timestamp: createTimestamp()
-                        }
-                    ]);
-                }
-            } catch (error: any) {
-                console.error("[Chat Widget] Error communicating with FastAPI backend:", error);
-                let errorNotice = `Error: ${error.message}`;
-                if (error.message?.includes("Failed to fetch") || error.name === "TypeError") {
-                    errorNotice = "Error: Unable to connect to the FastAPI backend server (Connection Refused). Ensure 'python main.py' is running at http://localhost:8000.";
-                }
-
-                if (isMountedRef.current) {
-                    setMessages(prev => [
-                        ...prev,
-                        {
-                            id: createId(),
-                            role: "assistant",
-                            content: errorNotice,
-                            timestamp: createTimestamp()
-                        }
-                    ]);
-                }
-            }
-
-            return true;
-        },
-        [authUser.token]
-    );
-
-    const startNewChat = useCallback(async () => {
-        let activeToken = tokenRef.current || authUser.token;
-        if (!activeToken) {
-            activeToken = await fetchTokenOnDemand();
-        }
-
-        if (activeToken) {
-            try {
-                const resetUrl = BACKEND_URL.replace(/\/chat\/?$/, "/chat/reset");
-                await fetch(resetUrl, {
+                const data = await apiFetch("/chat", {
                     method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${activeToken}`
-                    }
+                    body: JSON.stringify({ message: content, conversation_id: targetConversation })
                 });
-            } catch (err) {
-                console.warn("[Chat Widget] Error resetting session on backend:", err);
-            }
-        }
-
-        const greeting = authUser.fullName && authUser.fullName !== "Guest"
-            ? `Welcome, ${authUser.fullName}! Connected to ERPNext. How can I assist you today?`
-            : "Welcome! Connected to ERPNext. How can I assist you today?";
-
-        if (isMountedRef.current) {
-            setMessages([
-                {
+                reply = {
                     id: createId(),
                     role: "assistant",
-                    content: greeting,
+                    content: data.response || "The assistant returned an empty response.",
                     timestamp: createTimestamp()
+                };
+            } catch (error: any) {
+                console.error("[Chat Widget] Error communicating with the backend:", error);
+                reply = {
+                    id: createId(),
+                    role: "assistant",
+                    content: describeFetchError(error),
+                    timestamp: createTimestamp(),
+                    isError: true
+                };
+            }
+
+            if (!isMountedRef.current) return true;
+            setSendingConversationId(null);
+            // The user may have switched chats while waiting; the reply is saved server-side either way.
+            if (conversationIdRef.current === targetConversation) {
+                setMessages(prev => [...prev, reply]);
+            }
+            refreshConversations();
+            return true;
+        },
+        [apiFetch, authUser.username, conversations, refreshConversations, sendingConversationId]
+    );
+
+    const startNewChat = useCallback(() => {
+        const id = createId();
+        conversationIdRef.current = id;
+        setConversationId(id);
+        setMessages([]);
+        setIsLoadingConversation(false);
+        writeActiveConversation(authUser.username, null);
+    }, [authUser.username]);
+
+    const deleteConversation = useCallback(
+        async (id: string) => {
+            try {
+                await apiFetch(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+            } catch (error) {
+                console.error("[Chat Widget] Could not delete conversation:", error);
+                window.alert(`Could not delete the chat. ${describeFetchError(error)}`);
+                return false;
+            }
+            setConversations(prev => prev.filter(c => c.id !== id));
+            if (conversationIdRef.current === id) startNewChat();
+            return true;
+        },
+        [apiFetch, startNewChat]
+    );
+
+    // Optimistic: the new title shows at once and is restored if the server refuses it.
+    const renameConversation = useCallback(
+        async (id: string, rawTitle: string) => {
+            const title = rawTitle.replace(/\s+/g, " ").trim();
+            const previous = conversations.find(c => c.id === id)?.title;
+            if (!title || title === previous) return true;
+
+            setConversations(prev => prev.map(c => (c.id === id ? { ...c, title } : c)));
+            try {
+                await apiFetch(`/conversations/${encodeURIComponent(id)}`, {
+                    method: "PATCH",
+                    body: JSON.stringify({ title })
+                });
+                return true;
+            } catch (error) {
+                console.error("[Chat Widget] Could not rename conversation:", error);
+                if (previous !== undefined && isMountedRef.current) {
+                    setConversations(prev => prev.map(c => (c.id === id ? { ...c, title: previous } : c)));
                 }
-            ]);
-        }
-    }, [authUser.fullName, authUser.token]);
+                window.alert(`Could not rename the chat. ${describeFetchError(error)}`);
+                return false;
+            }
+        },
+        [apiFetch, conversations]
+    );
 
     return {
         authUser,
-        setAuthUser,
+        connection,
         currentUser: authUser.fullName,
         messages,
+        conversationId,
+        conversations,
+        historyStatus,
+        isLoadingConversation,
+        isSending: sendingConversationId !== null,
+        isSendingHere: sendingConversationId !== null && sendingConversationId === conversationId,
         sendMessage,
-        startNewChat
+        startNewChat,
+        loadConversation,
+        deleteConversation,
+        renameConversation,
+        refreshConversations
     };
 }

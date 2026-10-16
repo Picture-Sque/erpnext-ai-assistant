@@ -1,39 +1,37 @@
-import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, RefObject, useEffect } from "react";
 import { SendIcon } from "./chat-icons";
 
 interface ChatInputProps {
+	value: string;
+	onChange: (value: string) => void;
 	onSendMessage: (message: string) => boolean | Promise<boolean>;
-	autoFocus?: boolean;
+	textareaRef: RefObject<HTMLTextAreaElement | null>;
+	isSending?: boolean;
 }
 
-export function ChatInput({ onSendMessage, autoFocus = false }: ChatInputProps) {
-	const [draft, setDraft] = useState("");
-	const textareaRef = useRef<HTMLTextAreaElement>(null);
-
+export function ChatInput({ value, onChange, onSendMessage, textareaRef, isSending = false }: ChatInputProps) {
 	useEffect(() => {
 		const textarea = textareaRef.current;
 
 		if (!textarea) return;
 
 		textarea.style.height = "0px";
-		textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
-	}, [draft]);
+		textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+	}, [textareaRef, value]);
 
-	useEffect(() => {
-		if (!autoFocus) return;
-
-		const timeoutId = window.setTimeout(() => {
-			textareaRef.current?.focus();
-		}, 0);
-
-		return () => window.clearTimeout(timeoutId);
-	}, [autoFocus]);
+	const canSend = value.trim() !== "" && !isSending;
 
 	const submitMessage = async () => {
-		const sent = await onSendMessage(draft);
+		if (!canSend) return;
+		const text = value;
 
-		if (sent) {
-			setDraft("");
+		// Clear right away rather than after the reply arrives. A refused send is
+		// rejected before any network call, so restoring cannot overwrite new typing.
+		onChange("");
+		const sent = await onSendMessage(text);
+
+		if (!sent) {
+			onChange(text);
 		}
 	};
 
@@ -43,7 +41,7 @@ export function ChatInput({ onSendMessage, autoFocus = false }: ChatInputProps) 
 	};
 
 	const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-		if (event.key !== "Enter" || event.shiftKey) return;
+		if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
 
 		event.preventDefault();
 		submitMessage();
@@ -55,23 +53,26 @@ export function ChatInput({ onSendMessage, autoFocus = false }: ChatInputProps) 
 				<textarea
 					ref={textareaRef}
 					className="chat-input__textarea"
-					placeholder="Ask anything about your ERP..."
-					value={draft}
-					onChange={event => setDraft(event.target.value)}
+					placeholder="Ask anything about your ERP…"
+					rows={1}
+					value={value}
+					onChange={event => onChange(event.target.value)}
 					onKeyDown={handleKeyDown}
+					aria-label="Message the assistant"
 				/>
 
 				<button
 					className="chat-input__send"
-					disabled={!draft.trim()}
+					disabled={!canSend}
 					type="submit"
-					aria-label="Send message"
+					aria-label={isSending ? "Waiting for the reply" : "Send message"}
+					title={isSending ? "Waiting for the reply" : "Send"}
 				>
-					<SendIcon />
+					<SendIcon size={17} />
 				</button>
 			</div>
 
-			<p className="chat-input__hint">Press Enter to send • Shift+Enter for a newline</p>
+			<p className="chat-input__hint">Enter to send · Shift+Enter for a new line</p>
 		</form>
 	);
 }
