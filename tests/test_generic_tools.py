@@ -36,13 +36,28 @@ class TestGenericTools(unittest.TestCase):
             self.assertIn("Quotation", allowed)
             self.assertIn("Sales Invoice", allowed)
             self.assertIn("Purchase Order", allowed)
+            self.assertIn("Supplier", allowed)
+            self.assertIn("Delivery Note", allowed)
+            self.assertIn("Delivery Note Item", allowed)
+            self.assertIn("Purchase Receipt", allowed)
+            self.assertIn("Purchase Receipt Item", allowed)
+            self.assertIn("Stock Ledger Entry", allowed)
 
             self.assertTrue(is_doctype_allowed("Customer"))
             self.assertTrue(is_doctype_allowed("customer"))
             self.assertTrue(is_doctype_allowed("Sales Order"))
             self.assertTrue(is_doctype_allowed("sales order"))
+            self.assertTrue(is_doctype_allowed("Supplier"))
+            self.assertTrue(is_doctype_allowed("supplier"))
+            self.assertTrue(is_doctype_allowed("Delivery Note"))
+            self.assertTrue(is_doctype_allowed("delivery note"))
+            self.assertTrue(is_doctype_allowed("Purchase Receipt"))
+            self.assertTrue(is_doctype_allowed("purchase receipt"))
+            self.assertTrue(is_doctype_allowed("Stock Ledger Entry"))
+            self.assertTrue(is_doctype_allowed("stock ledger entry"))
             self.assertFalse(is_doctype_allowed("User"))
-            self.assertFalse(is_doctype_allowed("Supplier"))
+            self.assertFalse(is_doctype_allowed("Employee"))
+            self.assertFalse(is_doctype_allowed("Payment Entry"))
 
     def test_custom_whitelist_env(self):
         """Test custom DOCTYPE_WHITELIST env var."""
@@ -51,6 +66,23 @@ class TestGenericTools(unittest.TestCase):
             self.assertTrue(is_doctype_allowed("user"))
             self.assertTrue(is_doctype_allowed("Customer"))
             self.assertFalse(is_doctype_allowed("Bin"))
+            self.assertFalse(is_doctype_allowed("Delivery Note"))
+            self.assertFalse(is_doctype_allowed("Purchase Receipt"))
+            self.assertFalse(is_doctype_allowed("Stock Ledger Entry"))
+
+        with patch.dict(os.environ, {"DOCTYPE_WHITELIST": "Customer, Item, Purchase Receipt"}):
+            self.assertTrue(is_doctype_allowed("Purchase Receipt"))
+            self.assertTrue(is_doctype_allowed("purchase receipt"))
+            self.assertTrue(is_doctype_allowed("Customer"))
+            self.assertTrue(is_doctype_allowed("Item"))
+            self.assertFalse(is_doctype_allowed("Delivery Note"))
+            self.assertFalse(is_doctype_allowed("Stock Ledger Entry"))
+            self.assertFalse(is_doctype_allowed("Bin"))
+
+        # Verify environment cleanup and default restoration
+        self.assertNotIn("DOCTYPE_WHITELIST", os.environ)
+        self.assertTrue(is_doctype_allowed("Delivery Note"))
+        self.assertTrue(is_doctype_allowed("Bin"))
 
     def test_extract_erpnext_error(self):
         """Test extracting error messages from ERPNext response JSON structures."""
@@ -107,6 +139,7 @@ class TestGenericTools(unittest.TestCase):
         self.assertEqual(params["filters"], '[["customer_name", "like", "%West View%"]]')
         self.assertEqual(params["fields"], '["name", "customer_name"]')
         self.assertEqual(params["limit_page_length"], "11")
+        self.assertNotIn("order_by", params)
 
     def test_get_list_whitelist_rejection(self):
         """Test get_list blocks non-whitelisted DocTypes."""
@@ -309,6 +342,153 @@ class TestGenericTools(unittest.TestCase):
         self.assertEqual(called_doctype, "Sales Order")
         self.assertEqual(called_params["transaction_date"], "2026-08-08")
         self.assertEqual(called_params["delivery_date"], "2026-08-15")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_list_omitted_order_by(self, mock_client_cls):
+        """Test get_list omits order_by parameter when not provided."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": []}
+        mock_client.get.return_value = mock_resp
+
+        res = get_list("Customer", limit=5)
+        self.assertEqual(res["status"], "empty")
+        _, kwargs = mock_client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertNotIn("order_by", params)
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_list_valid_single_order_by(self, mock_client_cls):
+        """Test get_list passes a valid single-column order_by clause."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"name": "SLE-001"}]}
+        mock_client.get.return_value = mock_resp
+
+        res = get_list("Stock Ledger Entry", order_by="posting_date desc")
+        self.assertEqual(res["status"], "success")
+        _, kwargs = mock_client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertEqual(params.get("order_by"), "posting_date desc")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_list_valid_multi_order_by(self, mock_client_cls):
+        """Test get_list passes a valid multi-column order_by clause with mixed casing and spacing."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"name": "SLE-001"}]}
+        mock_client.get.return_value = mock_resp
+
+        res = get_list("Stock Ledger Entry", order_by="posting_date DESC, posting_time desc")
+        self.assertEqual(res["status"], "success")
+        _, kwargs = mock_client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertEqual(params.get("order_by"), "posting_date DESC, posting_time desc")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_list_sql_injection_rejected_before_http_call(self, mock_client_cls):
+        """Test invalid SQL injection-like inputs are rejected before HTTP request is made."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        dangerous_inputs = [
+            "posting_date desc; DROP TABLE tabStockLedgerEntry",
+            "posting_date desc -- SQL comment",
+            "(SELECT 1 FROM tabUser)",
+            "1=1",
+            "name; DELETE FROM tabBin",
+            "name UNION SELECT * FROM tabUser",
+        ]
+        for bad_order_by in dangerous_inputs:
+            res = get_list("Stock Ledger Entry", order_by=bad_order_by)
+            self.assertEqual(res["status"], "system_error", f"Expected failure for {bad_order_by}")
+            self.assertIn("Invalid order_by clause", res["error"])
+
+        # Crucial check: client.get was never called for any dangerous input
+        mock_client.get.assert_not_called()
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_list_invalid_direction_and_malformed_clauses_rejected(self, mock_client_cls):
+        """Test invalid direction words and malformed clauses are rejected before HTTP call."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        malformed_inputs = [
+            "",
+            "   ",
+            ",",
+            "posting_date,",
+            ",posting_date",
+            "posting_date,,posting_time",
+            "posting_date invalid_direction",
+            "posting_date asc desc",
+            "posting-date desc",
+            "posting_date desc desc",
+        ]
+        for bad_clause in malformed_inputs:
+            res = get_list("Stock Ledger Entry", order_by=bad_clause)
+            self.assertEqual(res["status"], "system_error", f"Expected failure for {bad_clause}")
+            self.assertIn("Invalid order_by clause", res["error"])
+
+        mock_client.get.assert_not_called()
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_list_positional_and_keyword_callers_compatible(self, mock_client_cls):
+        """Test existing positional and keyword callers remain 100% compatible."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"name": "CUST-001"}]}
+        mock_client.get.return_value = mock_resp
+
+        # Positional call with 4 arguments
+        res_pos = get_list("Customer", [["customer_name", "like", "%Test%"]], ["name"], 10)
+        self.assertEqual(res_pos["status"], "success")
+
+        # Keyword call with only limit
+        res_kw = get_list("Customer", limit=1)
+        self.assertEqual(res_kw["status"], "success")
+
+    @patch("agent.workflow.graph.get_list")
+    @patch("agent.workflow.graph._get_skill_for_intent")
+    def test_workflow_call_generic_tool_node_order_by_passthrough(self, mock_get_skill, mock_get_list):
+        """Test that workflow call_generic_tool_node passes skill query_parameters.order_by to get_list."""
+        from agent.workflow.graph import call_generic_tool_node
+        mock_get_skill.return_value = {
+            "tool": "get_list",
+            "doctype": "Stock Ledger Entry",
+            "query_parameters": {
+                "filters": [["item_code", "=", "{item_code}"]],
+                "fields": ["name", "posting_date", "posting_time"],
+                "order_by": "posting_date desc, posting_time desc"
+            }
+        }
+        mock_get_list.return_value = {"status": "success", "data": []}
+        state = {
+            "detected_intent": "stock-movement-analysis",
+            "collected_fields": {"item_code": "SKU001"}
+        }
+
+        call_generic_tool_node(state)
+
+        mock_get_list.assert_called_once_with(
+            "Stock Ledger Entry",
+            filters=[["item_code", "=", "SKU001"]],
+            fields=["name", "posting_date", "posting_time"],
+            limit=None,
+            order_by="posting_date desc, posting_time desc"
+        )
 
 
 if __name__ == "__main__":

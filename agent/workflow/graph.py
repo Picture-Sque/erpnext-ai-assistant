@@ -2184,6 +2184,8 @@ def call_generic_tool_node(state: AgentState):
             "filters": formatted_filters,
             "fields": query_def.get("fields", [])
         }
+        if query_def.get("order_by"):
+            parameters["order_by"] = query_def.get("order_by")
 
     elif tool == "create_document":
         ps = skill.get("payload_structure", {})
@@ -2354,7 +2356,14 @@ def call_generic_tool_node(state: AgentState):
             if tool == "create_document":
                 tool_res = create_document(doctype_name, parameters)
             elif tool == "get_list":
-                tool_res = get_list(doctype_name, filters=parameters.get("filters"), fields=parameters.get("fields"), limit=parameters.get("limit"))
+                list_kwargs = {
+                    "filters": parameters.get("filters"),
+                    "fields": parameters.get("fields"),
+                    "limit": parameters.get("limit")
+                }
+                if parameters.get("order_by"):
+                    list_kwargs["order_by"] = parameters.get("order_by")
+                tool_res = get_list(doctype_name, **list_kwargs)
             elif tool == "get_document":
                 doc_name = parameters.get("name") or record_id
                 if doc_name:

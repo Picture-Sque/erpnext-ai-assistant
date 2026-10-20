@@ -401,7 +401,13 @@ class GenericToolRequest(BaseModel):
 @app.post("/api/tools/list")
 async def list_doctype_endpoint(request: GenericToolRequest):
     params = request.parameters or {}
-    return get_list(request.doctype_name, filters=params.get("filters"), fields=params.get("fields"), limit=params.get("limit"))
+    return get_list(
+        request.doctype_name,
+        filters=params.get("filters"),
+        fields=params.get("fields"),
+        limit=params.get("limit"),
+        order_by=params.get("order_by")
+    )
 
 @app.post("/api/tools/add")
 async def add_doctype_endpoint(request: GenericToolRequest):

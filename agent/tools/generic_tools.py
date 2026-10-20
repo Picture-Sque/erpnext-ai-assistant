@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import httpx
@@ -14,6 +15,12 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(ch)
 
+ORDER_BY_PATTERN = re.compile(
+    r"^\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:asc|desc))?"
+    r"(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:asc|desc))?)*\s*$",
+    re.IGNORECASE
+)
+
 try:
     from agent.tools.erpnext_client import get_auth_headers, ERPNEXT_BASE_URL
 except ImportError:
@@ -28,6 +35,12 @@ DEFAULT_WHITELIST = [
     "Purchase Order Item",   # purchase-order-lookup item-based PO check
     "Company",               # Dynamic company resolution
     "Warehouse",             # Dynamic warehouse resolution
+    # Added for Tier 1 reporting skills:
+    "Delivery Note",         # delivery-status-tracking
+    "Delivery Note Item",    # delivery-status-tracking child table filter
+    "Purchase Receipt",      # purchase-receipt-report
+    "Purchase Receipt Item", # purchase-receipt-report child table filter
+    "Stock Ledger Entry",    # stock-movement-analysis
 ]
 
 _cached_company = None
@@ -151,9 +164,19 @@ def _format_result(status: str, data: Any = None, error: Optional[str] = None, h
         "success": status in ("success", "empty")
     }
 
-def get_list(doctype: str, filters: Optional[dict] = None, fields: Optional[list] = None, limit: Optional[int] = None) -> dict:
+def get_list(
+    doctype: str,
+    filters: Optional[dict] = None,
+    fields: Optional[list] = None,
+    limit: Optional[int] = None,
+    order_by: Optional[str] = None
+) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist. Allowed DocTypes: {', '.join(get_allowed_doctypes())}")
+
+    if order_by is not None:
+        if not isinstance(order_by, str) or not ORDER_BY_PATTERN.match(order_by):
+            return _format_result("system_error", error=f"Invalid order_by clause: '{order_by}'. Must be valid comma-separated field names with optional ASC/DESC.")
 
     url = f"{ERPNEXT_BASE_URL}/api/resource/{doctype}"
     headers = get_auth_headers()
@@ -169,6 +192,8 @@ def get_list(doctype: str, filters: Optional[dict] = None, fields: Optional[list
             query_params["fields"] = json.dumps(fields)
         else:
             query_params["fields"] = str(fields)
+    if order_by:
+        query_params["order_by"] = order_by.strip()
     
     # We fetch limit + 1 to determine if has_more is true
     actual_limit = limit if limit else 20
