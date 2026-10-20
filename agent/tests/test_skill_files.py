@@ -214,3 +214,16 @@ ROUTING_PROBES = [
 @pytest.mark.parametrize("message,expected", ROUTING_PROBES)
 def test_ambiguous_phrases_are_not_misrouted_by_keywords(message, expected):
     assert graph.match_skill_keyword(message) == expected
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("Show purchase history for supplier Zuckerman", "supplier-purchase-analysis"),
+    ("How did the stock of SKU005 change?", "stock-movement-analysis"),
+    ("Show supplier purchases for Zuckerman", "supplier-purchase-analysis"),
+    ("Show stock of item 1001", "check-inventory"),
+    ("Show stock movement of item 1001", "stock-movement-analysis"),
+    ("Show customer order history for West View", "customer-order-history"),
+])
+def test_new_skills_cross_routing_resolution(message, expected):
+    """Verify newly added skills and disambiguated keywords route accurately."""
+    assert graph.match_skill_keyword(message) == expected

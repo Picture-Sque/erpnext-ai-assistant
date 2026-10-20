@@ -60,7 +60,6 @@ keywords:
   - what has customer ordered
   - customer order history
   - customer history
-  - purchase history
   - buying history
   - what did customer buy
   - what has customer bought
