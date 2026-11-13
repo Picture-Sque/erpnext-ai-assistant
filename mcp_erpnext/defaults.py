@@ -155,7 +155,8 @@ def get_default_warehouse(
     try:
         c_resp = client.get(f"/api/resource/Company/{comp}", timeout=5.0)
         if c_resp.is_success:
-            c_def = (c_resp.json().get("data") or {}).get("default_warehouse")
+            c_data = c_resp.json().get("data")
+            c_def = c_data.get("default_warehouse") if isinstance(c_data, dict) else None
             if c_def and c_def in warehouse_names:
                 pref_wh = c_def
         else:
@@ -167,7 +168,8 @@ def get_default_warehouse(
         try:
             s_resp = client.get("/api/resource/Stock Settings/Stock Settings", timeout=5.0)
             if s_resp.is_success:
-                s_def = (s_resp.json().get("data") or {}).get("default_warehouse")
+                s_data = s_resp.json().get("data")
+                s_def = s_data.get("default_warehouse") if isinstance(s_data, dict) else None
                 if s_def and s_def in warehouse_names:
                     pref_wh = s_def
             else:
