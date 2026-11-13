@@ -1,5 +1,6 @@
 import os
 import sys
+import uuid
 import logging
 from pathlib import Path
 
@@ -8,6 +9,9 @@ from pathlib import Path
 agent_dir = str(Path(__file__).parent.resolve())
 if agent_dir not in sys.path:
     sys.path.insert(0, agent_dir)
+repo_root = str(Path(__file__).parent.parent.resolve())
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 import jwt
 from typing import List, Optional
@@ -18,6 +22,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage
+
+from mcp_erpnext.auth import RequestContext, set_request_context, get_request_context
 
 # Ensure environment variables are loaded
 load_dotenv()
@@ -48,21 +54,24 @@ def on_shutdown():
     close_adapter()
 
 # CORS Configuration
-origins = [
-    "http://localhost:5173",  # Standalone Vite dev server
-    "http://127.0.0.1:5173",
-    "http://localhost:8000",  # Default Frappe Bench port
-    "http://127.0.0.1:8000",
-    "http://localhost:8080",  # ERPNext target instance port (confirmed port 8080)
-    "http://127.0.0.1:8080",
-    "http://localhost:8081",
-    "http://127.0.0.1:8081",
-]
+def get_cors_origins() -> List[str]:
+    cors_env = os.getenv("CORS_ALLOWED_ORIGINS")
+    if cors_env:
+        return [o.strip() for o in cors_env.split(",") if o.strip()]
+    return [
+        "http://localhost:5173",  # Standalone Vite dev server
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",  # Default Frappe Bench port
+        "http://127.0.0.1:8000",
+        "http://localhost:8080",  # ERPNext target instance port (confirmed port 8080)
+        "http://127.0.0.1:8080",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_origin_regex=r"https?://.*",
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -148,7 +157,7 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
     # Split 'Bearer <token>'
     parts = authorization.split(" ")
     if len(parts) != 2 or parts[0].lower() != "bearer":
-        logger.warning(f"Malformed Authorization header: {authorization[:30]}...")
+        logger.warning("Malformed Authorization header format")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Authorization header format. Expected 'Bearer <token>'",
@@ -251,6 +260,19 @@ def build_persisted_state(updated_state: dict) -> dict:
     }
 
 
+def _build_request_context(payload: dict) -> RequestContext:
+    user_sub = payload.get("sub", "")
+    roles = tuple(payload.get("roles", []))
+    req_id = f"req-{uuid.uuid4().hex[:12]}"
+    return RequestContext(
+        user_id=user_sub,
+        roles=roles,
+        credentials=None,
+        read_only=False,
+        request_id=req_id,
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_token)):
     user_sub = payload.get("sub")
@@ -262,71 +284,74 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
     session_id = request.conversation_id or user_sub
     user_id = payload.get("full_name") or user_sub
 
-    try:
-        # A conversation belongs to the user who created it; nobody else may load it,
-        # read its history, or answer its pending confirmations.
-        chat_store.verify_conversation_owner(session_id, user_sub, user_id=user_id)
-    except chat_store.ConversationAccessError:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This conversation belongs to another user."
-        )
+    req_ctx = _build_request_context(payload)
+    with set_request_context(req_ctx):
+        try:
+            # A conversation belongs to the user who created it; nobody else may load it,
+            # read its history, or answer its pending confirmations.
+            chat_store.verify_conversation_owner(session_id, user_sub, user_id=user_id)
+        except chat_store.ConversationAccessError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This conversation belongs to another user."
+            )
 
-    try:
-        session_state = chat_store.load_session_state(session_id, user_roles=payload.get("roles", []))
-        chat_store.save_message(session_id, "user", request.message)
-    except chat_store.ChatStoreError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        try:
+            session_state = chat_store.load_session_state(session_id, user_roles=payload.get("roles", []))
+            chat_store.save_message(session_id, "user", request.message)
+        except chat_store.ChatStoreError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    session_state["messages"].append(HumanMessage(content=request.message))
-    session_state["user_id"] = user_id
-    session_state["user_sub"] = user_sub
+        session_state["messages"].append(HumanMessage(content=request.message))
+        session_state["user_id"] = user_id
+        session_state["user_sub"] = user_sub
 
-    try:
-        # Run state machine iteration
-        updated_state = compiled_graph.invoke(session_state, config={"recursion_limit": GRAPH_RECURSION_LIMIT})
-    except Exception as e:
-        logger.exception("Error executing conversation graph")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error executing conversation graph: {str(e)}"
-        )
+        try:
+            # Run state machine iteration
+            updated_state = compiled_graph.invoke(session_state, config={"recursion_limit": GRAPH_RECURSION_LIMIT})
+        except Exception as e:
+            logger.exception("Error executing conversation graph")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error executing conversation graph: {str(e)}"
+            )
 
-    final_resp = updated_state.get("final_response", "")
-    persisted = build_persisted_state(updated_state)
-    try:
-        chat_store.save_message(session_id, "assistant", final_resp, intent=updated_state.get("detected_intent", ""))
-        chat_store.update_session_state(
-            session_id,
-            detected_intent=persisted["detected_intent"],
-            collected_fields=persisted["collected_fields"],
-            is_complete=persisted["is_complete"],
-            extra_state=persisted["extra_state"],
-        )
-    except chat_store.ChatStoreError as e:
-        # The turn ran, but its state (possibly a pending confirmation) was not saved.
-        # Say so rather than return a response the next turn cannot honor.
-        logger.error(f"Turn completed but state was not saved for {session_id}. Response was: {final_resp!r}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{e}. The last response was: {final_resp}"
-        )
+        final_resp = updated_state.get("final_response", "")
+        persisted = build_persisted_state(updated_state)
+        try:
+            chat_store.save_message(session_id, "assistant", final_resp, intent=updated_state.get("detected_intent", ""))
+            chat_store.update_session_state(
+                session_id,
+                detected_intent=persisted["detected_intent"],
+                collected_fields=persisted["collected_fields"],
+                is_complete=persisted["is_complete"],
+                extra_state=persisted["extra_state"],
+            )
+        except chat_store.ChatStoreError as e:
+            # The turn ran, but its state (possibly a pending confirmation) was not saved.
+            # Say so rather than return a response the next turn cannot honor.
+            logger.error(f"Turn completed but state was not saved for {session_id}. Response was: {final_resp!r}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"{e}. The last response was: {final_resp}"
+            )
 
-    return ChatResponse(response=final_resp)
+        return ChatResponse(response=final_resp)
 
 @app.post("/chat/reset")
 async def reset_session(payload: dict = Depends(verify_token)):
     """
     Helper endpoint to clear conversation session memory.
     """
-    session_id = payload.get("sub")
-    if not session_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Token payload missing required 'sub' claim"
-        )
-    chat_store.reset_session_state(session_id)
-    return {"status": "session reset successful"}
+    with set_request_context(_build_request_context(payload)):
+        session_id = payload.get("sub")
+        if not session_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Token payload missing required 'sub' claim"
+            )
+        chat_store.reset_session_state(session_id)
+        return {"status": "session reset successful"}
 
 
 def _require_sub(payload: dict) -> str:
@@ -342,22 +367,24 @@ def _require_sub(payload: dict) -> str:
 @app.get("/conversations")
 async def list_conversations_endpoint(payload: dict = Depends(verify_token)):
     """The caller's past conversations for the chat history sidebar, newest first."""
-    user_sub = _require_sub(payload)
-    try:
-        return {"conversations": chat_store.list_conversations(user_sub)}
-    except chat_store.ChatStoreError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    with set_request_context(_build_request_context(payload)):
+        user_sub = _require_sub(payload)
+        try:
+            return {"conversations": chat_store.list_conversations(user_sub)}
+        except chat_store.ChatStoreError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.get("/conversations/{conversation_id}/messages")
 async def conversation_messages_endpoint(conversation_id: str, payload: dict = Depends(verify_token)):
-    user_sub = _require_sub(payload)
-    try:
-        return {"messages": chat_store.get_conversation_messages(conversation_id, user_sub)}
-    except chat_store.ConversationAccessError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
-    except chat_store.ChatStoreError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    with set_request_context(_build_request_context(payload)):
+        user_sub = _require_sub(payload)
+        try:
+            return {"messages": chat_store.get_conversation_messages(conversation_id, user_sub)}
+        except chat_store.ConversationAccessError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+        except chat_store.ChatStoreError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 class RenameConversationRequest(BaseModel):
@@ -368,32 +395,34 @@ class RenameConversationRequest(BaseModel):
 async def rename_conversation_endpoint(
     conversation_id: str, request: RenameConversationRequest, payload: dict = Depends(verify_token)
 ):
-    user_sub = _require_sub(payload)
-    try:
-        renamed = chat_store.rename_conversation(conversation_id, user_sub, request.title)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-    except chat_store.ConversationAccessError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
-    except chat_store.ChatStoreError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-    if not renamed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-    return {"status": "renamed", "title": " ".join(request.title.split())}
+    with set_request_context(_build_request_context(payload)):
+        user_sub = _require_sub(payload)
+        try:
+            renamed = chat_store.rename_conversation(conversation_id, user_sub, request.title)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+        except chat_store.ConversationAccessError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+        except chat_store.ChatStoreError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        if not renamed:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+        return {"status": "renamed", "title": " ".join(request.title.split())}
 
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str, payload: dict = Depends(verify_token)):
-    user_sub = _require_sub(payload)
-    try:
-        deleted = chat_store.delete_conversation(conversation_id, user_sub)
-    except chat_store.ConversationAccessError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
-    except chat_store.ChatStoreError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-    return {"status": "deleted"}
+    with set_request_context(_build_request_context(payload)):
+        user_sub = _require_sub(payload)
+        try:
+            deleted = chat_store.delete_conversation(conversation_id, user_sub)
+        except chat_store.ConversationAccessError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+        except chat_store.ChatStoreError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+        return {"status": "deleted"}
 
 
 # Standalone endpoints for Generic CRUD Tools
@@ -405,31 +434,35 @@ class GenericToolRequest(BaseModel):
     parameters: Optional[dict] = None
 
 @app.post("/api/tools/list")
-async def list_doctype_endpoint(request: GenericToolRequest):
-    params = request.parameters or {}
-    return get_list(
-        request.doctype_name,
-        filters=params.get("filters"),
-        fields=params.get("fields"),
-        limit=params.get("limit"),
-        order_by=params.get("order_by")
-    )
+async def list_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+    with set_request_context(_build_request_context(payload)):
+        params = request.parameters or {}
+        return get_list(
+            request.doctype_name,
+            filters=params.get("filters"),
+            fields=params.get("fields"),
+            limit=params.get("limit"),
+            order_by=params.get("order_by")
+        )
 
 @app.post("/api/tools/add")
-async def add_doctype_endpoint(request: GenericToolRequest):
-    return create_document(request.doctype_name, request.parameters or {})
+async def add_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+    with set_request_context(_build_request_context(payload)):
+        return create_document(request.doctype_name, request.parameters or {})
 
 @app.put("/api/tools/update")
-async def update_doctype_endpoint(request: GenericToolRequest):
-    if not request.id:
-        raise HTTPException(status_code=400, detail="Missing record 'id' for update")
-    return update_document(request.doctype_name, request.id, request.parameters or {})
+async def update_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+    with set_request_context(_build_request_context(payload)):
+        if not request.id:
+            raise HTTPException(status_code=400, detail="Missing record 'id' for update")
+        return update_document(request.doctype_name, request.id, request.parameters or {})
 
 @app.delete("/api/tools/delete")
-async def delete_doctype_endpoint(request: GenericToolRequest):
-    if not request.id:
-        raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
-    return delete_document(request.doctype_name, request.id)
+async def delete_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+    with set_request_context(_build_request_context(payload)):
+        if not request.id:
+            raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
+        return delete_document(request.doctype_name, request.id)
 
 if __name__ == "__main__":
     import uvicorn
