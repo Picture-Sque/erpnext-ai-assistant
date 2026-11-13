@@ -24,6 +24,7 @@ SECRET = "conversations-api-test-secret-0123456789abcdef"
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("JWT_SECRET", SECRET)
+    monkeypatch.setenv("ALLOW_DEV_MOCK_AUTH", "false")
     monkeypatch.setattr(chat_store, "DB_PATH", str(tmp_path / "chat.db"))
     with TestClient(main.app) as c:
         yield c
@@ -102,7 +103,8 @@ def test_delete_removes_conversation_and_state(client):
     assert chat_store.load_session_state("a1")["detected_intent"] == ""
 
 
-def test_endpoints_require_a_token(client):
+def test_endpoints_require_a_token(client, monkeypatch):
+    monkeypatch.setenv("ALLOW_DEV_MOCK_AUTH", "false")
     assert client.get("/conversations").status_code in (401, 403)
     assert client.get("/conversations/a1/messages").status_code in (401, 403)
     assert client.delete("/conversations/a1").status_code in (401, 403)
