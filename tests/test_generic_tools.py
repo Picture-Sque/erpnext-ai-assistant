@@ -1110,6 +1110,241 @@ class TestGenericTools(unittest.TestCase):
         res = submit_document("Sales Order", "SO-001")
         self._assert_envelope(res, "system_error")
 
+    # ---------------------------------------------------------
+    # Characterization tests Part 0b: write tools, delivery_date sync,
+    # and get_count limit pinning
+    # ---------------------------------------------------------
+
+    # update_document error cases
+    def test_update_document_whitelist_rejection(self):
+        res = update_document("User", "admin", {"email": "test@example.com"})
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_update_document_not_found(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Document not found"}
+        mock_client.put.return_value = mock_resp
+
+        res = update_document("Customer", "NONEXISTENT", {"customer_name": "New"})
+        self._assert_envelope(res, "not_found")
+        self.assertIn("not found", res["error"].lower())
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_update_document_permission_denied_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=403)
+        mock_resp.json.return_value = {"message": "Forbidden update"}
+        mock_client.put.return_value = mock_resp
+
+        res = update_document("Customer", "CUST-001", {"customer_name": "New"})
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("Forbidden", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_update_document_system_error_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "Server update failure"}
+        mock_client.put.return_value = mock_resp
+
+        res = update_document("Customer", "CUST-001", {"customer_name": "New"})
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Server update failure", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_update_document_transport_exception(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_client.put.side_effect = httpx.ConnectError("Connection refused")
+
+        res = update_document("Customer", "CUST-001", {"customer_name": "New"})
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Connection refused", res["error"])
+
+    # delete_document error cases
+    def test_delete_document_whitelist_rejection(self):
+        res = delete_document("User", "admin")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_delete_document_not_found(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Document not found"}
+        mock_client.delete.return_value = mock_resp
+
+        res = delete_document("Customer", "NONEXISTENT")
+        self._assert_envelope(res, "not_found")
+        self.assertIn("not found", res["error"].lower())
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_delete_document_permission_denied_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=403)
+        mock_resp.json.return_value = {"message": "Forbidden deletion"}
+        mock_client.delete.return_value = mock_resp
+
+        res = delete_document("Customer", "CUST-001")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("Forbidden", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_delete_document_system_error_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "Server delete failure"}
+        mock_client.delete.return_value = mock_resp
+
+        res = delete_document("Customer", "CUST-001")
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Server delete failure", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_delete_document_transport_exception(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_client.delete.side_effect = httpx.ConnectError("Connection reset")
+
+        res = delete_document("Customer", "CUST-001")
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Connection reset", res["error"])
+
+    # create_document additional failure cases (403, 404, transport exception)
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_create_document_permission_denied_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=403)
+        mock_resp.json.return_value = {"message": "Forbidden creation"}
+        mock_client.post.return_value = mock_resp
+
+        res = create_document("Customer", {"customer_name": "New Co"})
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("Forbidden", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_create_document_not_found(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Endpoint not found"}
+        mock_client.post.return_value = mock_resp
+
+        res = create_document("Customer", {"customer_name": "New Co"})
+        self._assert_envelope(res, "not_found")
+        self.assertIn("not found", res["error"].lower())
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_create_document_transport_exception(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_client.post.side_effect = httpx.ConnectError("Connection timed out")
+
+        res = create_document("Customer", {"customer_name": "New Co"})
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Connection timed out", res["error"])
+
+    # Sales Order delivery_date synchronization in update_document (pinning CURRENT behavior)
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_document")
+    def test_update_sales_order_delivery_date_syncs_child_items_when_get_doc_succeeds(self, mock_get_doc, mock_client_cls):
+        """When delivery_date is updated and get_document succeeds, child items receive updated delivery_date."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "delivery_date": "2026-11-01"}}
+        mock_client.put.return_value = mock_resp
+
+        mock_get_doc.return_value = {
+            "status": "success",
+            "data": {
+                "name": "SO-001",
+                "items": [
+                    {"name": "row-1", "item_code": "ITEM-1", "delivery_date": "2026-10-01"},
+                    {"name": "row-2", "item_code": "ITEM-2", "delivery_date": "2026-10-01"}
+                ]
+            }
+        }
+
+        res = update_document("Sales Order", "SO-001", {"delivery_date": "2026-11-01"})
+        self._assert_envelope(res, "success")
+        _, kwargs = mock_client.put.call_args
+        put_payload = kwargs.get("json", {})
+        self.assertIn("items", put_payload)
+        self.assertEqual(len(put_payload["items"]), 2)
+        for row in put_payload["items"]:
+            self.assertEqual(row["delivery_date"], "2026-11-01")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_document")
+    def test_update_sales_order_delivery_date_get_doc_failure_silent_fallthrough_known_behavior(self, mock_get_doc, mock_client_cls):
+        """Documents KNOWN silent fall-through: if get_document returns not_found or system_error, PUT proceeds WITHOUT items."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "delivery_date": "2026-11-01"}}
+        mock_client.put.return_value = mock_resp
+
+        mock_get_doc.return_value = {"status": "not_found", "error": "Sales Order SO-001 not found"}
+
+        res = update_document("Sales Order", "SO-001", {"delivery_date": "2026-11-01"})
+        self._assert_envelope(res, "success")
+        _, kwargs = mock_client.put.call_args
+        put_payload = kwargs.get("json", {})
+        # Note: items is NOT in payload because the non-success status was silently ignored
+        self.assertNotIn("items", put_payload)
+        self.assertEqual(put_payload["delivery_date"], "2026-11-01")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_document")
+    def test_update_sales_order_delivery_date_get_doc_raises_silent_fallthrough_and_logs_warning(self, mock_get_doc, mock_client_cls):
+        """Documents KNOWN silent fall-through: if get_document raises an exception, warning is logged and PUT proceeds WITHOUT items."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "delivery_date": "2026-11-01"}}
+        mock_client.put.return_value = mock_resp
+
+        mock_get_doc.side_effect = RuntimeError("Simulated timeout fetching Sales Order")
+
+        with self.assertLogs("generic_tools", level="WARNING") as cm:
+            res = update_document("Sales Order", "SO-001", {"delivery_date": "2026-11-01"})
+
+        self._assert_envelope(res, "success")
+        self.assertTrue(any("Failed to synchronize items delivery_date" in msg for msg in cm.output))
+        _, kwargs = mock_client.put.call_args
+        put_payload = kwargs.get("json", {})
+        self.assertNotIn("items", put_payload)
+
+    # get_count limit pinning
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_count_pins_limit_and_page_length_param(self, mock_client_cls):
+        """Pins that get_count passes limit=999999 to get_list, which requests limit_page_length=1000000."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": [{"name": f"SO-{i}"} for i in range(5)]}
+        mock_client.get.return_value = mock_resp
+
+        res = get_count("Sales Order", filters={"status": "Draft"})
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"], 5)
+        _, kwargs = mock_client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertEqual(params["limit_page_length"], "1000000")
+        self.assertEqual(params["fields"], '["name"]')
+        self.assertEqual(params["filters"], '{"status": "Draft"}')
+
 
 if __name__ == "__main__":
     unittest.main()
