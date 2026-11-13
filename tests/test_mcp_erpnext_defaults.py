@@ -14,6 +14,7 @@ if agent_path not in sys.path:
 if root_path not in sys.path:
     sys.path.insert(0, root_path)
 
+from mcp_erpnext.client import Credentials, ERPNextClient
 from mcp_erpnext.defaults import (
     get_default_company,
     get_default_warehouse,
@@ -289,6 +290,85 @@ class TestMCPErpnextDefaults(unittest.TestCase):
 
         self.assertIn("Failed to fetch Warehouse list for 'TC' from ERPNext", str(ctx.exception))
         self.assertIn("Network unreachable", str(ctx.exception))
+
+    @patch("mcp_erpnext.client.httpx.Client")
+    def test_custom_auth_headers_caching_behavior_and_no_raw_headers_in_cache_keys(self, mock_client_cls):
+        """Through behavior: different custom headers do not share cache; same header reuses cache; raw headers never in keys."""
+        import mcp_erpnext.defaults as defaults_mod
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        token_a = "Bearer token_alpha_secret_value_123"
+        token_b = "Bearer token_beta_secret_value_456"
+
+        creds_a = Credentials(base_url="http://erp.local:8000", auth_headers={"Authorization": token_a})
+        client_a = ERPNextClient(credentials=creds_a)
+
+        creds_b = Credentials(base_url="http://erp.local:8000", auth_headers={"Authorization": token_b})
+        client_b = ERPNextClient(credentials=creds_b)
+
+        # Responses for Client A
+        resp_a = MagicMock(is_success=True, status_code=200)
+        resp_a.json.return_value = {"data": [{"name": "Company Alpha"}]}
+
+        # Responses for Client B
+        resp_b = MagicMock(is_success=True, status_code=200)
+        resp_b.json.return_value = {"data": [{"name": "Company Beta"}]}
+
+        mock_client.get.side_effect = [resp_a, resp_b]
+
+        # 1. Call for Client A: makes 1 HTTP call
+        comp_a1 = get_default_company(client=client_a)
+        self.assertEqual(comp_a1, "Company Alpha")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        # 2. Call again for Client A with same header: reuses cache (0 additional HTTP calls)
+        comp_a2 = get_default_company(client=client_a)
+        self.assertEqual(comp_a2, "Company Alpha")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        # 3. Call for Client B with different header: does not share cache (makes 2nd HTTP call)
+        comp_b = get_default_company(client=client_b)
+        self.assertEqual(comp_b, "Company Beta")
+        self.assertEqual(mock_client.get.call_count, 2)
+
+        # 4. Inspect module-level cache dict keys: raw header values must NEVER appear
+        for key in defaults_mod._company_cache.keys():
+            key_repr = repr(key)
+            self.assertNotIn("token_alpha_secret_value_123", key_repr)
+            self.assertNotIn("token_beta_secret_value_456", key_repr)
+            self.assertNotIn(token_a, key_repr)
+            self.assertNotIn(token_b, key_repr)
+
+        # 5. Warehouse caching behavior with custom headers
+        w_resp_a = MagicMock(is_success=True, status_code=200)
+        w_resp_a.json.return_value = {"data": [{"name": "Stores - Alpha", "company": "Company Alpha", "is_group": 0}]}
+        c_resp_a = MagicMock(is_success=True, status_code=200)
+        c_resp_a.json.return_value = {"data": {}}
+        s_resp_a = MagicMock(is_success=True, status_code=200)
+        s_resp_a.json.return_value = {"data": {}}
+
+        w_resp_b = MagicMock(is_success=True, status_code=200)
+        w_resp_b.json.return_value = {"data": [{"name": "Stores - Beta", "company": "Company Beta", "is_group": 0}]}
+        c_resp_b = MagicMock(is_success=True, status_code=200)
+        c_resp_b.json.return_value = {"data": {}}
+        s_resp_b = MagicMock(is_success=True, status_code=200)
+        s_resp_b.json.return_value = {"data": {}}
+
+        mock_client.get.side_effect = [w_resp_a, c_resp_a, s_resp_a, w_resp_b, c_resp_b, s_resp_b]
+
+        wh_a1 = get_default_warehouse(company="Company Alpha", client=client_a)
+        self.assertEqual(wh_a1, "Stores - Alpha")
+        wh_a2 = get_default_warehouse(company="Company Alpha", client=client_a)
+        self.assertEqual(wh_a2, "Stores - Alpha")
+
+        wh_b = get_default_warehouse(company="Company Beta", client=client_b)
+        self.assertEqual(wh_b, "Stores - Beta")
+
+        for key in defaults_mod._warehouse_cache.keys():
+            key_repr = repr(key)
+            self.assertNotIn("token_alpha_secret_value_123", key_repr)
+            self.assertNotIn("token_beta_secret_value_456", key_repr)
 
 
 if __name__ == "__main__":

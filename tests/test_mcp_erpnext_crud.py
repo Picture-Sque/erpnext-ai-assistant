@@ -11,9 +11,16 @@ if root_path not in sys.path:
     sys.path.insert(0, root_path)
 
 from mcp_erpnext.client import Credentials, ERPNextClient
+from mcp_erpnext.errors import ERPNextTransportError, ERPNextConfigError
 from mcp_erpnext.crud import (
     create_document,
     update_document,
+    get_document,
+    get_list,
+    search_document,
+    delete_document,
+    get_count,
+    aggregate,
     submit_document,
     cancel_document,
 )
@@ -178,6 +185,309 @@ class TestMCPErpnextCrudCredentialsFlow(unittest.TestCase):
         last_post_call = mock_client.post.call_args_list[-1]
         posted_data = last_post_call[1].get("json", {})
         self.assertEqual(posted_data.get("company"), "Company B")
+
+
+class TestMCPErpnextCrudDirect(unittest.TestCase):
+    """Direct tests of every CRUD function asserting 5-key envelope across all statuses."""
+
+    def setUp(self):
+        super().setUp()
+        self.mock_client = MagicMock(spec=ERPNextClient)
+
+    def _assert_envelope(self, res: dict, expected_status: str):
+        self.assertIsInstance(res, dict)
+        self.assertEqual(set(res.keys()), {"status", "data", "error", "has_more", "success"})
+        self.assertEqual(res["status"], expected_status)
+        if expected_status in ("success", "empty"):
+            self.assertTrue(res["success"])
+            self.assertIsNone(res["error"])
+        else:
+            self.assertFalse(res["success"])
+            self.assertIsNotNone(res["error"])
+
+    def _make_response(self, status_code: int, json_data: any = None, text: str = ""):
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = status_code
+        resp.is_success = (200 <= status_code < 300)
+        resp.text = text or (json.dumps(json_data) if json_data is not None else "")
+        if json_data is not None:
+            resp.json.return_value = json_data
+        else:
+            resp.json.side_effect = ValueError("Non-JSON")
+        return resp
+
+    # --- get_list ---
+    def test_get_list_success(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "Cust-1"}]})
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"], [{"name": "Cust-1"}])
+
+    def test_get_list_empty(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": []})
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "empty")
+        self.assertEqual(res["data"], [])
+
+    def test_get_list_not_found(self):
+        self.mock_client.get.return_value = self._make_response(404, {"message": "Not found"})
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_get_list_permission_denied_403(self):
+        self.mock_client.get.return_value = self._make_response(403, {"message": "Forbidden"})
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_get_list_permission_denied_whitelist(self):
+        res = get_list("ForbiddenDocType", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    def test_get_list_system_error_500(self):
+        self.mock_client.get.return_value = self._make_response(500, {"exception": "DB Error"})
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    def test_get_list_transport_error_becomes_system_error(self):
+        self.mock_client.get.side_effect = ERPNextTransportError("Connection failed")
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Connection failed", res["error"])
+
+    def test_get_list_config_error_becomes_system_error(self):
+        self.mock_client.get.side_effect = ERPNextConfigError("Missing API key")
+        res = get_list("Customer", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Missing API key", res["error"])
+
+    # --- get_document ---
+    def test_get_document_success(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": {"name": "Cust-1", "customer_name": "Acme"}})
+        res = get_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["customer_name"], "Acme")
+
+    def test_get_document_not_found(self):
+        self.mock_client.get.return_value = self._make_response(404, {"message": "Customer Cust-99 does not exist"})
+        res = get_document("Customer", "Cust-99", client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_get_document_permission_denied(self):
+        self.mock_client.get.return_value = self._make_response(401, {"message": "Unauthorized"})
+        res = get_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_get_document_system_error_500(self):
+        self.mock_client.get.return_value = self._make_response(500, text="Internal Server Error")
+        res = get_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    def test_get_document_transport_error(self):
+        self.mock_client.get.side_effect = ERPNextTransportError("Timeout")
+        res = get_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Timeout", res["error"])
+
+    def test_get_document_200_json_list_returns_invalid_json_system_error(self):
+        """A 200 response whose body is a JSON list (not object) triggers AttributeError and returns Invalid JSON response."""
+        self.mock_client.get.return_value = self._make_response(200, [{"name": "Cust-1"}])
+        res = get_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertEqual(res["error"], "Invalid JSON response")
+
+    # --- search_document ---
+    def test_search_document_success(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "Cust-1"}]})
+        res = search_document("Customer", query="Acme", client=self.mock_client)
+        self._assert_envelope(res, "success")
+
+    def test_search_document_empty(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": []})
+        res = search_document("Customer", query="Nonexistent", client=self.mock_client)
+        self._assert_envelope(res, "empty")
+
+    def test_search_document_not_found(self):
+        self.mock_client.get.return_value = self._make_response(404, {"message": "DocType not found"})
+        res = search_document("Customer", query="Acme", client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_search_document_system_error(self):
+        self.mock_client.get.return_value = self._make_response(500, {"exception": "Server Crash"})
+        res = search_document("Customer", query="Acme", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    # --- create_document ---
+    def test_create_document_success(self):
+        self.mock_client.post.return_value = self._make_response(201, {"data": {"name": "Cust-100"}})
+        res = create_document("Customer", {"customer_name": "New Corp"}, client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["name"], "Cust-100")
+
+    def test_create_document_whitelist_rejection(self):
+        res = create_document("SecretDoctype", {"field": "val"}, client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_create_document_not_found_404(self):
+        self.mock_client.post.return_value = self._make_response(404, {"message": "DocType Customer not found"})
+        res = create_document("Customer", {"customer_name": "New Corp"}, client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_create_document_permission_denied_403(self):
+        self.mock_client.post.return_value = self._make_response(403, {"message": "No write permission"})
+        res = create_document("Customer", {"customer_name": "New Corp"}, client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_create_document_system_error_500(self):
+        self.mock_client.post.return_value = self._make_response(500, {"exception": "DB write lock"})
+        res = create_document("Customer", {"customer_name": "New Corp"}, client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    def test_create_document_transport_error(self):
+        self.mock_client.post.side_effect = ERPNextTransportError("Connection reset")
+        res = create_document("Customer", {"customer_name": "New Corp"}, client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Connection reset", res["error"])
+
+    def test_create_document_200_json_list_returns_invalid_json_system_error(self):
+        self.mock_client.post.return_value = self._make_response(200, [{"name": "Cust-1"}])
+        res = create_document("Customer", {"customer_name": "New Corp"}, client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertEqual(res["error"], "Invalid JSON response")
+
+    # --- update_document ---
+    def test_update_document_success(self):
+        self.mock_client.put.return_value = self._make_response(200, {"data": {"name": "Cust-1", "phone": "12345"}})
+        res = update_document("Customer", "Cust-1", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["phone"], "12345")
+
+    def test_update_document_whitelist_rejection(self):
+        res = update_document("SecretDoctype", "S-1", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_update_document_not_found_404(self):
+        self.mock_client.put.return_value = self._make_response(404, {"message": "Cust-99 not found"})
+        res = update_document("Customer", "Cust-99", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_update_document_permission_denied_403(self):
+        self.mock_client.put.return_value = self._make_response(403, {"message": "Cannot update document"})
+        res = update_document("Customer", "Cust-1", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_update_document_system_error_500(self):
+        self.mock_client.put.return_value = self._make_response(500, {"exception": "Update failed"})
+        res = update_document("Customer", "Cust-1", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    def test_update_document_transport_error(self):
+        self.mock_client.put.side_effect = ERPNextTransportError("Host down")
+        res = update_document("Customer", "Cust-1", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Host down", res["error"])
+
+    def test_update_document_200_json_list_returns_invalid_json_system_error(self):
+        self.mock_client.put.return_value = self._make_response(200, [{"name": "Cust-1"}])
+        res = update_document("Customer", "Cust-1", {"phone": "12345"}, client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertEqual(res["error"], "Invalid JSON response")
+
+    # --- delete_document ---
+    def test_delete_document_success(self):
+        self.mock_client.delete.return_value = self._make_response(200, {"message": "ok"})
+        res = delete_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "success")
+
+    def test_delete_document_whitelist_rejection(self):
+        res = delete_document("SecretDoctype", "S-1", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_delete_document_not_found_404(self):
+        self.mock_client.delete.return_value = self._make_response(404, {"message": "Not found"})
+        res = delete_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_delete_document_permission_denied_403(self):
+        self.mock_client.delete.return_value = self._make_response(403, {"message": "Delete forbidden"})
+        res = delete_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_delete_document_system_error_500(self):
+        self.mock_client.delete.return_value = self._make_response(500, text="Crash")
+        res = delete_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    def test_delete_document_transport_error(self):
+        self.mock_client.delete.side_effect = ERPNextTransportError("Network error")
+        res = delete_document("Customer", "Cust-1", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Network error", res["error"])
+
+    # --- get_count ---
+    def test_get_count_success(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C1"}, {"name": "C2"}]})
+        res = get_count("Customer", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"], 2)
+
+    def test_get_count_empty(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": []})
+        res = get_count("Customer", client=self.mock_client)
+        self._assert_envelope(res, "empty")
+        self.assertEqual(res["data"], 0)
+
+    def test_get_count_system_error_500(self):
+        self.mock_client.get.return_value = self._make_response(500, text="Internal error")
+        res = get_count("Customer", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    # --- aggregate ---
+    def test_aggregate_success(self):
+        self.mock_client.get.return_value = self._make_response(200, {
+            "data": [
+                {"name": "SO-1", "customer": "Acme", "grand_total": 100.0},
+                {"name": "SO-2", "customer": "Acme", "grand_total": 200.0},
+                {"name": "SO-3", "customer": "Beta", "grand_total": 50.0},
+            ]
+        })
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(len(res["data"]), 2)
+
+    def test_aggregate_empty(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": []})
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "empty")
+        self.assertEqual(res["data"], [])
+
+    def test_aggregate_system_error_500(self):
+        self.mock_client.get.return_value = self._make_response(500, text="Server Error")
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+
+    # --- submit_document and cancel_document ---
+    def test_submit_document_success(self):
+        self.mock_client.put.return_value = self._make_response(200, {"data": {"name": "SO-001", "docstatus": 1}})
+        res = submit_document("Sales Order", "SO-001", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["docstatus"], 1)
+
+    def test_cancel_document_success(self):
+        self.mock_client.put.return_value = self._make_response(200, {"data": {"name": "SO-001", "docstatus": 2}})
+        res = cancel_document("Sales Order", "SO-001", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["docstatus"], 2)
+
+    def test_submit_document_not_found(self):
+        self.mock_client.put.return_value = self._make_response(404, {"message": "SO-99 not found"})
+        res = submit_document("Sales Order", "SO-99", client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+
+    def test_cancel_document_permission_denied(self):
+        self.mock_client.put.return_value = self._make_response(403, {"message": "Not allowed to cancel"})
+        res = cancel_document("Sales Order", "SO-001", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
 
 
 if __name__ == "__main__":

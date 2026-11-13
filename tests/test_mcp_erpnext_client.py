@@ -6,17 +6,13 @@ import httpx
 import pytest
 from unittest.mock import MagicMock, patch
 
-# Ensure root and agent directories are on sys.path
+# Ensure root directory is on sys.path
 root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-agent_path = os.path.join(root_path, "agent")
-if agent_path not in sys.path:
-    sys.path.insert(0, agent_path)
 if root_path not in sys.path:
     sys.path.insert(0, root_path)
 
 from mcp_erpnext.client import Credentials, ERPNextClient, get_env_credentials
 from mcp_erpnext.errors import ERPNextConfigError, ERPNextTransportError, ERPNextError, extract_erpnext_error as mcp_extract_error
-import agent.tools.generic_tools as generic_tools
 
 
 class TestMCPErpnextClient(unittest.TestCase):
@@ -212,22 +208,8 @@ class TestMCPErpnextClient(unittest.TestCase):
         # Assert exactly one call was made - NO retries!
         self.assertEqual(mock_client.post.call_count, 1)
 
-    def test_credentials_get_headers_parity_with_get_auth_headers(self):
-        """Credentials.get_headers returns identical headers to agent.tools.erpnext_client.get_auth_headers for same keys."""
-        import agent.tools.erpnext_client as ec
-        with patch.object(ec, "ERPNEXT_API_KEY", "parity_key_abc"), \
-             patch.object(ec, "ERPNEXT_API_SECRET", "parity_secret_xyz"):
-            legacy_headers = ec.get_auth_headers()
-            creds = Credentials(
-                base_url="http://localhost:8081",
-                api_key="parity_key_abc",
-                api_secret="parity_secret_xyz"
-            )
-            new_headers = creds.get_headers()
-            self.assertEqual(legacy_headers, new_headers)
-
     # -------------------------------------------------------------
-    # Parity tests: generic_tools vs mcp_erpnext extract_erpnext_error
+    # Error extraction tests: extract_erpnext_error
     # -------------------------------------------------------------
 
     def _create_mock_response(self, status_code: int, json_data: any = None, text: str = ""):
@@ -240,48 +222,38 @@ class TestMCPErpnextClient(unittest.TestCase):
             resp.json.side_effect = ValueError("Non-JSON")
         return resp
 
-    def test_extract_erpnext_error_parity_server_messages(self):
+    def test_extract_erpnext_error_server_messages(self):
         resp = self._create_mock_response(400, {
             "_server_messages": json.dumps([json.dumps({"message": "Mandatory fields required"})])
         })
-        old_out = generic_tools.extract_erpnext_error(resp)
         new_out = mcp_extract_error(resp)
-        self.assertEqual(old_out, new_out)
         self.assertEqual(new_out, "Mandatory fields required")
 
-    def test_extract_erpnext_error_parity_nested_json(self):
+    def test_extract_erpnext_error_nested_json(self):
         resp = self._create_mock_response(400, {
             "_server_messages": json.dumps([
                 json.dumps({"message": "Invalid company warehouse combination"}),
                 json.dumps({"message": "Stock not available"})
             ])
         })
-        old_out = generic_tools.extract_erpnext_error(resp)
         new_out = mcp_extract_error(resp)
-        self.assertEqual(old_out, new_out)
         self.assertEqual(new_out, "Invalid company warehouse combination | Stock not available")
 
-    def test_extract_erpnext_error_parity_exception_field(self):
+    def test_extract_erpnext_error_exception_field(self):
         resp = self._create_mock_response(500, {
             "exception": "frappe.exceptions.ValidationError: Row 1 warehouse does not belong to company"
         })
-        old_out = generic_tools.extract_erpnext_error(resp)
         new_out = mcp_extract_error(resp)
-        self.assertEqual(old_out, new_out)
         self.assertEqual(new_out, "frappe.exceptions.ValidationError: Row 1 warehouse does not belong to company")
 
-    def test_extract_erpnext_error_parity_plain_message(self):
+    def test_extract_erpnext_error_plain_message(self):
         resp = self._create_mock_response(404, {"message": "Document SO-99999 does not exist"})
-        old_out = generic_tools.extract_erpnext_error(resp)
         new_out = mcp_extract_error(resp)
-        self.assertEqual(old_out, new_out)
         self.assertEqual(new_out, "Document SO-99999 does not exist")
 
-    def test_extract_erpnext_error_parity_non_json_body(self):
+    def test_extract_erpnext_error_non_json_body(self):
         resp = self._create_mock_response(502, json_data=None, text="Bad Gateway - Nginx")
-        old_out = generic_tools.extract_erpnext_error(resp)
         new_out = mcp_extract_error(resp)
-        self.assertEqual(old_out, new_out)
         self.assertEqual(new_out, "HTTP 502: Bad Gateway - Nginx")
 
 

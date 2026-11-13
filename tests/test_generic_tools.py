@@ -32,6 +32,7 @@ from agent.tools.generic_tools import (
     get_default_warehouse,
 )
 import agent.tools.generic_tools as generic_tools
+from mcp_erpnext.client import Credentials
 from mcp_erpnext.defaults import reset_resolver_caches
 
 
@@ -1459,6 +1460,20 @@ class TestGenericTools(unittest.TestCase):
         c3 = get_default_company()
         self.assertEqual(c3, "Company A")
         self.assertEqual(mock_client.get.call_count, 2)
+
+    def test_credentials_get_headers_parity_with_get_auth_headers(self):
+        """Credentials.get_headers returns identical headers to agent.tools.erpnext_client.get_auth_headers for same keys."""
+        import agent.tools.erpnext_client as ec
+        with patch.object(ec, "ERPNEXT_API_KEY", "parity_key_abc"), \
+             patch.object(ec, "ERPNEXT_API_SECRET", "parity_secret_xyz"):
+            legacy_headers = ec.get_auth_headers()
+            creds = Credentials(
+                base_url="http://localhost:8081",
+                api_key="parity_key_abc",
+                api_secret="parity_secret_xyz"
+            )
+            new_headers = creds.get_headers()
+            self.assertEqual(legacy_headers, new_headers)
 
 
 if __name__ == "__main__":
