@@ -21,6 +21,7 @@ from mcp_erpnext.crud import (
     delete_document,
     get_count,
     aggregate,
+    MAX_AGGREGATE_GROUPS,
     submit_document,
     cancel_document,
 )
@@ -553,6 +554,131 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
         self.mock_client.get.return_value = self._make_response(500, text="Server Error")
         res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
         self._assert_envelope(res, "system_error")
+
+    # --- aggregate: database-side path ---
+    def _db_rows(self, rows):
+        return self._make_response(200, {"data": rows})
+
+    def test_aggregate_database_side_request_shape(self):
+        self.mock_client.get.return_value = self._db_rows([{"customer": "Acme", "agg_value": 300.0}])
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total",
+                        aggregation_fn="sum", filters=[["docstatus", "=", 1]], client=self.mock_client)
+        self.assertEqual(self.mock_client.get.call_count, 1)
+        _, kwargs = self.mock_client.get.call_args
+        params = kwargs["params"]
+        self.assertEqual(params["group_by"], "customer")
+        self.assertEqual(json.loads(params["fields"]), ["customer", "sum(grand_total) as agg_value"])
+        self.assertEqual(params["limit_page_length"], str(MAX_AGGREGATE_GROUPS + 1))
+        self.assertEqual(res["data"], [{"customer": "Acme", "grand_total": 300.0}])
+        self.assertEqual(res["total_count"], 1)
+        self.assertFalse(res["truncated"])
+
+    def test_aggregate_count_uses_count_name(self):
+        self.mock_client.get.return_value = self._db_rows([{"status": "Draft", "agg_value": 4}])
+        res = aggregate("Sales Order", group_by="status", metric="name", aggregation_fn="count", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(json.loads(kwargs["params"]["fields"]), ["status", "count(name) as agg_value"])
+        self.assertEqual(res["data"], [{"status": "Draft", "name": 4}])
+        self.assertIsInstance(res["data"][0]["name"], int)
+
+    def test_aggregate_database_side_sort_and_limit(self):
+        self.mock_client.get.return_value = self._db_rows([
+            {"customer": "A", "agg_value": 10}, {"customer": "B", "agg_value": 30},
+            {"customer": "C", "agg_value": 20},
+        ])
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum",
+                        sort="grand_total desc", limit=2, client=self.mock_client)
+        self.assertEqual([r["customer"] for r in res["data"]], ["B", "C"])
+        self.assertEqual(res["total_count"], 3)
+
+    def test_aggregate_null_group_and_null_metric(self):
+        self.mock_client.get.return_value = self._db_rows([
+            {"customer": None, "agg_value": None}, {"customer": "B", "agg_value": 5},
+        ])
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        by_group = {r["customer"]: r["grand_total"] for r in res["data"]}
+        self.assertEqual(by_group, {"Unknown": 0.0, "B": 5.0})
+
+    def test_aggregate_flags_truncated_when_group_cap_is_hit(self):
+        rows = [{"customer": f"C{i}", "agg_value": i} for i in range(MAX_AGGREGATE_GROUPS + 1)]
+        self.mock_client.get.return_value = self._db_rows(rows)
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["total_count"], MAX_AGGREGATE_GROUPS)
+
+    def test_aggregate_falls_back_when_erpnext_ignores_aggregate_fields(self):
+        self.mock_client.get.side_effect = [
+            self._db_rows([{"customer": "Acme"}, {"customer": "Acme"}]),  # no agg_value: query ignored
+            self._db_rows([
+                {"name": "SO-1", "customer": "Acme", "grand_total": 100},
+                {"name": "SO-2", "customer": "Acme", "grand_total": 200},
+            ]),
+        ]
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self.assertEqual(self.mock_client.get.call_count, 2)
+        self.assertEqual(res["data"], [{"customer": "Acme", "grand_total": 300.0}])
+
+    def test_aggregate_falls_back_on_system_error_from_database_query(self):
+        self.mock_client.get.side_effect = [
+            self._make_response(417, {"exception": "frappe.exceptions.ValidationError: bad field"}),
+            self._db_rows([{"name": "SO-1", "customer": "Acme", "grand_total": 50}]),
+        ]
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual(self.mock_client.get.call_count, 2)
+
+    def test_aggregate_no_fallback_on_permission_denied(self):
+        self.mock_client.get.return_value = self._make_response(403, {"message": "no"})
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+        self.assertEqual(self.mock_client.get.call_count, 1)
+
+    def test_aggregate_no_fallback_on_not_found(self):
+        self.mock_client.get.return_value = self._make_response(404, {"message": "nope"})
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "not_found")
+        self.assertEqual(self.mock_client.get.call_count, 1)
+
+    def test_aggregate_python_fallback_handles_null_metric(self):
+        self.mock_client.get.side_effect = [
+            self._db_rows([{"customer": "Acme"}]),
+            self._db_rows([
+                {"name": "SO-1", "customer": "Acme", "grand_total": None},
+                {"name": "SO-2", "customer": None, "grand_total": 7},
+            ]),
+        ]
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual({r["customer"]: r["grand_total"] for r in res["data"]}, {"Acme": 0.0, "Unknown": 7.0})
+
+    def test_aggregate_python_fallback_rejects_non_numeric_metric(self):
+        self.mock_client.get.side_effect = [
+            self._db_rows([{"customer": "Acme"}]),
+            self._db_rows([{"name": "SO-1", "customer": "Acme", "grand_total": "abc"}]),
+        ]
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.assertIn("non-numeric", res["error"])
+
+    def test_aggregate_rejects_unsafe_or_unknown_inputs_without_a_call(self):
+        bad_calls = [
+            dict(group_by="customer; DROP TABLE x", metric="grand_total", aggregation_fn="sum"),
+            dict(group_by="customer", metric="sum(grand_total)", aggregation_fn="sum"),
+            dict(group_by="customer", metric="grand_total", aggregation_fn="median"),
+            dict(group_by="customer", metric="grand_total", aggregation_fn="sum", sort="other desc"),
+            dict(group_by="customer", metric="grand_total", aggregation_fn="sum", sort="grand_total sideways"),
+            dict(group_by="customer", metric="grand_total", aggregation_fn="sum", limit=-1),
+            dict(group_by="customer", metric="grand_total", aggregation_fn="sum", limit="5"),
+        ]
+        for kwargs in bad_calls:
+            res = aggregate("Sales Order", client=self.mock_client, **kwargs)
+            self._assert_envelope(res, "system_error")
+        self.mock_client.get.assert_not_called()
+
+    def test_get_list_rejects_unsafe_group_by(self):
+        res = get_list("Customer", group_by="a b", client=self.mock_client)
+        self._assert_envelope(res, "system_error")
+        self.mock_client.get.assert_not_called()
 
     # --- submit_document and cancel_document ---
     def test_submit_document_success(self):

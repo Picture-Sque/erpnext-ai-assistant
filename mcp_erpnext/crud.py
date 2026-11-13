@@ -19,6 +19,15 @@ ORDER_BY_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+# Aggregation functions allowed in aggregate(), mapped to the SQL function ERPNext evaluates.
+AGGREGATION_FUNCTIONS = {"sum": "sum", "avg": "avg", "count": "count", "max": "max", "min": "min"}
+
+# Upper bound on the number of groups one aggregate() call asks ERPNext for.
+# If ERPNext returns this many, the result is flagged truncated.
+MAX_AGGREGATE_GROUPS = 5000
+
 DEFAULT_WHITELIST = [
     "Customer", "Item", "Sales Order", "Bin",
     "Quotation", "Sales Invoice", "Purchase Order",
@@ -118,6 +127,7 @@ def get_list(
     client: Optional[ERPNextClient] = None,
     offset: Optional[int] = 0,
     include_total: bool = False,
+    group_by: Optional[str] = None,
 ) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result(
@@ -139,7 +149,15 @@ def get_list(
             error=f"Invalid offset: {offset!r}. Must be a non-negative integer."
         )
 
+    if group_by is not None and (not isinstance(group_by, str) or not IDENTIFIER_PATTERN.match(group_by)):
+        return _format_result(
+            "system_error",
+            error=f"Invalid group_by field: {group_by!r}. Must be a single field name."
+        )
+
     query_params = {}
+    if group_by:
+        query_params["group_by"] = group_by
     if filters:
         if isinstance(filters, list) or isinstance(filters, dict):
             query_params["filters"] = json.dumps(filters)
@@ -449,6 +467,127 @@ def get_count(doctype: str, filters: Optional[dict] = None, client: Optional[ERP
         return _format_result("system_error", error=str(e))
 
 
+def _finish_aggregate(
+    groups: Dict[str, Any],
+    group_by: str,
+    metric: str,
+    aggregation_fn: str,
+    sort: Optional[str],
+    limit: Optional[int],
+    truncated: bool,
+) -> dict:
+    """Sort, limit and wrap grouped values as [{group_by: g, metric: v}, ...]."""
+    result_list = [{group_by: g, metric: v} for g, v in groups.items()]
+    if not result_list:
+        return _format_result("empty", data=[], pagination=_page_meta(0, 0, limit, truncated))
+
+    if sort:
+        parts = sort.split()
+        reverse = len(parts) == 2 and parts[1].lower() == "desc"
+        result_list.sort(key=lambda x: x[parts[0]], reverse=reverse)
+    if limit:
+        result_list = result_list[:limit]
+
+    return _format_result(
+        "success",
+        data=result_list,
+        pagination=_page_meta(len(groups), 0, limit, truncated),
+    )
+
+
+def _aggregate_in_database(
+    doctype: str,
+    group_by: str,
+    metric: str,
+    aggregation_fn: str,
+    filters: Optional[dict],
+    client: Optional[ERPNextClient],
+) -> dict:
+    """
+    Ask ERPNext to group and aggregate. Returns {group value: aggregated value} wrapped in
+    an envelope-like dict: {"status": ..., "groups": {...}, "truncated": bool} on success,
+    or the failing envelope. "unsupported" means ERPNext did not honour the query.
+    """
+    sql_fn = AGGREGATION_FUNCTIONS[aggregation_fn]
+    target = "name" if aggregation_fn == "count" else metric
+    res = get_list(
+        doctype,
+        filters=filters,
+        fields=[group_by, f"{sql_fn}({target}) as agg_value"],
+        limit=MAX_AGGREGATE_GROUPS,
+        group_by=group_by,
+        client=client,
+    )
+    if res["status"] not in ("success", "empty"):
+        return res
+
+    groups: Dict[str, Any] = {}
+    for row in res.get("data") or []:
+        if not isinstance(row, dict) or "agg_value" not in row:
+            # ERPNext ignored the aggregate fields and returned plain documents.
+            return {"status": "unsupported"}
+        g_val = row.get(group_by)
+        g_key = "Unknown" if g_val is None else str(g_val)
+        raw = row["agg_value"]
+        if aggregation_fn == "count":
+            value: Any = int(raw or 0)
+        else:
+            value = float(raw or 0)
+        if g_key in groups:
+            # Two raw values that stringify the same cannot be merged safely for avg/min/max.
+            return {"status": "unsupported"}
+        groups[g_key] = value
+    return {"status": "ok", "groups": groups, "truncated": bool(res.get("has_more"))}
+
+
+def _aggregate_in_python(
+    doctype: str,
+    group_by: str,
+    metric: str,
+    aggregation_fn: str,
+    filters: Optional[dict],
+    client: Optional[ERPNextClient],
+) -> dict:
+    """Fallback: fetch the rows and aggregate here. Used when the database path is unavailable."""
+    fields = ["name", group_by, metric]
+    res = get_list(doctype, filters=filters, fields=fields, limit=999999, client=client)
+    if res["status"] not in ("success", "empty"):
+        return res
+
+    agg: Dict[str, Any] = {}
+    counts: Dict[str, int] = {}
+    for row in res.get("data") or []:
+        g_val = row.get(group_by)
+        g_key = "Unknown" if g_val is None else str(g_val)
+        if aggregation_fn == "count":
+            m_val: Any = 1
+        else:
+            try:
+                m_val = float(row.get(metric) or 0)
+            except (TypeError, ValueError):
+                return _format_result(
+                    "system_error",
+                    error=f"Field '{metric}' has a non-numeric value and cannot be aggregated with '{aggregation_fn}'."
+                )
+
+        if g_key not in agg:
+            agg[g_key] = 0 if aggregation_fn in ("sum", "avg", "count") else m_val
+            counts[g_key] = 0
+
+        counts[g_key] += 1
+        if aggregation_fn in ("sum", "avg", "count"):
+            agg[g_key] += m_val
+        elif aggregation_fn == "max":
+            agg[g_key] = max(agg[g_key], m_val)
+        elif aggregation_fn == "min":
+            agg[g_key] = min(agg[g_key], m_val)
+
+    if aggregation_fn == "avg":
+        for g_key in agg:
+            agg[g_key] = agg[g_key] / counts[g_key]
+    return {"status": "ok", "groups": agg, "truncated": bool(res.get("has_more"))}
+
+
 def aggregate(
     doctype: str,
     group_by: str,
@@ -462,52 +601,46 @@ def aggregate(
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-    # We compute aggregation tool-level, fetching all required fields first.
-    fields = ["name", group_by, metric]
-    res = get_list(doctype, filters=filters, fields=fields, limit=999999, client=client)
-    if res["status"] not in ("success", "empty"):
-        return res
-
-    data = res.get("data", [])
-    if not data:
-        return _format_result("empty", data=[])
-
-    agg = {}
-    counts = {}
-
-    for row in data:
-        g_val = str(row.get(group_by, "Unknown"))
-        m_val = float(row.get(metric, 0)) if aggregation_fn != "count" else 1
-
-        if g_val not in agg:
-            agg[g_val] = 0 if aggregation_fn in ("sum", "avg", "count") else m_val
-            counts[g_val] = 0
-
-        counts[g_val] += 1
-        if aggregation_fn in ("sum", "avg", "count"):
-            agg[g_val] += m_val
-        elif aggregation_fn == "max":
-            agg[g_val] = max(agg[g_val], m_val)
-        elif aggregation_fn == "min":
-            agg[g_val] = min(agg[g_val], m_val)
-
-    result_list = []
-    for g_val, val in agg.items():
-        if aggregation_fn == "avg" and counts[g_val] > 0:
-            val = val / counts[g_val]
-        result_list.append({group_by: g_val, metric: val})
-
+    # Field names and the function end up inside the query sent to ERPNext, so they are
+    # validated here and never passed through as free text.
+    for label, value in (("group_by", group_by), ("metric", metric)):
+        if not isinstance(value, str) or not IDENTIFIER_PATTERN.match(value):
+            return _format_result("system_error", error=f"Invalid {label} field: {value!r}. Must be a single field name.")
+    if aggregation_fn not in AGGREGATION_FUNCTIONS:
+        return _format_result(
+            "system_error",
+            error=f"Unsupported aggregation_fn: {aggregation_fn!r}. Use one of: {', '.join(AGGREGATION_FUNCTIONS)}."
+        )
     if sort:
-        parts = sort.split()
-        if len(parts) == 2 and parts[1].lower() == "desc":
-            result_list.sort(key=lambda x: x.get(parts[0], 0), reverse=True)
-        else:
-            result_list.sort(key=lambda x: x.get(parts[0], 0))
+        sort_parts = str(sort).split()
+        if (
+            len(sort_parts) not in (1, 2)
+            or sort_parts[0] not in (group_by, metric)
+            or (len(sort_parts) == 2 and sort_parts[1].lower() not in ("asc", "desc"))
+        ):
+            return _format_result(
+                "system_error",
+                error=f"Invalid sort: {sort!r}. Use '<{group_by}|{metric}> [asc|desc]'."
+            )
+        sort = " ".join(sort_parts)
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+        return _format_result("system_error", error=f"Invalid limit: {limit!r}. Must be a non-negative integer.")
 
-    if limit:
-        result_list = result_list[:limit]
+    outcome = _aggregate_in_database(doctype, group_by, metric, aggregation_fn, filters, client)
+    if outcome["status"] in ("system_error", "unsupported"):
+        # Only a failure of the aggregate query itself justifies the slower path. Permission
+        # and not-found results are returned as they are.
+        logger.warning(
+            f"Database-side aggregation unavailable for {doctype} ({outcome.get('error') or 'ignored by ERPNext'}); "
+            "falling back to Python-side aggregation."
+        )
+        outcome = _aggregate_in_python(doctype, group_by, metric, aggregation_fn, filters, client)
 
-    return _format_result("success", data=result_list)
+    if outcome["status"] != "ok":
+        return outcome
+    return _finish_aggregate(
+        outcome["groups"], group_by, metric, aggregation_fn, sort, limit, outcome["truncated"]
+    )
 
 
 def cancel_document(doctype: str, name: str, client: Optional[ERPNextClient] = None) -> dict:
