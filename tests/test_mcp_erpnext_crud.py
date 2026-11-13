@@ -567,7 +567,7 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
         _, kwargs = self.mock_client.get.call_args
         params = kwargs["params"]
         self.assertEqual(params["group_by"], "customer")
-        self.assertEqual(json.loads(params["fields"]), ["customer", "sum(grand_total) as agg_value"])
+        self.assertEqual(json.loads(params["fields"]), ["customer", {"SUM": "grand_total", "as": "agg_value"}])
         self.assertEqual(params["limit_page_length"], str(MAX_AGGREGATE_GROUPS + 1))
         self.assertEqual(res["data"], [{"customer": "Acme", "grand_total": 300.0}])
         self.assertEqual(res["total_count"], 1)
@@ -577,7 +577,7 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
         self.mock_client.get.return_value = self._db_rows([{"status": "Draft", "agg_value": 4}])
         res = aggregate("Sales Order", group_by="status", metric="name", aggregation_fn="count", client=self.mock_client)
         _, kwargs = self.mock_client.get.call_args
-        self.assertEqual(json.loads(kwargs["params"]["fields"]), ["status", "count(name) as agg_value"])
+        self.assertEqual(json.loads(kwargs["params"]["fields"]), ["status", {"COUNT": "name", "as": "agg_value"}])
         self.assertEqual(res["data"], [{"status": "Draft", "name": 4}])
         self.assertIsInstance(res["data"][0]["name"], int)
 
@@ -673,6 +673,64 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
         for kwargs in bad_calls:
             res = aggregate("Sales Order", client=self.mock_client, **kwargs)
             self._assert_envelope(res, "system_error")
+        self.mock_client.get.assert_not_called()
+
+    def test_aggregate_ties_come_out_in_a_stable_order(self):
+        self.mock_client.get.return_value = self._db_rows([
+            {"item_code": "B", "agg_value": 50}, {"item_code": "A", "agg_value": 50},
+            {"item_code": "C", "agg_value": 90},
+        ])
+        desc = aggregate("Sales Order Item", group_by="item_code", metric="qty", aggregation_fn="sum",
+                         sort="qty desc", client=self.mock_client)
+        self.assertEqual([r["item_code"] for r in desc["data"]], ["C", "A", "B"])
+        asc = aggregate("Sales Order Item", group_by="item_code", metric="qty", aggregation_fn="sum",
+                        sort="qty asc", client=self.mock_client)
+        self.assertEqual([r["item_code"] for r in asc["data"]], ["A", "B", "C"])
+
+    # --- child tables (parent_doctype) ---
+    def test_get_list_child_table_sends_parent_param(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"item_code": "X", "qty": 1}]})
+        get_list("Sales Order Item", fields=["item_code", "qty"], parent_doctype="Sales Order", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(kwargs["params"]["parent"], "Sales Order")
+
+    def test_get_list_without_parent_sends_no_parent_param(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C1"}]})
+        get_list("Customer", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertNotIn("parent", kwargs["params"])
+
+    def test_get_list_parent_doctype_must_be_whitelisted(self):
+        res = get_list("Sales Order Item", parent_doctype="User", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+        self.mock_client.get.assert_not_called()
+
+    def test_aggregate_child_table_database_side(self):
+        self.mock_client.get.return_value = self._db_rows([{"item_code": "ITEM-1", "agg_value": 12.0}])
+        flt = [["docstatus", "=", "1"], ["Sales Order", "transaction_date", ">=", "2026-07-01"]]
+        res = aggregate("Sales Order Item", group_by="item_code", metric="qty", aggregation_fn="sum",
+                        filters=flt, parent_doctype="Sales Order", client=self.mock_client)
+        self.assertEqual(self.mock_client.get.call_count, 1)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(kwargs["params"]["parent"], "Sales Order")
+        self.assertEqual(json.loads(kwargs["params"]["filters"]), flt)
+        self.assertEqual(res["data"], [{"item_code": "ITEM-1", "qty": 12.0}])
+
+    def test_aggregate_child_table_fallback_keeps_parent_param(self):
+        self.mock_client.get.side_effect = [
+            self._make_response(417, {"exception": "ValidationError"}),
+            self._db_rows([{"name": "r1", "item_code": "ITEM-1", "qty": 3}, {"name": "r2", "item_code": "ITEM-1", "qty": 4}]),
+        ]
+        res = aggregate("Sales Order Item", group_by="item_code", metric="qty", aggregation_fn="sum",
+                        parent_doctype="Sales Order", client=self.mock_client)
+        self.assertEqual(res["data"], [{"item_code": "ITEM-1", "qty": 7.0}])
+        for call in self.mock_client.get.call_args_list:
+            self.assertEqual(call.kwargs["params"]["parent"], "Sales Order")
+
+    def test_aggregate_parent_doctype_must_be_whitelisted(self):
+        res = aggregate("Sales Order Item", group_by="item_code", metric="qty", aggregation_fn="sum",
+                        parent_doctype="User", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
         self.mock_client.get.assert_not_called()
 
     def test_get_list_rejects_unsafe_group_by(self):

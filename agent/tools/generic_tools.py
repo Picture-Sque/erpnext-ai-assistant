@@ -112,7 +112,8 @@ def aggregate(
     aggregation_fn: str,
     filters: Optional[dict] = None,
     sort: Optional[str] = None,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    parent_doctype: Optional[str] = None,
 ) -> dict:
     return crud.aggregate(
         doctype=doctype,
@@ -122,6 +123,7 @@ def aggregate(
         filters=filters,
         sort=sort,
         limit=limit,
+        parent_doctype=parent_doctype,
     )
 
 

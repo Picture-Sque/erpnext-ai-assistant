@@ -128,6 +128,7 @@ def get_list(
     offset: Optional[int] = 0,
     include_total: bool = False,
     group_by: Optional[str] = None,
+    parent_doctype: Optional[str] = None,
 ) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result(
@@ -155,7 +156,18 @@ def get_list(
             error=f"Invalid group_by field: {group_by!r}. Must be a single field name."
         )
 
+    # Child tables (for example Sales Order Item) only return their fields when ERPNext is told
+    # which parent doctype they belong to. Filters on parent fields use the four-item form
+    # [parent_doctype, field, operator, value].
+    if parent_doctype is not None and not is_doctype_allowed(parent_doctype):
+        return _format_result(
+            "permission_denied",
+            error=f"DocType '{parent_doctype}' is not permitted by whitelist."
+        )
+
     query_params = {}
+    if parent_doctype:
+        query_params["parent"] = parent_doctype
     if group_by:
         query_params["group_by"] = group_by
     if filters:
@@ -484,6 +496,9 @@ def _finish_aggregate(
     if sort:
         parts = sort.split()
         reverse = len(parts) == 2 and parts[1].lower() == "desc"
+        # Order by group name first, then by the requested field. The sort is stable, so
+        # equal values always come out in the same (alphabetical) order.
+        result_list.sort(key=lambda x: str(x[group_by]))
         result_list.sort(key=lambda x: x[parts[0]], reverse=reverse)
     if limit:
         result_list = result_list[:limit]
@@ -502,6 +517,7 @@ def _aggregate_in_database(
     aggregation_fn: str,
     filters: Optional[dict],
     client: Optional[ERPNextClient],
+    parent_doctype: Optional[str] = None,
 ) -> dict:
     """
     Ask ERPNext to group and aggregate. Returns {group value: aggregated value} wrapped in
@@ -513,10 +529,13 @@ def _aggregate_in_database(
     res = get_list(
         doctype,
         filters=filters,
-        fields=[group_by, f"{sql_fn}({target}) as agg_value"],
+        # Frappe 16 rejects SQL functions written as strings ("sum(x) as y"); it wants the
+        # dict form. Verified against Frappe 16.24 for SUM, COUNT, AVG, MAX and MIN.
+        fields=[group_by, {sql_fn.upper(): target, "as": "agg_value"}],
         limit=MAX_AGGREGATE_GROUPS,
         group_by=group_by,
         client=client,
+        parent_doctype=parent_doctype,
     )
     if res["status"] not in ("success", "empty"):
         return res
@@ -547,10 +566,14 @@ def _aggregate_in_python(
     aggregation_fn: str,
     filters: Optional[dict],
     client: Optional[ERPNextClient],
+    parent_doctype: Optional[str] = None,
 ) -> dict:
     """Fallback: fetch the rows and aggregate here. Used when the database path is unavailable."""
     fields = ["name", group_by, metric]
-    res = get_list(doctype, filters=filters, fields=fields, limit=999999, client=client)
+    res = get_list(
+        doctype, filters=filters, fields=fields, limit=999999, client=client,
+        parent_doctype=parent_doctype,
+    )
     if res["status"] not in ("success", "empty"):
         return res
 
@@ -597,9 +620,12 @@ def aggregate(
     sort: Optional[str] = None,
     limit: Optional[int] = None,
     client: Optional[ERPNextClient] = None,
+    parent_doctype: Optional[str] = None,
 ) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+    if parent_doctype is not None and not is_doctype_allowed(parent_doctype):
+        return _format_result("permission_denied", error=f"DocType '{parent_doctype}' is not permitted by whitelist.")
 
     # Field names and the function end up inside the query sent to ERPNext, so they are
     # validated here and never passed through as free text.
@@ -626,7 +652,7 @@ def aggregate(
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
         return _format_result("system_error", error=f"Invalid limit: {limit!r}. Must be a non-negative integer.")
 
-    outcome = _aggregate_in_database(doctype, group_by, metric, aggregation_fn, filters, client)
+    outcome = _aggregate_in_database(doctype, group_by, metric, aggregation_fn, filters, client, parent_doctype)
     if outcome["status"] in ("system_error", "unsupported"):
         # Only a failure of the aggregate query itself justifies the slower path. Permission
         # and not-found results are returned as they are.
@@ -634,7 +660,7 @@ def aggregate(
             f"Database-side aggregation unavailable for {doctype} ({outcome.get('error') or 'ignored by ERPNext'}); "
             "falling back to Python-side aggregation."
         )
-        outcome = _aggregate_in_python(doctype, group_by, metric, aggregation_fn, filters, client)
+        outcome = _aggregate_in_python(doctype, group_by, metric, aggregation_fn, filters, client, parent_doctype)
 
     if outcome["status"] != "ok":
         return outcome
