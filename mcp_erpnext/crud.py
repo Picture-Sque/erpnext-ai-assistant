@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Callable
 import httpx
 
+from mcp_erpnext.aggregation import AGGREGATION_FUNCTIONS, aggregate_rows, group_key
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.defaults import get_default_company, get_default_warehouse
 from mcp_erpnext.errors import ERPNextError, extract_erpnext_error
@@ -20,9 +21,6 @@ ORDER_BY_PATTERN = re.compile(
 )
 
 IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-
-# Aggregation functions allowed in aggregate(), mapped to the SQL function ERPNext evaluates.
-AGGREGATION_FUNCTIONS = {"sum": "sum", "avg": "avg", "count": "count", "max": "max", "min": "min"}
 
 # Upper bound on the number of groups one aggregate() call asks ERPNext for.
 # If ERPNext returns this many, the result is flagged truncated.
@@ -656,8 +654,7 @@ def _aggregate_in_database(
         if not isinstance(row, dict) or "agg_value" not in row:
             # ERPNext ignored the aggregate fields and returned plain documents.
             return {"status": "unsupported"}
-        g_val = row.get(group_by)
-        g_key = "Unknown" if g_val is None else str(g_val)
+        g_key = group_key(row.get(group_by))
         raw = row["agg_value"]
         if aggregation_fn == "count":
             value: Any = int(raw or 0)
@@ -688,37 +685,10 @@ def _aggregate_in_python(
     if res["status"] not in ("success", "empty"):
         return res
 
-    agg: Dict[str, Any] = {}
-    counts: Dict[str, int] = {}
-    for row in res.get("data") or []:
-        g_val = row.get(group_by)
-        g_key = "Unknown" if g_val is None else str(g_val)
-        if aggregation_fn == "count":
-            m_val: Any = 1
-        else:
-            try:
-                m_val = float(row.get(metric) or 0)
-            except (TypeError, ValueError):
-                return _format_result(
-                    "system_error",
-                    error=f"Field '{metric}' has a non-numeric value and cannot be aggregated with '{aggregation_fn}'."
-                )
-
-        if g_key not in agg:
-            agg[g_key] = 0 if aggregation_fn in ("sum", "avg", "count") else m_val
-            counts[g_key] = 0
-
-        counts[g_key] += 1
-        if aggregation_fn in ("sum", "avg", "count"):
-            agg[g_key] += m_val
-        elif aggregation_fn == "max":
-            agg[g_key] = max(agg[g_key], m_val)
-        elif aggregation_fn == "min":
-            agg[g_key] = min(agg[g_key], m_val)
-
-    if aggregation_fn == "avg":
-        for g_key in agg:
-            agg[g_key] = agg[g_key] / counts[g_key]
+    try:
+        agg = aggregate_rows(res.get("data") or [], group_by, metric, aggregation_fn)
+    except ValueError as e:
+        return _format_result("system_error", error=str(e))
     return {"status": "ok", "groups": agg, "truncated": bool(res.get("has_more"))}
 
 
