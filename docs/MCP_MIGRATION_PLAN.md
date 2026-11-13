@@ -1,7 +1,7 @@
 # ERPNext Assistant: MCP Migration Plan, Status and Handover
 
-Last updated: 13 Nov 2026. Branch: `mcp-integration` (cut from `integration-fixed` at `d3d75bd`).
-Status: Members 1 and 2 are COMPLETE. Members 3 to 6 have not started.
+Last updated: 14 Nov 2026. Branch: `mcp-integration` (cut from `integration-fixed` at `d3d75bd`).
+Status: Members 1, 2 and 3 are COMPLETE. Members 4, 5 and 6 are pending.
 
 This document is the work allocation plus the handover notes from Members 1 and 2. It is a plan, not evidence that work 3 to 6 is done.
 
@@ -30,7 +30,7 @@ Build a separately maintainable Python MCP component while keeping the existing 
 |---|---|---|
 | 1 | ERPNext tool layer extraction | DONE (section 4) |
 | 2 | Aggregation, reports, pagination | DONE (section 4b) |
-| 3 | MCP server and shared security policy | Not started |
+| 3 | MCP server and shared security policy | DONE ( section 4c) |
 | 4 | LangGraph adapter and MCP integration | Not started |
 | 5 | Authentication and user identity | Not started |
 | 6 | Testing, security, deployment | Not started (baseline numbers in section 5) |
@@ -112,6 +112,103 @@ Antony ran the chatbot against his real ERPNext (company Metal Forms): a Sales O
 - Search fields for Delivery Note and Purchase Receipt were only checked on empty tables (ERPNext accepted the fields).
 - The genericity scan still does not cover `mcp_erpnext/crud.py` or `reports.py`.
 - Test baseline after this work (`tests` and `agent/tests` run together): 655 passed, 1 failed. The one failure is the genericity scan described in section 5.
+
+## 4c. Member 3 handover: MCP server and shared security policy
+
+### Commit
+
+- `5436b02` — Implement secure ERPNext MCP server
+- Six new files created.
+- 2,942 lines added.
+- Working tree was clean after the commit.
+
+### Files delivered
+
+| File | Description |
+|---|---|
+| `mcp_erpnext/policy.py` | Centralized security policy covering RBAC, DocType allowlisting, report authorization, tool allowlisting, read-only restrictions and query validation. |
+| `mcp_erpnext/schemas.py` | Pydantic v2 input/output schemas for all 11 MCP tools, with strict validation and rejection of unexpected arguments. |
+| `mcp_erpnext/server.py` | MCP server using the official Python MCP SDK, supporting STDIO and Streamable HTTP transports. |
+| `tests/test_policy.py` | 51 tests covering authorization, RBAC, allowlists and validation. |
+| `tests/test_schemas.py` | 37 tests covering input schemas and validation. |
+| `tests/test_server.py` | 26 tests covering tool registration, execution, authentication and transport security. |
+
+### Security implementation
+
+- Centralized authorization through `policy.py`.
+- Separate allowlists for read and write tools.
+- Read-only mode enabled by default.
+- Empty or missing `allowed_roles` denies access.
+- DocType access checked against the existing CRUD whitelist.
+- Report access checked against the existing report allowlist.
+- Strict validation of `order_by`, sorting and identifiers to prevent unsafe query expressions.
+- Reserved identity fields such as `user_id`, `roles`, `read_only` and `credential` cannot be supplied through tool arguments.
+- Fail-closed authorization: denied requests never reach the underlying CRUD or report functions.
+
+### MCP server implementation
+
+The server exposes all 11 existing ERPNext operations through MCP.
+
+Each tool request passes through four stages:
+
+1. Tool allowlist verification.
+2. Pydantic schema validation.
+3. Shared policy authorization.
+4. Execution through existing `mcp_erpnext.crud` or `mcp_erpnext.reports` functions.
+
+Supported transports:
+
+- **STDIO:** Recommended for initial integration. Runs without requiring another network port and directs logs to `stderr`.
+- **Streamable HTTP:** Supports Bearer JWT authentication, DNS rebinding protection and allowed-host validation.
+
+### Authentication and security protections
+
+- JWT verification uses HS256.
+- JWT requires valid `sub` and `exp` claims.
+- No hardcoded JWT secret fallback.
+- JWT secret is resolved from `JWT_SECRET`, `JWT_SECRET_KEY` or `MCP_JWT_SECRET`.
+- Development mock authentication is disabled in production.
+- Sensitive credentials and tokens are masked in error output.
+- HTTP transport uses explicit host validation rather than wildcard hosts.
+
+### Test results
+
+**Member 3 dedicated test results:**
+
+| Test | Passed |
+|---|---:|
+| `test_policy.py` | 51 |
+| `test_schemas.py` | 37 |
+| `test_server.py` | 26 |
+| `test_mcp_erpnext_isolation.py` | 1 |
+| **Total** | **115** |
+
+**Full regression results:**
+
+- `tests`: 410 passed, 1 failed.
+- `agent/tests`: 359 passed, 0 failed.
+- Overall: 769 passed, 1 known baseline failure.
+
+The remaining failure is `tests/test_generic_pipeline_genericity.py::test_static_scan_for_hardcoded_literals`, caused by pre-existing hardcoded literals in `agent/workflow/graph.py`. Member 3 did not modify that file.
+
+### Handover to Member 4
+
+- The MCP server and shared policy are ready for LangGraph integration.
+- STDIO is recommended initially to avoid introducing another Docker container or network port.
+- User identity and roles must come from trusted, verified server-side authentication context.
+- Identity and roles must never be accepted from the LLM or user prompt.
+- Keep `TOOL_BACKEND=direct|mcp` so the existing direct backend remains available for rollback.
+- Keep MCP read-only until per-user identity and authorization are implemented and verified.
+
+### Deployment requirements
+
+- Configure a strong `JWT_SECRET` with at least 32 random bytes.
+- Set `ENVIRONMENT=production` in production.
+- If using HTTP alongside FastAPI on port 8000, configure MCP to use another port, such as `8001`.
+- Configure `MCP_ALLOWED_HOSTS` explicitly when exposing HTTP.
+- Keep STDIO read-only until the authentication integration is complete.
+
+**Member 3 status: COMPLETE.** MCP server, shared security policy, schemas and dedicated tests have been implemented and committed as `5436b02`.
 
 ## 5. What every member must know
 
