@@ -30,6 +30,8 @@ from workflow.graph import (
     result_validation_node,
     route_after_result_validation,
     CHAIN_LOW_STOCK_THRESHOLD,
+    _describe_create_scope,
+    _submit_offer,
 )
 from workflow.state import AgentState
 
@@ -389,4 +391,29 @@ def test_route_after_result_validation_chain_flow():
     composed = prepare_chain_step_node(state_completed)
     assert composed["is_workflow_complete"] is True
     assert composed["detected_intent"] == ""
+
+
+def test_describe_create_scope_includes_company_and_warehouse():
+    with patch("workflow.graph.get_default_company", return_value="Metal Forms"), \
+         patch("workflow.graph.get_default_warehouse", return_value="Stores - MF"):
+        desc = _describe_create_scope("Sales Order", {"customer": "Cust1"})
+        assert "Company: Metal Forms" in desc
+        assert "Warehouse: Stores - MF" in desc
+
+
+def test_describe_create_scope_resolver_runtime_error_does_not_crash():
+    with patch("workflow.graph.get_default_company", side_effect=RuntimeError("Default company is not configured.")):
+        desc = _describe_create_scope("Sales Order", {"customer": "Cust1"})
+        assert "Company:" not in desc
+        assert "Warehouse:" not in desc
+
+
+def test_submit_offer_includes_company_and_warehouse():
+    state = AgentState(user_roles=["Sales Manager"])
+    res = _submit_offer(state, "Sales Order", "SAL-ORD-0001", company="Metal Forms", warehouse="Stores - MF")
+    assert res is not None
+    pending, prompt = res
+    assert "Company: **Metal Forms**" in pending["scope_description"]
+    assert "Warehouse: **Stores - MF**" in pending["scope_description"]
+    assert "Target location: Company: **Metal Forms**, Warehouse: **Stores - MF**." in prompt
 

@@ -35,6 +35,8 @@ from tools.generic_tools import (
     submit_document,
     is_doctype_allowed,
     get_allowed_doctypes,
+    get_default_company,
+    get_default_warehouse,
 )
 
 logger = logging.getLogger("workflow_graph")
@@ -2078,6 +2080,31 @@ def _describe_create_scope(doctype: str, collected: dict) -> str:
     party_key = next((k for k in ("supplier", "customer", "customer_name") if collected.get(k)), None)
     party = f" for {party_key.replace('_', ' ')} '{collected[party_key]}'" if party_key else ""
     lines = [f"Are you sure you want to create a {doctype}{party}?"]
+
+    if doctype in ("Sales Order", "Purchase Order"):
+        comp = collected.get("company")
+        if not comp:
+            try:
+                comp = get_default_company()
+            except RuntimeError as e:
+                logger.warning(f"Could not resolve default company for {doctype} confirmation: {e}")
+                comp = None
+        wh = collected.get("warehouse")
+        if not wh:
+            items = collected.get("items")
+            if isinstance(items, list) and items and isinstance(items[0], dict):
+                wh = items[0].get("warehouse")
+            if not wh and comp:
+                try:
+                    wh = get_default_warehouse(comp)
+                except RuntimeError as e:
+                    logger.warning(f"Could not resolve default warehouse for company '{comp}': {e}")
+                    wh = None
+        if comp:
+            lines.append(f"Company: {comp}")
+        if wh:
+            lines.append(f"Warehouse: {wh}")
+
     rows = collected.get("items")
     if isinstance(rows, list) and rows:
         total = 0.0
@@ -2827,7 +2854,25 @@ def format_agent_message_node(state: AgentState):
         updates["last_turn_context"] = None
         if (tool_name == "create_document" and not state.get("chain_plan") and isinstance(data, dict)
                 and str(data.get("docstatus")) == "0" and data.get("name")):
-            offer = _submit_offer(state, doctype_name, data["name"])
+            doc_comp = data.get("company") or collected.get("company")
+            doc_wh = data.get("set_warehouse")
+            if not doc_wh and isinstance(data.get("items"), list) and data["items"]:
+                doc_wh = data["items"][0].get("warehouse")
+            if not doc_wh:
+                doc_wh = collected.get("warehouse")
+            if not doc_comp and doctype_name in ("Sales Order", "Purchase Order"):
+                try:
+                    doc_comp = get_default_company()
+                except RuntimeError as e:
+                    logger.warning(f"Could not resolve default company for submit offer: {e}")
+                    doc_comp = None
+            if not doc_wh and doctype_name in ("Sales Order", "Purchase Order") and doc_comp:
+                try:
+                    doc_wh = get_default_warehouse(doc_comp)
+                except RuntimeError as e:
+                    logger.warning(f"Could not resolve default warehouse for company '{doc_comp}' in submit offer: {e}")
+                    doc_wh = None
+            offer = _submit_offer(state, doctype_name, data["name"], company=doc_comp, warehouse=doc_wh)
             if offer:
                 updates["pending_confirmation"] = offer[0]
                 updates["final_response"] = f"{updates['final_response']}\n\n{offer[1]}"
@@ -3291,7 +3336,7 @@ def _render_done_step(step: dict, rec: dict) -> str:
     return f"**{label}**\n{_fmt_cell(output)}"
 
 
-def _submit_offer(state: AgentState, doctype: str, name: str) -> Optional[Tuple[dict, str]]:
+def _submit_offer(state: AgentState, doctype: str, name: str, company: Optional[str] = None, warehouse: Optional[str] = None) -> Optional[Tuple[dict, str]]:
     """
     After a document is created as a Draft, offer to submit it as a pending action, so
     the user is reminded and a plain "yes" submits it. Only when a submit skill exists
@@ -3310,13 +3355,22 @@ def _submit_offer(state: AgentState, doctype: str, name: str) -> Optional[Tuple[
     allowed, _ = _check_role_access(state.get("user_roles") or [], submit_skill)
     if not allowed:
         return None
+
+    extra_info = []
+    if company:
+        extra_info.append(f"Company: **{company}**")
+    if warehouse:
+        extra_info.append(f"Warehouse: **{warehouse}**")
+    extra_str = f" ({', '.join(extra_info)})" if extra_info else ""
+    location_line = f"Target location: {', '.join(extra_info)}.\n\n" if extra_info else ""
+
     pending = {
         "operation": "submit",
         "doctype": doctype,
         "target_name": name,
         "is_bulk": False,
         "is_offer": True,
-        "scope_description": f"Do you want me to submit {doctype} '{name}' now?",
+        "scope_description": f"Do you want me to submit {doctype} '{name}'{extra_str} now?",
         "requested_at": len(state.get("messages", [])),
         "requested_at_ts": datetime.now(timezone.utc).isoformat(),
         "requested_by": state.get("user_sub"),
@@ -3331,6 +3385,7 @@ def _submit_offer(state: AgentState, doctype: str, name: str) -> Optional[Tuple[
     prompt = (
         f"**Submit it now?** {doctype} '{name}' stays a Draft until it is submitted, and a submitted "
         f"{doctype} can only be cancelled, not edited.\n\n"
+        f"{location_line}"
         f"Reply **Yes** to submit it, or **No** to keep it as a Draft."
     )
     log_audit_event("submit", doctype, name, "pending", user_id=state.get("user_sub") or "unknown",
