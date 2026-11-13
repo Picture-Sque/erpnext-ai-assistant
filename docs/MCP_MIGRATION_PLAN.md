@@ -1,9 +1,9 @@
 # ERPNext Assistant: MCP Migration Plan, Status and Handover
 
 Last updated: 13 Nov 2026. Branch: `mcp-integration` (cut from `integration-fixed` at `d3d75bd`).
-Status: Member 1 is COMPLETE. Members 2 to 6 have not started.
+Status: Members 1 and 2 are COMPLETE. Members 3 to 6 have not started.
 
-This document is the work allocation plus the handover notes from Member 1. It is a plan, not evidence that work 2 to 6 is done.
+This document is the work allocation plus the handover notes from Members 1 and 2. It is a plan, not evidence that work 3 to 6 is done.
 
 ## 1. Direction and security boundary
 
@@ -29,7 +29,7 @@ Build a separately maintainable Python MCP component while keeping the existing 
 | Member | Stream | Status |
 |---|---|---|
 | 1 | ERPNext tool layer extraction | DONE (section 4) |
-| 2 | Aggregation, reports, pagination | Not started |
+| 2 | Aggregation, reports, pagination | DONE (section 4b) |
 | 3 | MCP server and shared security policy | Not started |
 | 4 | LangGraph adapter and MCP integration | Not started |
 | 5 | Authentication and user identity | Not started |
@@ -68,6 +68,50 @@ Tool names, signatures, the envelope `{status, data, error, has_more, success}` 
 
 ### Manual smoke test
 Antony ran the chatbot against his real ERPNext (company Metal Forms): a Sales Order was created, and the draft showed the Company and Warehouse lines and the submit offer.
+
+## 4b. Member 2 handover: what was delivered
+
+### Commits on `mcp-integration` (oldest first, after `db0eef9`)
+- `c6e5b01` pagination metadata and a database-side `get_count`
+- `0d76eaf` database-side `aggregate` with input validation and a Python fallback
+- `675e3ce` Frappe 16 dict aggregates and `parent_doctype` child-table reads
+- `450b453` item-level analytics in `graph.py` as one grouped call (the N+1 is gone)
+- `4b71c70` ranked multi-field search with exact-match priority
+- `6ff8add` row aggregation moved into `mcp_erpnext/aggregation.py`
+- `0195d52` `run_report` with a fail-closed report allowlist (`mcp_erpnext/reports.py`)
+
+### Contract changes (Members 3 and 4 read this)
+- The read tools `get_list`, `get_count`, `search_document`, `aggregate` and `run_report` add `total_count`, `offset`, `limit` and `truncated` to successful and empty results. Errors and the write tools keep the original five-key envelope. `total_count` is `None` when it is not known (for example a list that was cut off and not asked for a total).
+- `get_list` gained optional `offset` and `include_total` (the total costs one extra call and is only made on request). `group_by`, `parent_doctype` and `or_filters` are for internal use by the tool layer.
+- `get_count` asks ERPNext to count (`frappe.client.get_count`). No rows are transferred and the old 999,999 ceiling is gone.
+- `aggregate` gained `parent_doctype`. Inputs are validated before anything is sent: `group_by` and `metric` must be single field names, `aggregation_fn` must be one of sum, avg, count, max, min (an unknown function used to behave like max), `sort` must name the group or the metric, `limit` must be a non-negative integer. A null group value is reported as "Unknown" (it was "None") and a null metric counts as 0 (it used to raise). Ties are ordered alphabetically by group so results are repeatable. It asks ERPNext to group and sum, and falls back to the old fetch-and-sum path if ERPNext ignores the query or returns a system error. Permission and not-found results never trigger the fallback. At most 5,000 groups are requested per call; reaching that sets `truncated`.
+- `search_document` searches every field mapped for the doctype (ID and display name), matches `%` and `_` literally, ranks starts-with before contains, and returns only the exact matches when any exist. A blank query is a `system_error`. It gained an optional `limit` (default 10).
+- The wrappers in `agent/tools/generic_tools.py` only gained optional trailing arguments. Tool names and existing signatures are unchanged.
+
+### run_report contract (Member 3 and Member 5 read this)
+`run_report(report_name, filters=None, *, user_roles, row_filters=None, group_by=None, metric=None, aggregation_fn=None, sort=None, limit=None, client=None)`.
+- `user_roles` has no default. It must be filled from trusted, authenticated context. `None`, an empty list, a bare string or an entry that is not a string all deny. An allowlist entry with an empty or missing `allowed_roles` denies everyone.
+- Unknown reports, unlisted reports and role-denied reports all return the same `permission_denied` text, so the answer does not reveal which reports exist.
+- The allowlist is data (`REPORT_ALLOWLIST`, read through `get_report_allowlist()`). Member 3 can replace that function when the shared policy exists. Each entry has `allowed_roles`, `max_rows` and a `filters` declaration (type, required, choices). Unknown filters are rejected, not forwarded.
+- Current entries are operational only: Stock Projected Qty, Stock Ledger, Sales Analytics. Financial reports are not listed, and a test fails if one is added by accident. Adding them waits for per-user identity (Member 5). The role names in the allowlist are the standard ERPNext ones and were not checked against this site's role setup.
+- Row filters allow only =, !=, >, >=, <, <=, contains. Aggregation allows only the five functions above. Rows are capped at the report's `max_rows` and never above 1,000.
+- The report's total row (a list lined up with the columns, present when `add_total_row` is set) is returned as `data["totals"]` and is never counted as data.
+- Reports that ERPNext runs in the background (Prepared Reports, for example Stock Balance on this site) return a `system_error` saying so. Stock Balance is one on this site, so it is not on the allowlist. Stock Ageing is also left off: it failed with a server error for the filters tried, and its required filters were not worked out.
+- `run_report` is not wired into the chatbot or any skill.
+
+### Behaviour verified against a live instance (Frappe 16.24, ERPNext 16.25, read only)
+- Frappe 16 rejects SQL functions written as strings in `fields` ("sum(x) as y"). The dict form `{"SUM": "x", "as": "agg_value"}` works for SUM, COUNT, AVG, MAX and MIN, and `order_by` on the alias works.
+- A child doctype such as Sales Order Item only returns its fields when the `parent` parameter names the parent doctype. Filters on parent fields use `[parent, field, operator, value]`. The grouped child-table result equalled a per-document ground truth for every item-level query type and filter variant.
+- A GET with about 600 names in a filter returns 414 from nginx. Do not build long `in` lists into a GET; use the POST form of `frappe.client.get_list`.
+- Aggregating report rows reproduced the report's own total row exactly.
+
+### Open items and known limits
+- Everything above was verified against one local instance. The aggregate fallback exists for other ERPNext versions. Its computation was checked live, but the switch to it (when ERPNext rejects or ignores the aggregate query) was only exercised with mocks.
+- `search_document` ranks within the 50 rows it fetches. An exact match is always found (it gets its own lookup), but with more than 50 partial matches the best partial match is not guaranteed to be shown.
+- The bulk-operation path in `graph.py` still reads targets with `get_list(limit=999999)` after taking an exact count. A bulk action over more than 999,999 documents would silently leave some out. The owner of `graph.py` should decide whether to cap bulk size.
+- Search fields for Delivery Note and Purchase Receipt were only checked on empty tables (ERPNext accepted the fields).
+- The genericity scan still does not cover `mcp_erpnext/crud.py` or `reports.py`.
+- Test baseline after this work (`tests` and `agent/tests` run together): 655 passed, 1 failed. The one failure is the genericity scan described in section 5.
 
 ## 5. What every member must know
 
