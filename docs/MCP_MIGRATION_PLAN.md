@@ -252,6 +252,7 @@ Notes from Member 1:
 - Work in `mcp_erpnext/crud.py` first; `generic_tools.py` is only a wrapper. Coordinate argument changes with the YAML skills.
 
 ### Member 3: MCP server and shared security policy (core MCP development)
+See section 4c for what was delivered.
 Responsibility: build the Python MCP server and centralise security rules.
 - MCP server with STDIO and HTTP transports.
 - Register the existing ERPNext operations as MCP tools.
