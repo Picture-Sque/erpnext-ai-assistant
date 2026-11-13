@@ -3,6 +3,7 @@ import logging
 import httpx
 from typing import Optional, Dict, Any
 from mcp_erpnext.errors import ERPNextConfigError, ERPNextTransportError
+from mcp_erpnext.auth import get_request_context
 
 logger = logging.getLogger("mcp_erpnext")
 
@@ -80,6 +81,9 @@ class ERPNextClient:
     def get_credentials(self) -> Credentials:
         if self._credentials is not None:
             return self._credentials
+        ctx = get_request_context()
+        if ctx is not None and ctx.credentials is not None:
+            return ctx.credentials
         return get_env_credentials()
 
     def get(

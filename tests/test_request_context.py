@@ -9,7 +9,7 @@ from mcp_erpnext.auth import (
     set_request_context,
     current_request_context,
 )
-from mcp_erpnext.client import Credentials
+from mcp_erpnext.client import Credentials, ERPNextClient
 
 
 def test_default_context_is_none():
@@ -141,3 +141,110 @@ def test_asyncio_task_isolation():
     assert results["task2"].user_id == "task2"
     assert results["task1_after"] is None
     assert results["task2_after"] is None
+
+
+def test_client_credentials_fallback_when_context_is_none(monkeypatch):
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("ERPNEXT_API_KEY", "env_key")
+    monkeypatch.setenv("ERPNEXT_API_SECRET", "env_secret")
+
+    client = ERPNextClient()
+    creds = client.get_credentials()
+    assert creds.api_key == "env_key"
+    assert creds.api_secret == "env_secret"
+
+
+def test_client_credentials_fallback_when_context_credentials_none(monkeypatch):
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("ERPNEXT_API_KEY", "env_key")
+    monkeypatch.setenv("ERPNEXT_API_SECRET", "env_secret")
+
+    ctx = RequestContext(user_id="user@example.com", credentials=None)
+    with set_request_context(ctx):
+        client = ERPNextClient()
+        creds = client.get_credentials()
+        assert creds.api_key == "env_key"
+        assert creds.api_secret == "env_secret"
+
+
+def test_client_credentials_precedence(monkeypatch):
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("ERPNEXT_API_KEY", "env_key")
+    monkeypatch.setenv("ERPNEXT_API_SECRET", "env_secret")
+
+    ctx_creds = Credentials(base_url="http://ctx-host:8000", api_key="ctx_key", api_secret="ctx_sec")
+    explicit_creds = Credentials(base_url="http://exp-host:8000", api_key="exp_key", api_secret="exp_sec")
+
+    ctx = RequestContext(user_id="user@example.com", credentials=ctx_creds)
+
+    # Context credentials win over env
+    with set_request_context(ctx):
+        client = ERPNextClient()
+        creds = client.get_credentials()
+        assert creds == ctx_creds
+        assert creds.api_key == "ctx_key"
+
+        # Explicit constructor credentials win over context
+        explicit_client = ERPNextClient(credentials=explicit_creds)
+        assert explicit_client.get_credentials() == explicit_creds
+        assert explicit_client.get_credentials().api_key == "exp_key"
+
+    # Outside context, env wins
+    client = ERPNextClient()
+    assert client.get_credentials().api_key == "env_key"
+
+
+def test_resolver_cache_keyed_per_credential(monkeypatch):
+    from unittest.mock import MagicMock, patch
+    from mcp_erpnext.defaults import get_default_company, reset_resolver_caches
+
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("ERPNEXT_API_KEY", "env_key")
+    monkeypatch.setenv("ERPNEXT_API_SECRET", "env_secret")
+    monkeypatch.delenv("DEFAULT_COMPANY", raising=False)
+
+    reset_resolver_caches()
+
+    creds_a = Credentials(base_url="http://localhost:8000", api_key="user_a_key", api_secret="user_a_sec")
+    creds_b = Credentials(base_url="http://localhost:8000", api_key="user_b_key", api_secret="user_b_sec")
+
+    ctx_a = RequestContext(user_id="user_a@example.com", credentials=creds_a)
+    ctx_b = RequestContext(user_id="user_b@example.com", credentials=creds_b)
+
+    with patch("mcp_erpnext.client.httpx.Client") as mock_client_cls:
+        mock_http = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_http
+
+        # Return Company A for request A, Company B for request B
+        resp_a = MagicMock()
+        resp_a.status_code = 200
+        resp_a.is_success = True
+        resp_a.json.return_value = {"data": [{"name": "Company A"}]}
+
+        resp_b = MagicMock()
+        resp_b.status_code = 200
+        resp_b.is_success = True
+        resp_b.json.return_value = {"data": [{"name": "Company B"}]}
+
+        mock_http.get.side_effect = [resp_a, resp_b]
+
+        # First call with user A context
+        with set_request_context(ctx_a):
+            comp_a = get_default_company()
+            assert comp_a == "Company A"
+
+            # Cached for user A
+            comp_a_again = get_default_company()
+            assert comp_a_again == "Company A"
+
+        # mock_http.get should have been called only once for user A
+        assert mock_http.get.call_count == 1
+
+        # Second call with user B context must NOT share user A's cached default
+        with set_request_context(ctx_b):
+            comp_b = get_default_company()
+            assert comp_b == "Company B"
+
+        # mock_http.get must have been called again (call_count = 2)
+        assert mock_http.get.call_count == 2
+
