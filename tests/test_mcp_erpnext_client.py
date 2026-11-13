@@ -212,6 +212,20 @@ class TestMCPErpnextClient(unittest.TestCase):
         # Assert exactly one call was made - NO retries!
         self.assertEqual(mock_client.post.call_count, 1)
 
+    def test_credentials_get_headers_parity_with_get_auth_headers(self):
+        """Credentials.get_headers returns identical headers to agent.tools.erpnext_client.get_auth_headers for same keys."""
+        import agent.tools.erpnext_client as ec
+        with patch.object(ec, "ERPNEXT_API_KEY", "parity_key_abc"), \
+             patch.object(ec, "ERPNEXT_API_SECRET", "parity_secret_xyz"):
+            legacy_headers = ec.get_auth_headers()
+            creds = Credentials(
+                base_url="http://localhost:8081",
+                api_key="parity_key_abc",
+                api_secret="parity_secret_xyz"
+            )
+            new_headers = creds.get_headers()
+            self.assertEqual(legacy_headers, new_headers)
+
     # -------------------------------------------------------------
     # Parity tests: generic_tools vs mcp_erpnext extract_erpnext_error
     # -------------------------------------------------------------

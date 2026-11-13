@@ -32,34 +32,45 @@ from agent.tools.generic_tools import (
     get_default_warehouse,
 )
 import agent.tools.generic_tools as generic_tools
+from mcp_erpnext.defaults import reset_resolver_caches
 
 
 @pytest.fixture(autouse=True)
 def reset_globals_and_env(monkeypatch):
-    generic_tools._cached_company = None
-    generic_tools._cached_warehouses.clear()
+    reset_resolver_caches()
     monkeypatch.delenv("DEFAULT_COMPANY", raising=False)
     monkeypatch.delenv("DEFAULT_WAREHOUSE", raising=False)
     yield
-    generic_tools._cached_company = None
-    generic_tools._cached_warehouses.clear()
+    reset_resolver_caches()
+
+
+@pytest.fixture(autouse=True)
+def erpnext_env_defaults():
+    with patch.dict(os.environ, {
+        "ERPNEXT_BASE_URL": "http://localhost:8081",
+        "ERPNEXT_API_KEY": "test_api_key",
+        "ERPNEXT_API_SECRET": "test_api_secret",
+    }):
+        yield
 
 
 class TestGenericTools(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        generic_tools._cached_company = None
-        generic_tools._cached_warehouses.clear()
-        self._env_patch = patch.dict(os.environ, {}, clear=False)
+        reset_resolver_caches()
+        self._env_patch = patch.dict(os.environ, {
+            "ERPNEXT_BASE_URL": "http://localhost:8081",
+            "ERPNEXT_API_KEY": "test_api_key",
+            "ERPNEXT_API_SECRET": "test_api_secret",
+        }, clear=False)
         self._env_patch.start()
         os.environ.pop("DEFAULT_COMPANY", None)
         os.environ.pop("DEFAULT_WAREHOUSE", None)
 
     def tearDown(self):
         self._env_patch.stop()
-        generic_tools._cached_company = None
-        generic_tools._cached_warehouses.clear()
+        reset_resolver_caches()
         super().tearDown()
 
     def test_whitelist_defaults_and_case_insensitivity(self):
@@ -1344,6 +1355,100 @@ class TestGenericTools(unittest.TestCase):
         self.assertEqual(params["limit_page_length"], "1000000")
         self.assertEqual(params["fields"], '["name"]')
         self.assertEqual(params["filters"], '{"status": "Draft"}')
+
+    # -------------------------------------------------------------
+    # Missing credentials and resolver caching tests
+    # -------------------------------------------------------------
+    def test_missing_credentials_read_returns_system_error(self):
+        """Missing credentials on read operations return system_error envelope with original message."""
+        with patch.dict(os.environ, {"ERPNEXT_API_KEY": "", "ERPNEXT_API_SECRET": ""}):
+            res = get_document("Customer", "Cust-1")
+            self._assert_envelope(res, "system_error")
+            self.assertIn("ERPNext credentials not configured", res["error"])
+
+    def test_missing_credentials_write_returns_system_error(self):
+        """Missing credentials on write operations return system_error envelope with original message."""
+        with patch.dict(os.environ, {"ERPNEXT_API_KEY": "", "ERPNEXT_API_SECRET": ""}):
+            res = create_document("Customer", {"customer_name": "Acme"})
+            self._assert_envelope(res, "system_error")
+            self.assertIn("ERPNext credentials not configured", res["error"])
+
+    def test_missing_credentials_resolver_raises_runtime_error(self):
+        """Missing credentials in resolver raises RuntimeError."""
+        with patch.dict(os.environ, {"ERPNEXT_API_KEY": "", "ERPNEXT_API_SECRET": ""}):
+            with self.assertRaises(RuntimeError) as ctx:
+                get_default_company()
+            self.assertIn("ERPNext credentials not configured", str(ctx.exception))
+
+    @patch("mcp_erpnext.client.httpx.Client")
+    def test_resolver_cache_shared_between_tools_and_agent_tools(self, mock_client_cls):
+        """Resolver cache is shared between tools.generic_tools and agent.tools.generic_tools."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": [{"name": "Shared Company"}]}
+        mock_client.get.return_value = mock_resp
+
+        import tools.generic_tools as t_gt
+        import agent.tools.generic_tools as a_gt
+
+        c1 = t_gt.get_default_company()
+        self.assertEqual(c1, "Shared Company")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        c2 = a_gt.get_default_company()
+        self.assertEqual(c2, "Shared Company")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+    @patch("mcp_erpnext.client.httpx.Client")
+    def test_resolver_cache_distinct_credentials_never_share(self, mock_client_cls):
+        """Two different credentials produce different cache keys and never share entries."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        mock_resp1 = MagicMock(is_success=True, status_code=200)
+        mock_resp1.json.return_value = {"data": [{"name": "Company User1"}]}
+
+        mock_resp2 = MagicMock(is_success=True, status_code=200)
+        mock_resp2.json.return_value = {"data": [{"name": "Company User2"}]}
+
+        mock_client.get.side_effect = [mock_resp1, mock_resp2]
+
+        with patch.dict(os.environ, {"ERPNEXT_API_KEY": "user1_key", "ERPNEXT_API_SECRET": "user1_sec"}):
+            c1 = get_default_company()
+            self.assertEqual(c1, "Company User1")
+            self.assertEqual(mock_client.get.call_count, 1)
+
+        with patch.dict(os.environ, {"ERPNEXT_API_KEY": "user2_key", "ERPNEXT_API_SECRET": "user2_sec"}):
+            c2 = get_default_company()
+            self.assertEqual(c2, "Company User2")
+            self.assertEqual(mock_client.get.call_count, 2)
+
+    @patch("mcp_erpnext.client.httpx.Client")
+    def test_reset_resolver_caches_clears_cache(self, mock_client_cls):
+        """reset_resolver_caches() clears all cached entries so next lookup re-fetches."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": [{"name": "Company A"}]}
+        mock_client.get.return_value = mock_resp
+
+        c1 = get_default_company()
+        self.assertEqual(c1, "Company A")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        # Call again without reset: hits cache
+        c2 = get_default_company()
+        self.assertEqual(c2, "Company A")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        # Reset caches
+        reset_resolver_caches()
+
+        # Call after reset: triggers new HTTP GET
+        c3 = get_default_company()
+        self.assertEqual(c3, "Company A")
+        self.assertEqual(mock_client.get.call_count, 2)
 
 
 if __name__ == "__main__":
