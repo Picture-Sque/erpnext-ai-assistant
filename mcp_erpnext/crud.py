@@ -54,18 +54,59 @@ def is_doctype_allowed(doctype_name: str) -> bool:
     return doctype_name.strip().lower() in allowed_lower
 
 
-def _format_result(status: str, data: Any = None, error: Optional[str] = None, has_more: bool = False) -> dict:
+def _format_result(
+    status: str,
+    data: Any = None,
+    error: Optional[str] = None,
+    has_more: bool = False,
+    pagination: Optional[dict] = None,
+) -> dict:
     """
     Format standard tool response.
     status must be one of: "success", "empty", "permission_denied", "not_found", "system_error"
+
+    `pagination` is only passed by read tools on success/empty. It adds the keys
+    total_count, offset, limit and truncated; write tools and error results keep the
+    original five-key envelope.
     """
-    return {
+    result = {
         "status": status,
         "data": data,
         "error": error,
         "has_more": has_more,
         "success": status in ("success", "empty")
     }
+    if pagination is not None:
+        result.update(pagination)
+    return result
+
+
+def _page_meta(
+    total_count: Optional[int],
+    offset: int,
+    limit: Optional[int],
+    truncated: bool,
+) -> dict:
+    """Pagination metadata. total_count is None when it is not known."""
+    return {
+        "total_count": total_count,
+        "offset": offset,
+        "limit": limit,
+        "truncated": truncated,
+    }
+
+
+def _parse_offset(offset: Any) -> Optional[int]:
+    """Return a non-negative int offset, or None when the value is unusable."""
+    if offset is None:
+        return 0
+    if isinstance(offset, bool):
+        return None
+    try:
+        value = int(offset)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
 
 def get_list(
@@ -75,6 +116,8 @@ def get_list(
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
     client: Optional[ERPNextClient] = None,
+    offset: Optional[int] = 0,
+    include_total: bool = False,
 ) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result(
@@ -88,6 +131,13 @@ def get_list(
                 "system_error",
                 error=f"Invalid order_by clause: '{order_by}'. Must be valid comma-separated field names with optional ASC/DESC."
             )
+
+    start = _parse_offset(offset)
+    if start is None:
+        return _format_result(
+            "system_error",
+            error=f"Invalid offset: {offset!r}. Must be a non-negative integer."
+        )
 
     query_params = {}
     if filters:
@@ -105,6 +155,8 @@ def get_list(
 
     actual_limit = limit if limit else 20
     query_params["limit_page_length"] = str(actual_limit + 1)
+    if start:
+        query_params["limit_start"] = str(start)
 
     try:
         c = client or ERPNextClient()
@@ -116,9 +168,26 @@ def get_list(
                 has_more = len(data) > actual_limit
                 if has_more:
                     data = data[:actual_limit]
-                return _format_result("success" if data else "empty", data=data, has_more=has_more)
             except Exception:
                 return _format_result("system_error", error="Invalid JSON response from ERPNext")
+
+            # The total is known for free when this page is the whole result set.
+            # Otherwise it needs a second call, which only happens when the caller asks.
+            total_count: Optional[int] = None
+            if not has_more:
+                total_count = start + len(data)
+            elif include_total:
+                count_res = get_count(doctype, filters=filters, client=c)
+                if count_res["status"] in ("success", "empty"):
+                    total_count = count_res["data"]
+                else:
+                    logger.warning(f"total_count unavailable for {doctype}: {count_res.get('error')}")
+            return _format_result(
+                "success" if data else "empty",
+                data=data,
+                has_more=has_more,
+                pagination=_page_meta(total_count, start, actual_limit, has_more),
+            )
         elif response.status_code == 404:
             return _format_result("not_found", error=extract_erpnext_error(response))
         elif response.status_code in (401, 403):
@@ -346,13 +415,38 @@ def get_count(doctype: str, filters: Optional[dict] = None, client: Optional[ERP
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-    # Fetching name to keep payload size minimal
-    res = get_list(doctype, filters=filters, fields=["name"], limit=999999, client=client)
-    if res["status"] in ("success", "empty"):
-        data_list = res.get("data", [])
-        count = len(data_list)
-        return _format_result("empty" if count == 0 else "success", data=count)
-    return res
+    # Counted by the database through ERPNext's own count method: no rows are transferred
+    # and there is no ceiling on the number of matching documents.
+    query_params = {"doctype": doctype}
+    if filters:
+        if isinstance(filters, (list, dict)):
+            query_params["filters"] = json.dumps(filters)
+        else:
+            query_params["filters"] = str(filters)
+
+    try:
+        c = client or ERPNextClient()
+        response = c.get("/api/method/frappe.client.get_count", params=query_params, timeout=60.0)
+        if response.is_success:
+            try:
+                count = response.json().get("message")
+            except Exception:
+                return _format_result("system_error", error="Invalid JSON response from ERPNext")
+            if isinstance(count, bool) or not isinstance(count, int):
+                return _format_result("system_error", error="Invalid count returned by ERPNext")
+            return _format_result(
+                "empty" if count == 0 else "success",
+                data=count,
+                pagination=_page_meta(count, 0, None, False),
+            )
+        elif response.status_code == 404:
+            return _format_result("not_found", error=extract_erpnext_error(response))
+        elif response.status_code in (401, 403):
+            return _format_result("permission_denied", error=extract_erpnext_error(response))
+        else:
+            return _format_result("system_error", error=extract_erpnext_error(response))
+    except Exception as e:
+        return _format_result("system_error", error=str(e))
 
 
 def aggregate(

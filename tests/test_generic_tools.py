@@ -798,7 +798,10 @@ class TestGenericTools(unittest.TestCase):
     # ---------------------------------------------------------
 
     def _assert_envelope(self, res: dict, expected_status: str):
-        self.assertEqual(set(res.keys()), {"status", "data", "error", "has_more", "success"})
+        base_keys = {"status", "data", "error", "has_more", "success"}
+        page_keys = {"total_count", "offset", "limit", "truncated"}
+        # Read tools add pagination metadata on success/empty; everything else keeps the base keys.
+        self.assertIn(set(res.keys()), (base_keys, base_keys | page_keys))
         self.assertEqual(res["status"], expected_status)
         self.assertEqual(res["success"], expected_status in ("success", "empty"))
 
@@ -925,12 +928,14 @@ class TestGenericTools(unittest.TestCase):
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
         mock_resp = MagicMock(is_success=True, status_code=200)
-        mock_resp.json.return_value = {"data": [{"name": "SO-001"}, {"name": "SO-002"}, {"name": "SO-003"}]}
+        mock_resp.json.return_value = {"message": 3}
         mock_client.get.return_value = mock_resp
 
         res = get_count("Sales Order")
         self._assert_envelope(res, "success")
         self.assertEqual(res["data"], 3)
+        self.assertEqual(res["total_count"], 3)
+        self.assertFalse(res["truncated"])
         self.assertTrue(res["success"])
 
     @patch("agent.tools.generic_tools.httpx.Client")
@@ -938,7 +943,7 @@ class TestGenericTools(unittest.TestCase):
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
         mock_resp = MagicMock(is_success=True, status_code=200)
-        mock_resp.json.return_value = {"data": []}
+        mock_resp.json.return_value = {"message": 0}
         mock_client.get.return_value = mock_resp
 
         res = get_count("Sales Order", filters={"status": "Draft"})
@@ -1348,24 +1353,26 @@ class TestGenericTools(unittest.TestCase):
         self.assertNotIn("items", put_payload)
         self.assertEqual(put_payload["delivery_date"], "2026-11-01")
 
-    # get_count limit pinning
+    # get_count uses ERPNext's database-side count
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_get_count_pins_limit_and_page_length_param(self, mock_client_cls):
-        """Pins that get_count passes limit=999999 to get_list, which requests limit_page_length=1000000."""
+    def test_get_count_uses_native_count_method(self, mock_client_cls):
+        """get_count asks ERPNext to count; no rows are fetched and there is no 1,000,000 ceiling."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
         mock_resp = MagicMock(is_success=True, status_code=200)
-        mock_resp.json.return_value = {"data": [{"name": f"SO-{i}"} for i in range(5)]}
+        mock_resp.json.return_value = {"message": 1500000}
         mock_client.get.return_value = mock_resp
 
         res = get_count("Sales Order", filters={"status": "Draft"})
         self._assert_envelope(res, "success")
-        self.assertEqual(res["data"], 5)
-        _, kwargs = mock_client.get.call_args
+        self.assertEqual(res["data"], 1500000)
+        args, kwargs = mock_client.get.call_args
+        self.assertTrue(args[0].endswith("/api/method/frappe.client.get_count"))
         params = kwargs.get("params", {})
-        self.assertEqual(params["limit_page_length"], "1000000")
-        self.assertEqual(params["fields"], '["name"]')
+        self.assertEqual(params["doctype"], "Sales Order")
         self.assertEqual(params["filters"], '{"status": "Draft"}')
+        self.assertNotIn("limit_page_length", params)
+        self.assertNotIn("fields", params)
 
     # -------------------------------------------------------------
     # Missing credentials and resolver caching tests

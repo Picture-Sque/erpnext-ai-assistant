@@ -196,7 +196,10 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
 
     def _assert_envelope(self, res: dict, expected_status: str):
         self.assertIsInstance(res, dict)
-        self.assertEqual(set(res.keys()), {"status", "data", "error", "has_more", "success"})
+        base_keys = {"status", "data", "error", "has_more", "success"}
+        page_keys = {"total_count", "offset", "limit", "truncated"}
+        # Read tools add pagination metadata on success/empty; everything else keeps the base keys.
+        self.assertIn(set(res.keys()), (base_keys, base_keys | page_keys))
         self.assertEqual(res["status"], expected_status)
         if expected_status in ("success", "empty"):
             self.assertTrue(res["success"])
@@ -424,15 +427,100 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
         self._assert_envelope(res, "system_error")
         self.assertIn("Network error", res["error"])
 
+    # --- pagination metadata ---
+    def test_get_list_offset_sent_as_limit_start(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C3"}]})
+        res = get_list("Customer", limit=2, offset=4, client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(kwargs["params"]["limit_start"], "4")
+        self.assertEqual(kwargs["params"]["limit_page_length"], "3")
+        self.assertEqual(res["offset"], 4)
+        self.assertEqual(res["limit"], 2)
+
+    def test_get_list_no_offset_omits_limit_start(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C1"}]})
+        get_list("Customer", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertNotIn("limit_start", kwargs["params"])
+
+    def test_get_list_last_page_knows_total_without_extra_call(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C3"}, {"name": "C4"}]})
+        res = get_list("Customer", limit=5, offset=10, client=self.mock_client)
+        self.assertEqual(res["total_count"], 12)
+        self.assertFalse(res["truncated"])
+        self.assertFalse(res["has_more"])
+        self.assertEqual(self.mock_client.get.call_count, 1)
+
+    def test_get_list_truncated_total_unknown_by_default(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C1"}, {"name": "C2"}, {"name": "C3"}]})
+        res = get_list("Customer", limit=2, client=self.mock_client)
+        self.assertTrue(res["truncated"])
+        self.assertTrue(res["has_more"])
+        self.assertIsNone(res["total_count"])
+        self.assertEqual(len(res["data"]), 2)
+        self.assertEqual(self.mock_client.get.call_count, 1)
+
+    def test_get_list_include_total_makes_one_count_call(self):
+        self.mock_client.get.side_effect = [
+            self._make_response(200, {"data": [{"name": "C1"}, {"name": "C2"}, {"name": "C3"}]}),
+            self._make_response(200, {"message": 57}),
+        ]
+        res = get_list("Customer", limit=2, include_total=True, client=self.mock_client)
+        self.assertEqual(res["total_count"], 57)
+        self.assertTrue(res["truncated"])
+        self.assertEqual(self.mock_client.get.call_count, 2)
+        count_args, _ = self.mock_client.get.call_args
+        self.assertTrue(count_args[0].endswith("frappe.client.get_count"))
+
+    def test_get_list_include_total_count_failure_does_not_fail_the_list(self):
+        self.mock_client.get.side_effect = [
+            self._make_response(200, {"data": [{"name": "C1"}, {"name": "C2"}, {"name": "C3"}]}),
+            self._make_response(500, text="boom"),
+        ]
+        res = get_list("Customer", limit=2, include_total=True, client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertIsNone(res["total_count"])
+        self.assertTrue(res["truncated"])
+
+    def test_get_list_invalid_offset_is_rejected_without_a_call(self):
+        for bad in (-1, "abc", True):
+            res = get_list("Customer", offset=bad, client=self.mock_client)
+            self._assert_envelope(res, "system_error")
+            self.assertIn("Invalid offset", res["error"])
+        self.mock_client.get.assert_not_called()
+
+    def test_get_list_errors_keep_the_base_envelope(self):
+        self.mock_client.get.return_value = self._make_response(500, text="boom")
+        res = get_list("Customer", client=self.mock_client)
+        self.assertEqual(set(res.keys()), {"status", "data", "error", "has_more", "success"})
+
     # --- get_count ---
+    def test_get_count_rejects_malformed_count(self):
+        for bad in ({"message": "12"}, {"message": None}, {"message": True}, {}):
+            self.mock_client.get.return_value = self._make_response(200, bad)
+            res = get_count("Customer", client=self.mock_client)
+            self._assert_envelope(res, "system_error")
+
+    def test_get_count_permission_denied(self):
+        self.mock_client.get.return_value = self._make_response(403, {"message": "no"})
+        res = get_count("Customer", client=self.mock_client)
+        self._assert_envelope(res, "permission_denied")
+
+    def test_get_count_sends_filters_as_json(self):
+        self.mock_client.get.return_value = self._make_response(200, {"message": 4})
+        get_count("Sales Order", filters=[["docstatus", "=", 1]], client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(kwargs["params"]["filters"], '[["docstatus", "=", 1]]')
+
     def test_get_count_success(self):
-        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "C1"}, {"name": "C2"}]})
+        self.mock_client.get.return_value = self._make_response(200, {"message": 2})
         res = get_count("Customer", client=self.mock_client)
         self._assert_envelope(res, "success")
         self.assertEqual(res["data"], 2)
+        self.assertEqual(res["total_count"], 2)
 
     def test_get_count_empty(self):
-        self.mock_client.get.return_value = self._make_response(200, {"data": []})
+        self.mock_client.get.return_value = self._make_response(200, {"message": 0})
         res = get_count("Customer", client=self.mock_client)
         self._assert_envelope(res, "empty")
         self.assertEqual(res["data"], 0)

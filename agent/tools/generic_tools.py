@@ -42,7 +42,9 @@ def get_list(
     filters: Optional[dict] = None,
     fields: Optional[list] = None,
     limit: Optional[int] = None,
-    order_by: Optional[str] = None
+    order_by: Optional[str] = None,
+    offset: Optional[int] = 0,
+    include_total: bool = False,
 ) -> dict:
     return crud.get_list(
         doctype=doctype,
@@ -50,6 +52,8 @@ def get_list(
         fields=fields,
         limit=limit,
         order_by=order_by,
+        offset=offset,
+        include_total=include_total,
     )
 
 
