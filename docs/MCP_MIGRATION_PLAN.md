@@ -139,7 +139,8 @@ Baseline at `529f7d9`: `tests` gives 1 failed, 190 passed; `agent/tests` gives 3
 ### Member 1: ERPNext tool layer extraction: DONE
 See section 4.
 
-### Member 2: Aggregation, reports and pagination (new features)
+### Member 2: Aggregation, reports and pagination (new features): DONE
+See section 4b for what was delivered. The text below is the original plan and Member 1's notes from before that work, so some of it (for example the `get_count` limit) no longer describes the code.
 Responsibility: improve data retrieval and add missing ERPNext capabilities.
 - Replace Python-side counting and summing with database-side aggregation where supported.
 - Reduce repeated document retrievals (N+1 calls).
