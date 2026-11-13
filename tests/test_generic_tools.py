@@ -2,6 +2,8 @@ import os
 import sys
 import unittest
 import json
+import httpx
+import pytest
 from unittest.mock import MagicMock, patch
 
 # Ensure agent and root directories are in path
@@ -19,11 +21,40 @@ from agent.tools.generic_tools import (
     delete_document,
     is_doctype_allowed,
     get_allowed_doctypes,
-    extract_erpnext_error
+    extract_erpnext_error,
+    get_default_company,
+    get_default_warehouse,
 )
+import agent.tools.generic_tools as generic_tools
+
+
+@pytest.fixture(autouse=True)
+def reset_globals_and_env(monkeypatch):
+    generic_tools._cached_company = None
+    generic_tools._cached_warehouses.clear()
+    monkeypatch.delenv("DEFAULT_COMPANY", raising=False)
+    monkeypatch.delenv("DEFAULT_WAREHOUSE", raising=False)
+    yield
+    generic_tools._cached_company = None
+    generic_tools._cached_warehouses.clear()
 
 
 class TestGenericTools(unittest.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        generic_tools._cached_company = None
+        generic_tools._cached_warehouses.clear()
+        self._env_patch = patch.dict(os.environ, {}, clear=False)
+        self._env_patch.start()
+        os.environ.pop("DEFAULT_COMPANY", None)
+        os.environ.pop("DEFAULT_WAREHOUSE", None)
+
+    def tearDown(self):
+        self._env_patch.stop()
+        generic_tools._cached_company = None
+        generic_tools._cached_warehouses.clear()
+        super().tearDown()
 
     def test_whitelist_defaults_and_case_insensitivity(self):
         """Test default whitelist and case-insensitive check."""
@@ -147,8 +178,10 @@ class TestGenericTools(unittest.TestCase):
         self.assertEqual(res["status"], "permission_denied")
         self.assertIn("DocType 'User' is not permitted by whitelist", res["error"])
 
+    @patch("agent.tools.generic_tools.get_default_warehouse", return_value="Stores - MF")
+    @patch("agent.tools.generic_tools.get_default_company", return_value="Metal Forms")
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_create_document_success(self, mock_client_cls):
+    def test_create_document_success(self, mock_client_cls, mock_comp, mock_wh):
         """Test create_document creates a document and returns ERPNext response."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
@@ -174,8 +207,10 @@ class TestGenericTools(unittest.TestCase):
         self.assertEqual(res["status"], "success")
         self.assertEqual(res["data"]["name"], "SALES-ORD-0001")
 
+    @patch("agent.tools.generic_tools.get_default_warehouse", return_value="Stores - MF")
+    @patch("agent.tools.generic_tools.get_default_company", return_value="Metal Forms")
     @patch("agent.tools.generic_tools.httpx.Client")
-    def test_create_document_validation_error(self, mock_client_cls):
+    def test_create_document_validation_error(self, mock_client_cls, mock_comp, mock_wh):
         """Test create_document preserves specific ERPNext error messages on failure."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
@@ -489,6 +524,254 @@ class TestGenericTools(unittest.TestCase):
             limit=None,
             order_by="posting_date desc, posting_time desc"
         )
+
+    # -------------------------------------------------------------------------
+    # get_default_company tests
+    # -------------------------------------------------------------------------
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_company_single_company(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"name": "Acme Corp"}]}
+        mock_client.get.return_value = mock_resp
+
+        comp = get_default_company()
+        self.assertEqual(comp, "Acme Corp")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_company_multiple_companies_unset_raises(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"name": "Comp A"}, {"name": "Comp B"}]}
+        mock_client.get.return_value = mock_resp
+
+        with self.assertRaises(RuntimeError) as ctx:
+            get_default_company()
+        self.assertIn("Default company is not configured", str(ctx.exception))
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_company_env_not_in_list_single_company_fallback(self, mock_client_cls):
+        os.environ["DEFAULT_COMPANY"] = "Unknown Company"
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"name": "Only Co"}]}
+        mock_client.get.return_value = mock_resp
+
+        comp = get_default_company()
+        self.assertEqual(comp, "Only Co")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_company_connect_error_raises_runtime_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_client.get.side_effect = httpx.ConnectError("Connection refused")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            get_default_company()
+        self.assertIn("Failed to fetch Company list from ERPNext", str(ctx.exception))
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_company_non_2xx_raises_runtime_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.is_success = False
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error"
+        mock_resp.json.return_value = {}
+        mock_client.get.return_value = mock_resp
+
+        with self.assertRaises(RuntimeError) as ctx:
+            get_default_company()
+        self.assertIn("500", str(ctx.exception))
+
+    # -------------------------------------------------------------------------
+    # get_default_warehouse tests
+    # -------------------------------------------------------------------------
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_warehouse_env_wrong_company_ignored(self, mock_client_cls):
+        os.environ["DEFAULT_WAREHOUSE"] = "Other WH"
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        w_resp = MagicMock(is_success=True, status_code=200)
+        w_resp.json.return_value = {"data": [
+            {"name": "Target WH", "warehouse_name": "Target WH", "company": "Target Co", "is_group": 0}
+        ]}
+        c_resp = MagicMock(is_success=False, status_code=404)
+        s_resp = MagicMock(is_success=False, status_code=404)
+
+        mock_client.get.side_effect = [w_resp, c_resp, s_resp]
+
+        wh = get_default_warehouse("Target Co")
+        self.assertEqual(wh, "Target WH")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_warehouse_preference_order(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        warehouses_data = [
+            {"name": "Wh Comp Def", "warehouse_name": "Wh Comp Def", "company": "Target Co", "is_group": 0},
+            {"name": "Wh Stock Def", "warehouse_name": "Wh Stock Def", "company": "Target Co", "is_group": 0},
+            {"name": "Stores - Target", "warehouse_name": "Stores - Target", "company": "Target Co", "is_group": 0},
+            {"name": "Leaf WH", "warehouse_name": "Leaf WH", "company": "Target Co", "is_group": 0},
+        ]
+
+        # 1. Company default preferred
+        w_resp = MagicMock(is_success=True, status_code=200)
+        w_resp.json.return_value = {"data": warehouses_data}
+        c_resp1 = MagicMock(is_success=True, status_code=200)
+        c_resp1.json.return_value = {"data": {"default_warehouse": "Wh Comp Def"}}
+        mock_client.get.side_effect = [w_resp, c_resp1]
+        wh1 = get_default_warehouse("Target Co", reload=True)
+        self.assertEqual(wh1, "Wh Comp Def")
+
+        # 2. Stock settings preferred when Company default not available
+        c_resp2 = MagicMock(is_success=True, status_code=200)
+        c_resp2.json.return_value = {"data": {"default_warehouse": None}}
+        s_resp2 = MagicMock(is_success=True, status_code=200)
+        s_resp2.json.return_value = {"data": {"default_warehouse": "Wh Stock Def"}}
+        mock_client.get.side_effect = [w_resp, c_resp2, s_resp2]
+        wh2 = get_default_warehouse("Target Co", reload=True)
+        self.assertEqual(wh2, "Wh Stock Def")
+
+        # 3. Stores heuristic when both Company and Stock defaults missing
+        c_resp3 = MagicMock(is_success=False, status_code=404)
+        s_resp3 = MagicMock(is_success=False, status_code=404)
+        mock_client.get.side_effect = [w_resp, c_resp3, s_resp3]
+        wh3 = get_default_warehouse("Target Co", reload=True)
+        self.assertEqual(wh3, "Stores - Target")
+
+        # 4. First leaf warehouse when stores heuristic doesn't match
+        no_stores_data = [
+            {"name": "Group WH", "warehouse_name": "Group WH", "company": "Target Co", "is_group": 1},
+            {"name": "Leaf WH", "warehouse_name": "Leaf WH", "company": "Target Co", "is_group": 0},
+        ]
+        w_resp4 = MagicMock(is_success=True, status_code=200)
+        w_resp4.json.return_value = {"data": no_stores_data}
+        mock_client.get.side_effect = [w_resp4, c_resp3, s_resp3]
+        wh4 = get_default_warehouse("Target Co", reload=True)
+        self.assertEqual(wh4, "Leaf WH")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_warehouse_company_fetch_http_error_falls_through(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        w_resp = MagicMock(is_success=True, status_code=200)
+        w_resp.json.return_value = {"data": [{"name": "Stores - TC", "warehouse_name": "Stores - TC", "company": "TC", "is_group": 0}]}
+        s_resp = MagicMock(is_success=True, status_code=200)
+        s_resp.json.return_value = {"data": {}}
+
+        mock_client.get.side_effect = [w_resp, httpx.ConnectError("timeout"), s_resp]
+
+        with self.assertLogs("generic_tools", level="WARNING") as log:
+            wh = get_default_warehouse("TC")
+            self.assertEqual(wh, "Stores - TC")
+            self.assertTrue(any("Failed to fetch default warehouse from Company" in msg for msg in log.output))
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_warehouse_stock_settings_403_falls_through(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        w_resp = MagicMock(is_success=True, status_code=200)
+        w_resp.json.return_value = {"data": [{"name": "Stores - TC", "warehouse_name": "Stores - TC", "company": "TC", "is_group": 0}]}
+        c_resp = MagicMock(is_success=True, status_code=200)
+        c_resp.json.return_value = {"data": {}}
+        s_resp = MagicMock(is_success=False, status_code=403)
+
+        mock_client.get.side_effect = [w_resp, c_resp, s_resp]
+
+        with self.assertLogs("generic_tools", level="WARNING") as log:
+            wh = get_default_warehouse("TC")
+            self.assertEqual(wh, "Stores - TC")
+            self.assertTrue(any("Failed to fetch Stock Settings from ERPNext (403)" in msg for msg in log.output))
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_default_warehouse_data_null_does_not_raise(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        w_resp = MagicMock(is_success=True, status_code=200)
+        w_resp.json.return_value = {"data": [{"name": "Stores - TC", "warehouse_name": "Stores - TC", "company": "TC", "is_group": 0}]}
+        c_resp = MagicMock(is_success=True, status_code=200)
+        c_resp.json.return_value = {"data": None}
+        s_resp = MagicMock(is_success=True, status_code=200)
+        s_resp.json.return_value = {"data": None}
+
+        mock_client.get.side_effect = [w_resp, c_resp, s_resp]
+
+        wh = get_default_warehouse("TC")
+        self.assertEqual(wh, "Stores - TC")
+
+    # -------------------------------------------------------------------------
+    # create_document default resolution tests
+    # -------------------------------------------------------------------------
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_default_company")
+    def test_create_document_resolver_runtime_error_returns_system_error_and_skips_post(self, mock_comp, mock_client_cls):
+        mock_comp.side_effect = RuntimeError("Default company is not configured.")
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        res = create_document("Sales Order", {"items": [{"item_code": "SKU001", "qty": 1}]})
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "system_error")
+        self.assertIn("Default company is not configured", res["error"])
+        mock_client.post.assert_not_called()
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_default_warehouse")
+    @patch("agent.tools.generic_tools.get_default_company", return_value="Metal Forms")
+    def test_create_document_all_items_have_warehouse_does_not_call_get_default_warehouse(self, mock_comp, mock_wh, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=201)
+        mock_resp.json.return_value = {"data": {"name": "SO-001"}}
+        mock_client.post.return_value = mock_resp
+
+        payload = {
+            "company": "Metal Forms",
+            "items": [{"item_code": "SKU001", "warehouse": "Explicit WH"}]
+        }
+        res = create_document("Sales Order", payload)
+        self.assertTrue(res["success"])
+        mock_wh.assert_not_called()
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_default_warehouse", return_value="Resolved Default WH")
+    @patch("agent.tools.generic_tools.get_default_company", return_value="Metal Forms")
+    def test_create_document_some_items_lack_warehouse_calls_and_applies_only_to_missing(self, mock_comp, mock_wh, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=201)
+        mock_resp.json.return_value = {"data": {"name": "SO-001"}}
+        mock_client.post.return_value = mock_resp
+
+        payload = {
+            "company": "Metal Forms",
+            "items": [
+                {"item_code": "SKU001", "warehouse": "Explicit WH"},
+                {"item_code": "SKU002"}
+            ]
+        }
+        res = create_document("Sales Order", payload)
+        self.assertTrue(res["success"])
+        mock_wh.assert_called_once_with("Metal Forms")
+        posted = mock_client.post.call_args[1]["json"]
+        self.assertEqual(posted["items"][0]["warehouse"], "Explicit WH")
+        self.assertEqual(posted["items"][1]["warehouse"], "Resolved Default WH")
 
 
 if __name__ == "__main__":

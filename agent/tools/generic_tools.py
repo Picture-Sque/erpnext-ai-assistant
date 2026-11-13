@@ -44,62 +44,135 @@ DEFAULT_WHITELIST = [
 ]
 
 _cached_company = None
-_cached_warehouse = None
+_cached_warehouses: Dict[str, str] = {}
 
-def get_default_company() -> str:
+def get_default_company(reload: bool = False) -> str:
     global _cached_company
-    if _cached_company:
+    if _cached_company and not reload:
         return _cached_company
+
+    headers = get_auth_headers()
+    try:
+        with httpx.Client() as client:
+            resp = client.get(
+                f"{ERPNEXT_BASE_URL}/api/resource/Company",
+                headers=headers,
+                params={"limit_page_length": 100},
+                timeout=10.0
+            )
+            if not resp.is_success:
+                err_msg = extract_erpnext_error(resp) or resp.text
+                raise RuntimeError(f"Failed to fetch Company list from ERPNext ({resp.status_code}): {err_msg}")
+            data = resp.json().get("data", [])
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning(f"Network error or invalid JSON while fetching Company list from ERPNext: {e}")
+        raise RuntimeError(f"Failed to fetch Company list from ERPNext: {e}") from e
+
+    company_names = [c["name"] for c in data if isinstance(c, dict) and "name" in c]
+
     env_val = os.getenv("DEFAULT_COMPANY")
     if env_val:
-        _cached_company = env_val.strip()
-        return _cached_company
-    try:
-        headers = get_auth_headers()
-        with httpx.Client() as client:
-            resp = client.get(f"{ERPNEXT_BASE_URL}/api/resource/Company", headers=headers, timeout=10.0)
-            if resp.is_success:
-                data = resp.json().get("data", [])
-                if data:
-                    _cached_company = data[0]["name"]
-                    return _cached_company
-    except Exception as e:
-        logger.warning(f"Failed to fetch default company from ERPNext: {e}")
-    _cached_company = "Metal Forms"
-    return _cached_company
+        target = env_val.strip()
+        if target in company_names:
+            _cached_company = target
+            return _cached_company
+        logger.warning(f"DEFAULT_COMPANY '{target}' does not exist in ERPNext companies: {company_names}")
 
-def get_default_warehouse(company: Optional[str] = None) -> Optional[str]:
-    global _cached_warehouse
-    if _cached_warehouse:
-        return _cached_warehouse
-    env_val = os.getenv("DEFAULT_WAREHOUSE")
-    if env_val:
-        _cached_warehouse = env_val.strip()
-        return _cached_warehouse
-    comp = company or get_default_company()
-    try:
-        headers = get_auth_headers()
-        with httpx.Client() as client:
+    if len(company_names) == 1:
+        _cached_company = company_names[0]
+        return _cached_company
+    elif len(company_names) == 0:
+        raise RuntimeError("No companies found in ERPNext.")
+    else:
+        raise RuntimeError("Default company is not configured.")
+
+def get_default_warehouse(company: Optional[str] = None, reload: bool = False) -> str:
+    global _cached_warehouses
+    comp = company or get_default_company(reload=reload)
+
+    if comp in _cached_warehouses and not reload:
+        return _cached_warehouses[comp]
+
+    headers = get_auth_headers()
+    with httpx.Client() as client:
+        try:
             resp = client.get(
                 f"{ERPNEXT_BASE_URL}/api/resource/Warehouse",
                 headers=headers,
-                params={"filters": json.dumps([["company", "=", comp]])},
+                params={
+                    "filters": json.dumps([["company", "=", comp]]),
+                    "fields": json.dumps(["name", "warehouse_name", "company", "is_group"]),
+                    "limit_page_length": 100,
+                },
                 timeout=10.0
             )
-            if resp.is_success:
-                data = resp.json().get("data", [])
-                for wh in data:
-                    w_name = wh.get("name", "")
-                    if "stores" in w_name.lower():
-                        _cached_warehouse = w_name
-                        return _cached_warehouse
-                if data:
-                    _cached_warehouse = data[0]["name"]
-                    return _cached_warehouse
-    except Exception as e:
-        logger.warning(f"Failed to fetch default warehouse from ERPNext: {e}")
-    _cached_warehouse = "Stores - MF"
-    return _cached_warehouse
+            if not resp.is_success:
+                err_msg = extract_erpnext_error(resp) or resp.text
+                raise RuntimeError(f"Failed to fetch Warehouse list for '{comp}' from ERPNext ({resp.status_code}): {err_msg}")
+
+            data = resp.json().get("data", [])
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning(f"Network error or invalid JSON while fetching Warehouse list for '{comp}' from ERPNext: {e}")
+            raise RuntimeError(f"Failed to fetch Warehouse list for '{comp}' from ERPNext: {e}") from e
+
+        warehouses = [w for w in data if isinstance(w, dict)]
+        if not warehouses:
+            raise RuntimeError(f"No warehouses found for company '{comp}' in ERPNext.")
+
+        warehouse_names = [w["name"] for w in warehouses if "name" in w]
+
+        # 1. DEFAULT_WAREHOUSE env is honored only if its company matches target company
+        env_val = os.getenv("DEFAULT_WAREHOUSE")
+        if env_val:
+            target_wh = env_val.strip()
+            for w in warehouses:
+                if w.get("name") == target_wh and w.get("company") == comp:
+                    _cached_warehouses[comp] = target_wh
+                    return target_wh
+            logger.info(f"DEFAULT_WAREHOUSE '{target_wh}' does not belong to company '{comp}'; ignoring.")
+
+        # 2. Prefer Company or Stock Settings default warehouse if available and belongs to company
+        pref_wh = None
+        try:
+            c_resp = client.get(f"{ERPNEXT_BASE_URL}/api/resource/Company/{comp}", headers=headers, timeout=5.0)
+            if c_resp.is_success:
+                c_def = (c_resp.json().get("data") or {}).get("default_warehouse")
+                if c_def and c_def in warehouse_names:
+                    pref_wh = c_def
+            else:
+                logger.warning(f"Failed to fetch Company '{comp}' from ERPNext ({c_resp.status_code})")
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning(f"Failed to fetch default warehouse from Company '{comp}': {e}")
+
+        if not pref_wh:
+            try:
+                s_resp = client.get(f"{ERPNEXT_BASE_URL}/api/resource/Stock Settings/Stock Settings", headers=headers, timeout=5.0)
+                if s_resp.is_success:
+                    s_def = (s_resp.json().get("data") or {}).get("default_warehouse")
+                    if s_def and s_def in warehouse_names:
+                        pref_wh = s_def
+                else:
+                    logger.warning(f"Failed to fetch Stock Settings from ERPNext ({s_resp.status_code})")
+            except (httpx.HTTPError, ValueError) as e:
+                logger.warning(f"Failed to fetch default warehouse from Stock Settings: {e}")
+
+        if pref_wh:
+            _cached_warehouses[comp] = pref_wh
+            return pref_wh
+
+        # 3. Existing 'stores' heuristic
+        for wh in warehouses:
+            w_name = wh.get("name", "")
+            w_label = wh.get("warehouse_name", "")
+            if "stores" in w_name.lower() or "stores" in w_label.lower():
+                _cached_warehouses[comp] = w_name
+                return w_name
+
+        # 4. Fallback to first warehouse (prefer non-group)
+        leaf = [wh["name"] for wh in warehouses if not wh.get("is_group") and "name" in wh]
+        chosen = leaf[0] if leaf else warehouse_names[0]
+        _cached_warehouses[comp] = chosen
+        return chosen
 
 
 def get_allowed_doctypes() -> List[str]:
@@ -230,18 +303,29 @@ def create_document(doctype: str, fields: dict) -> dict:
 
     # Dynamic default resolution for Sales Order and Purchase Order
     if doctype in ("Sales Order", "Purchase Order"):
-        if not payload.get("company"):
-            payload["company"] = get_default_company()
+        try:
+            if not payload.get("company"):
+                payload["company"] = get_default_company()
+
+            items = payload.get("items")
+            default_wh = None
+            if isinstance(items, list) and any(isinstance(it, dict) and not it.get("warehouse") for it in items):
+                default_wh = get_default_warehouse(payload.get("company"))
+        except RuntimeError as e:
+            err_msg = str(e)
+            if "Default company is not configured" in err_msg:
+                err_msg = "Default company is not configured. Set DEFAULT_COMPANY or pass a company."
+            logger.error(f"Failed to resolve default company or warehouse: {err_msg}")
+            return _format_result("system_error", error=err_msg)
+
         if not payload.get("transaction_date"):
             payload["transaction_date"] = datetime.now().strftime("%Y-%m-%d")
-        
-        default_wh = get_default_warehouse(payload.get("company"))
         if doctype == "Sales Order":
             if not payload.get("delivery_date"):
                 payload["delivery_date"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
             if "items" in payload and isinstance(payload["items"], list):
                 for item in payload["items"]:
-                    if not item.get("warehouse"):
+                    if default_wh and not item.get("warehouse"):
                         item["warehouse"] = default_wh
                     if not item.get("delivery_date"):
                         item["delivery_date"] = payload["delivery_date"]
@@ -250,7 +334,7 @@ def create_document(doctype: str, fields: dict) -> dict:
                 payload["schedule_date"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
             if "items" in payload and isinstance(payload["items"], list):
                 for item in payload["items"]:
-                    if not item.get("warehouse"):
+                    if default_wh and not item.get("warehouse"):
                         item["warehouse"] = default_wh
                     if not item.get("schedule_date"):
                         item["schedule_date"] = payload["schedule_date"]
