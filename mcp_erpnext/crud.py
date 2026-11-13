@@ -129,6 +129,7 @@ def get_list(
     include_total: bool = False,
     group_by: Optional[str] = None,
     parent_doctype: Optional[str] = None,
+    or_filters: Optional[list] = None,
 ) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result(
@@ -166,6 +167,9 @@ def get_list(
         )
 
     query_params = {}
+    if or_filters:
+        # A row matches when ANY of these conditions holds (combined with `filters` by AND).
+        query_params["or_filters"] = json.dumps(or_filters)
     if parent_doctype:
         query_params["parent"] = parent_doctype
     if group_by:
@@ -408,37 +412,144 @@ def get_document(doctype: str, name: str, client: Optional[ERPNextClient] = None
         return _format_result("system_error", error=str(e))
 
 
-def search_document(doctype: str, query: str, client: Optional[ERPNextClient] = None) -> dict:
+# Fields searched per doctype. A row matches when the query is contained in ANY of them, so
+# a document can be found by its ID or by its display name. Doctypes not listed here are
+# searched by `name` only.
+SEARCH_FIELDS_MAP = {
+    "Customer": ["name", "customer_name"],
+    "Item": ["name", "item_code", "item_name"],
+    "Sales Order": ["name"],
+    "Bin": ["item_code"],
+    "Quotation": ["name"],
+    "Sales Invoice": ["name"],
+    "Purchase Order": ["name"],
+    "Supplier": ["name", "supplier_name"],
+    "Warehouse": ["name", "warehouse_name"],
+    "Company": ["name", "company_name"],
+    "Delivery Note": ["name"],
+    "Purchase Receipt": ["name"],
+}
+DISPLAY_FIELDS_MAP = {
+    "Customer": ["name", "customer_name", "customer_group", "territory"],
+    "Item": ["name", "item_code", "item_name", "item_group"],
+    "Sales Order": ["name", "customer", "status"],
+    "Bin": ["name", "item_code", "warehouse", "actual_qty"],
+    "Quotation": ["name", "customer", "status"],
+    "Sales Invoice": ["name", "customer", "status"],
+    "Purchase Order": ["name", "supplier", "status"],
+    "Supplier": ["name", "supplier_name", "supplier_group"],
+    "Warehouse": ["name", "warehouse_name", "company"],
+    "Company": ["name", "company_name"],
+    "Delivery Note": ["name", "customer", "status"],
+    "Purchase Receipt": ["name", "supplier", "status"],
+}
+
+# Rows fetched per search so they can be ranked before the best ones are returned.
+SEARCH_FETCH_LIMIT = 50
+DEFAULT_SEARCH_LIMIT = 10
+
+
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so a user typing % or _ matches those characters literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _match_tier(row: dict, search_fields: List[str], needle: str) -> int:
+    """0 = a search field equals the query, 1 = starts with it, 2 = contains it (case-insensitive)."""
+    best = 2
+    for field in search_fields:
+        value = row.get(field)
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text == needle:
+            return 0
+        if text.startswith(needle):
+            best = 1
+    return best
+
+
+def search_document(
+    doctype: str,
+    query: str,
+    client: Optional[ERPNextClient] = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+) -> dict:
+    """
+    Find documents by a partial name or ID.
+
+    Every field in SEARCH_FIELDS_MAP for the doctype is searched, `%` and `_` in the query
+    are matched literally, and the results are ranked: exact, then starts-with, then contains.
+    If any document matches the query exactly, ONLY the exact matches are returned, so a user
+    who types a full, existing name is not asked to choose between it and longer names that
+    merely contain it.
+    """
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-    search_fields_map = {
-        "Customer": "customer_name",
-        "Item": "item_name",
-        "Sales Order": "name",
-        "Bin": "item_code",
-        "Quotation": "name",
-        "Sales Invoice": "name",
-        "Purchase Order": "name",
-        "Supplier": "supplier_name"
-    }
-    display_fields_map = {
-        "Customer": ["name", "customer_name", "customer_group", "territory"],
-        "Item": ["name", "item_code", "item_name", "item_group"],
-        "Sales Order": ["name", "customer", "status"],
-        "Bin": ["name", "item_code", "warehouse", "actual_qty"],
-        "Quotation": ["name", "customer", "status"],
-        "Sales Invoice": ["name", "customer", "status"],
-        "Purchase Order": ["name", "supplier", "status"],
-        "Supplier": ["name", "supplier_name", "supplier_group"]
-    }
+    needle = str(query or "").strip()
+    if not needle:
+        return _format_result("system_error", error="Search query must not be empty.")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return _format_result("system_error", error=f"Invalid limit: {limit!r}. Must be a positive integer.")
 
-    primary_field = search_fields_map.get(doctype, "name")
-    display_fields = display_fields_map.get(doctype, ["name"])
+    search_fields = SEARCH_FIELDS_MAP.get(doctype, ["name"])
+    display_fields = list(DISPLAY_FIELDS_MAP.get(doctype, ["name"]))
+    for field in search_fields:  # ranking reads these, so they must be in the result rows
+        if field not in display_fields:
+            display_fields.append(field)
 
-    filters = [[primary_field, "like", f"%{query}%"]]
+    escaped = _escape_like(needle)
+    res = get_list(
+        doctype,
+        fields=display_fields,
+        or_filters=[[field, "like", f"%{escaped}%"] for field in search_fields],
+        limit=SEARCH_FETCH_LIMIT,
+        client=client,
+    )
+    if res["status"] not in ("success", "empty"):
+        return res
 
-    return get_list(doctype, filters=filters, fields=display_fields, limit=10, client=client)
+    rows = res.get("data") or []
+    fetched_all = not res.get("has_more")
+    lowered = needle.lower()
+    ranked = sorted(
+        ((_match_tier(row, search_fields, lowered), str(row.get("name", "")), row) for row in rows),
+        key=lambda item: (item[0], item[1]),
+    )
+    exact = [row for tier, _, row in ranked if tier == 0]
+
+    if not exact and not fetched_all:
+        # More partial matches exist than were fetched, so an exact match could be among the
+        # ones not seen. Ask for exact matches directly.
+        exact_res = get_list(
+            doctype,
+            fields=display_fields,
+            or_filters=[[field, "=", needle] for field in search_fields],
+            limit=limit,
+            client=client,
+        )
+        if exact_res["status"] in ("success", "empty"):
+            exact = exact_res.get("data") or []
+
+    if exact:
+        shown = exact[:limit]
+        return _format_result(
+            "success",
+            data=shown,
+            has_more=len(exact) > limit,
+            pagination=_page_meta(len(exact), 0, limit, len(exact) > limit),
+        )
+
+    ordered = [row for _, _, row in ranked]
+    shown = ordered[:limit]
+    has_more = len(ordered) > limit or not fetched_all
+    return _format_result(
+        "success" if shown else "empty",
+        data=shown,
+        has_more=has_more,
+        pagination=_page_meta(len(ordered) if fetched_all else None, 0, limit, has_more),
+    )
 
 
 def get_count(doctype: str, filters: Optional[dict] = None, client: Optional[ERPNextClient] = None) -> dict:

@@ -889,7 +889,9 @@ class TestGenericTools(unittest.TestCase):
         # Verify filters and fields mapping
         _, kwargs = mock_client.get.call_args
         params = kwargs.get("params", {})
-        self.assertEqual(params["filters"], '[["customer_name", "like", "%West%"]]')
+        # Searches the ID and the display name, not just the display name.
+        self.assertEqual(params["or_filters"], '[["name", "like", "%West%"], ["customer_name", "like", "%West%"]]')
+        self.assertNotIn("filters", params)
         self.assertEqual(params["fields"], '["name", "customer_name", "customer_group", "territory"]')
 
     @patch("agent.tools.generic_tools.httpx.Client")

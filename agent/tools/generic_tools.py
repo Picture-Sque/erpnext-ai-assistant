@@ -91,10 +91,11 @@ def get_document(doctype: str, name: str) -> dict:
     )
 
 
-def search_document(doctype: str, query: str) -> dict:
+def search_document(doctype: str, query: str, limit: int = 10) -> dict:
     return crud.search_document(
         doctype=doctype,
         query=query,
+        limit=limit,
     )
 
 

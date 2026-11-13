@@ -22,6 +22,7 @@ from mcp_erpnext.crud import (
     get_count,
     aggregate,
     MAX_AGGREGATE_GROUPS,
+    SEARCH_FETCH_LIMIT,
     submit_document,
     cancel_document,
 )
@@ -427,6 +428,97 @@ class TestMCPErpnextCrudDirect(unittest.TestCase):
         res = delete_document("Customer", "Cust-1", client=self.mock_client)
         self._assert_envelope(res, "system_error")
         self.assertIn("Network error", res["error"])
+
+    # --- search ---
+    def _customers(self, *names):
+        return self._make_response(200, {"data": [
+            {"name": n, "customer_name": n, "customer_group": "Commercial", "territory": "India"} for n in names
+        ]})
+
+    def test_search_exact_name_wins_over_longer_names(self):
+        self.mock_client.get.return_value = self._customers("Acme Corporation", "Acme Corp", "Acme Industries")
+        res = search_document("Customer", "acme corp", client=self.mock_client)
+        self._assert_envelope(res, "success")
+        self.assertEqual([r["name"] for r in res["data"]], ["Acme Corp"])
+        self.assertEqual(res["total_count"], 1)
+        self.assertEqual(self.mock_client.get.call_count, 1)
+
+    def test_search_without_exact_match_ranks_prefix_before_contains(self):
+        self.mock_client.get.return_value = self._customers("Global Acme", "Acme Industries", "Acme Corporation")
+        res = search_document("Customer", "Acme", client=self.mock_client)
+        self.assertEqual([r["name"] for r in res["data"]], ["Acme Corporation", "Acme Industries", "Global Acme"])
+        self.assertFalse(res["has_more"])
+        self.assertEqual(res["total_count"], 3)
+
+    def test_search_matches_id_or_display_name(self):
+        self.mock_client.get.return_value = self._customers("CUST-0001")
+        search_document("Customer", "CUST-0001", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(
+            json.loads(kwargs["params"]["or_filters"]),
+            [["name", "like", "%CUST-0001%"], ["customer_name", "like", "%CUST-0001%"]],
+        )
+
+    def test_search_escapes_like_wildcards(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": []})
+        search_document("Customer", "50%_off" + chr(92), client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        sent = json.loads(kwargs["params"]["or_filters"])[0][2]
+        # Query was 50%_off\ : %, _ and the backslash are each escaped, then wrapped in %...%.
+        self.assertEqual(sent, r"%50\%\_off\\%")
+
+    def test_search_returns_at_most_limit_and_flags_more(self):
+        self.mock_client.get.return_value = self._customers(*[f"Acme {i:02d}" for i in range(15)])
+        res = search_document("Customer", "Acme", client=self.mock_client, limit=10)
+        self.assertEqual(len(res["data"]), 10)
+        self.assertTrue(res["has_more"])
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["total_count"], 15)
+
+    def test_search_looks_for_exact_match_beyond_the_fetched_page(self):
+        many = [f"Acme {i:02d}" for i in range(SEARCH_FETCH_LIMIT + 1)]  # page is full: more rows exist
+        self.mock_client.get.side_effect = [self._customers(*many), self._customers("Acme")]
+        res = search_document("Customer", "Acme", client=self.mock_client)
+        self.assertEqual([r["name"] for r in res["data"]], ["Acme"])
+        self.assertEqual(self.mock_client.get.call_count, 2)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(json.loads(kwargs["params"]["or_filters"]),
+                         [["name", "=", "Acme"], ["customer_name", "=", "Acme"]])
+
+    def test_search_truncated_page_without_exact_match_reports_unknown_total(self):
+        many = [f"Acme {i:02d}" for i in range(SEARCH_FETCH_LIMIT + 1)]
+        self.mock_client.get.side_effect = [self._customers(*many), self._make_response(200, {"data": []})]
+        res = search_document("Customer", "Acme", client=self.mock_client)
+        self.assertEqual(len(res["data"]), 10)
+        self.assertTrue(res["has_more"])
+        self.assertIsNone(res["total_count"])
+
+    def test_search_blank_query_is_rejected_without_a_call(self):
+        for bad in ("", "   ", None):
+            res = search_document("Customer", bad, client=self.mock_client)
+            self._assert_envelope(res, "system_error")
+        self.mock_client.get.assert_not_called()
+
+    def test_search_covers_doctypes_that_used_to_fall_back_to_name(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [
+            {"name": "Stores - LS", "warehouse_name": "Stores", "company": "LS"}]})
+        res = search_document("Warehouse", "Stores", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(json.loads(kwargs["params"]["fields"]), ["name", "warehouse_name", "company"])
+        self.assertEqual(json.loads(kwargs["params"]["or_filters"])[1][0], "warehouse_name")
+        self.assertEqual(res["data"][0]["name"], "Stores - LS")
+
+    def test_search_unmapped_doctype_searches_name_only(self):
+        self.mock_client.get.return_value = self._make_response(200, {"data": [{"name": "Stock Ledger Entry 1"}]})
+        search_document("Stock Ledger Entry", "Entry", client=self.mock_client)
+        _, kwargs = self.mock_client.get.call_args
+        self.assertEqual(json.loads(kwargs["params"]["or_filters"]), [["name", "like", "%Entry%"]])
+
+    def test_search_errors_pass_through(self):
+        self.mock_client.get.return_value = self._make_response(403, {"message": "no"})
+        self._assert_envelope(search_document("Customer", "x", client=self.mock_client), "permission_denied")
+        self.mock_client.get.return_value = self._make_response(500, text="boom")
+        self._assert_envelope(search_document("Customer", "x", client=self.mock_client), "system_error")
 
     # --- pagination metadata ---
     def test_get_list_offset_sent_as_limit_start(self):
