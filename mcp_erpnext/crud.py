@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import functools
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Callable
 import httpx
@@ -137,8 +138,9 @@ def create_document(
     logger: Optional[logging.Logger] = None,
 ) -> dict:
     log = logger or logging.getLogger("mcp_erpnext.crud")
-    comp_resolver = default_company_resolver or get_default_company
-    wh_resolver = default_warehouse_resolver or get_default_warehouse
+    c = client or ERPNextClient()
+    comp_resolver = default_company_resolver or functools.partial(get_default_company, client=c)
+    wh_resolver = default_warehouse_resolver or functools.partial(get_default_warehouse, client=c)
 
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
@@ -215,7 +217,8 @@ def update_document(
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
     log = logger or logging.getLogger("mcp_erpnext.crud")
-    doc_getter = document_getter or get_document
+    c = client or ERPNextClient()
+    doc_getter = document_getter or functools.partial(get_document, client=c)
 
     payload = dict(fields)
     # Special handling for Sales Order parent-synced fields:
