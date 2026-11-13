@@ -19,6 +19,12 @@ from agent.tools.generic_tools import (
     get_list,
     update_document,
     delete_document,
+    get_document,
+    search_document,
+    get_count,
+    aggregate,
+    cancel_document,
+    submit_document,
     is_doctype_allowed,
     get_allowed_doctypes,
     extract_erpnext_error,
@@ -772,6 +778,337 @@ class TestGenericTools(unittest.TestCase):
         posted = mock_client.post.call_args[1]["json"]
         self.assertEqual(posted["items"][0]["warehouse"], "Explicit WH")
         self.assertEqual(posted["items"][1]["warehouse"], "Resolved Default WH")
+
+    # ---------------------------------------------------------
+    # Characterization tests for read and workflow tools
+    # (get_document, search_document, get_count, aggregate,
+    #  cancel_document, submit_document)
+    # ---------------------------------------------------------
+
+    def _assert_envelope(self, res: dict, expected_status: str):
+        self.assertEqual(set(res.keys()), {"status", "data", "error", "has_more", "success"})
+        self.assertEqual(res["status"], expected_status)
+        self.assertEqual(res["success"], expected_status in ("success", "empty"))
+
+    # get_document tests
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_document_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "customer": "Acme Corp"}}
+        mock_client.get.return_value = mock_resp
+
+        res = get_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["name"], "SO-001")
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["error"])
+
+    def test_get_document_whitelist_rejection(self):
+        res = get_document("User", "admin")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_document_not_found(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Document not found"}
+        mock_client.get.return_value = mock_resp
+
+        res = get_document("Sales Order", "SO-NONEXISTENT")
+        self._assert_envelope(res, "not_found")
+        self.assertIn("not found", res["error"].lower())
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_document_permission_denied_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=403)
+        mock_resp.json.return_value = {"message": "Forbidden access"}
+        mock_client.get.return_value = mock_resp
+
+        res = get_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("Forbidden", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_document_system_error_http(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "Internal Server Error"}
+        mock_client.get.return_value = mock_resp
+
+        res = get_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Internal Server Error", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_document_transport_exception(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_client.get.side_effect = httpx.ConnectError("Failed to connect")
+
+        res = get_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Failed to connect", res["error"])
+
+    # search_document tests
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_search_document_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {
+            "data": [{"name": "CUST-001", "customer_name": "West View Store", "customer_group": "Commercial", "territory": "All Territories"}]
+        }
+        mock_client.get.return_value = mock_resp
+
+        res = search_document("Customer", "West")
+        self._assert_envelope(res, "success")
+        self.assertEqual(len(res["data"]), 1)
+        self.assertEqual(res["data"][0]["customer_name"], "West View Store")
+        # Verify filters and fields mapping
+        _, kwargs = mock_client.get.call_args
+        params = kwargs.get("params", {})
+        self.assertEqual(params["filters"], '[["customer_name", "like", "%West%"]]')
+        self.assertEqual(params["fields"], '["name", "customer_name", "customer_group", "territory"]')
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_search_document_empty(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": []}
+        mock_client.get.return_value = mock_resp
+
+        res = search_document("Customer", "Nonexistent")
+        self._assert_envelope(res, "empty")
+        self.assertEqual(res["data"], [])
+        self.assertTrue(res["success"])
+
+    def test_search_document_whitelist_rejection(self):
+        res = search_document("User", "admin")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_search_document_system_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "Database query failed"}
+        mock_client.get.return_value = mock_resp
+
+        res = search_document("Customer", "West")
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Database query failed", res["error"])
+
+    # get_count tests
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_count_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": [{"name": "SO-001"}, {"name": "SO-002"}, {"name": "SO-003"}]}
+        mock_client.get.return_value = mock_resp
+
+        res = get_count("Sales Order")
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"], 3)
+        self.assertTrue(res["success"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_count_empty(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": []}
+        mock_client.get.return_value = mock_resp
+
+        res = get_count("Sales Order", filters={"status": "Draft"})
+        self._assert_envelope(res, "empty")
+        self.assertEqual(res["data"], 0)
+        self.assertTrue(res["success"])
+
+    def test_get_count_whitelist_rejection(self):
+        res = get_count("User")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_get_count_error_propagation(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "Server error counting"}
+        mock_client.get.return_value = mock_resp
+
+        res = get_count("Sales Order")
+        self._assert_envelope(res, "system_error")
+        self.assertFalse(res["success"])
+
+    # aggregate tests
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_aggregate_success_sum_and_sort(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {
+            "data": [
+                {"name": "SO-001", "customer": "Acme", "grand_total": 100.0},
+                {"name": "SO-002", "customer": "Acme", "grand_total": 50.0},
+                {"name": "SO-003", "customer": "Beta", "grand_total": 200.0},
+            ]
+        }
+        mock_client.get.return_value = mock_resp
+
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum", sort="grand_total desc", limit=2)
+        self._assert_envelope(res, "success")
+        self.assertEqual(len(res["data"]), 2)
+        self.assertEqual(res["data"][0], {"customer": "Beta", "grand_total": 200.0})
+        self.assertEqual(res["data"][1], {"customer": "Acme", "grand_total": 150.0})
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_aggregate_empty(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": []}
+        mock_client.get.return_value = mock_resp
+
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum")
+        self._assert_envelope(res, "empty")
+        self.assertEqual(res["data"], [])
+        self.assertTrue(res["success"])
+
+    def test_aggregate_whitelist_rejection(self):
+        res = aggregate("User", group_by="role", metric="id", aggregation_fn="count")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_aggregate_error_propagation(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Resource not found"}
+        mock_client.get.return_value = mock_resp
+
+        res = aggregate("Sales Order", group_by="customer", metric="grand_total", aggregation_fn="sum")
+        self._assert_envelope(res, "not_found")
+        self.assertFalse(res["success"])
+
+    # cancel_document tests
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_cancel_document_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "docstatus": 2}}
+        mock_client.put.return_value = mock_resp
+
+        res = cancel_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["docstatus"], 2)
+        # Verify PUT body has docstatus = 2
+        _, kwargs = mock_client.put.call_args
+        self.assertEqual(kwargs.get("json"), {"docstatus": 2})
+
+    def test_cancel_document_whitelist_rejection(self):
+        res = cancel_document("User", "admin")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_cancel_document_not_found(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Document not found"}
+        mock_client.put.return_value = mock_resp
+
+        res = cancel_document("Sales Order", "SO-NONEXISTENT")
+        self._assert_envelope(res, "not_found")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_cancel_document_permission_denied(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=403)
+        mock_resp.json.return_value = {"message": "Not permitted to cancel"}
+        mock_client.put.return_value = mock_resp
+
+        res = cancel_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "permission_denied")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_cancel_document_system_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "ERPNext cancel failed"}
+        mock_client.put.return_value = mock_resp
+
+        res = cancel_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "system_error")
+
+    # submit_document tests
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_submit_document_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "docstatus": 1}}
+        mock_client.put.return_value = mock_resp
+
+        res = submit_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "success")
+        self.assertEqual(res["data"]["docstatus"], 1)
+        # Verify PUT body has docstatus = 1
+        _, kwargs = mock_client.put.call_args
+        self.assertEqual(kwargs.get("json"), {"docstatus": 1})
+
+    def test_submit_document_whitelist_rejection(self):
+        res = submit_document("User", "admin")
+        self._assert_envelope(res, "permission_denied")
+        self.assertIn("not permitted by whitelist", res["error"])
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_submit_document_not_found(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=404)
+        mock_resp.json.return_value = {"message": "Document not found"}
+        mock_client.put.return_value = mock_resp
+
+        res = submit_document("Sales Order", "SO-NONEXISTENT")
+        self._assert_envelope(res, "not_found")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_submit_document_permission_denied(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=403)
+        mock_resp.json.return_value = {"message": "Not permitted to submit"}
+        mock_client.put.return_value = mock_resp
+
+        res = submit_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "permission_denied")
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    def test_submit_document_system_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=False, status_code=500)
+        mock_resp.json.return_value = {"message": "ERPNext submit failed"}
+        mock_client.put.return_value = mock_resp
+
+        res = submit_document("Sales Order", "SO-001")
+        self._assert_envelope(res, "system_error")
 
 
 if __name__ == "__main__":
