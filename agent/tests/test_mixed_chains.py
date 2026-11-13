@@ -130,6 +130,35 @@ class FakeERP:
     def get_count(self, doctype, filters=None):
         return _res("success", len([r for r in self.db.get(doctype, []) if all(self._match(r, f) for f in (filters or []))]))
 
+    @staticmethod
+    def _parent_matches(parent, flt):
+        """Evaluate a filter on a child row's parent. Four-item filters name the parent doctype."""
+        if len(flt) == 4:
+            flt = flt[1:]
+        field, op, val = flt
+        cur = parent.get(field)
+        ops = {"=": lambda a, b: str(a) == str(b), "<": lambda a, b: str(a) < str(b),
+               ">=": lambda a, b: str(a) >= str(b), "<=": lambda a, b: str(a) <= str(b)}
+        return ops[op](cur, val)
+
+    def aggregate(self, doctype, group_by, metric, aggregation_fn, filters=None, sort=None, limit=None,
+                  parent_doctype=None):
+        """Grouped sum over a child table, the way ERPNext does it: one call, no per-document reads."""
+        self.calls.append(("aggregate", doctype, {"parent_doctype": parent_doctype, "filters": filters,
+                                                  "group_by": group_by, "metric": metric}))
+        assert doctype == "Sales Order Item" and parent_doctype == "Sales Order", "fake only models item analytics"
+        totals = {}
+        for parent in self.db["Sales Order"]:
+            if all(self._parent_matches(parent, f) for f in (filters or [])):
+                for row in parent["items"]:
+                    totals[row[group_by]] = totals.get(row[group_by], 0) + float(row.get(metric) or 0)
+        rows = [{group_by: g, metric: v} for g, v in totals.items()]
+        if sort:
+            field, _, direction = sort.partition(" ")
+            rows.sort(key=lambda r: (r[field], r[group_by]) if direction == "asc" else (-r[field], r[group_by]))
+        rows = rows[: limit or len(rows)]
+        return _res("success" if rows else "empty", rows)
+
     def po(self, name):
         return next(r for r in self.db["Purchase Order"] if r["name"] == name)
 
@@ -195,7 +224,7 @@ def env(tmp_path, monkeypatch):
 
     erp = FakeERP()
     for name in ("get_list", "search_document", "get_document", "create_document",
-                 "submit_document", "cancel_document", "get_count"):
+                 "submit_document", "cancel_document", "get_count", "aggregate"):
         monkeypatch.setattr(graph, name, getattr(erp, name))
     llm = ScriptedLLM()
     monkeypatch.setattr(graph, "invoke_structured_llm", llm.structured)
@@ -458,6 +487,24 @@ def test_best_seller_low_stock_conditional_po_runs_end_to_end(env):
     assert persisted["pending_input"] is None
     assert persisted["pending_confirmation"]["skill"] == "submit-purchase-order"  # the submit offer
     assert persisted["chain_plan"] is None
+
+
+def test_item_analytics_is_one_grouped_call_filtered_on_the_parent(env):
+    _best_seller_plan(env.llm)
+    env.text(BEST_SELLER_MSG)
+    agg_calls = [c for c in env.erp.calls if c[0] == "aggregate"]
+    assert len(agg_calls) == 1
+    _, doctype, args = agg_calls[0]
+    assert doctype == "Sales Order Item"
+    assert args["parent_doctype"] == "Sales Order"
+    assert args["group_by"] == "item_code" and args["metric"] == "qty"
+    # Dates belong to the Sales Order, so they carry the parent name; docstatus stays plain.
+    assert ["docstatus", "=", "1"] in args["filters"]
+    assert ["Sales Order", "transaction_date", ">=", "2026-06-16"] in args["filters"]
+    assert ["Sales Order", "transaction_date", "<=", "2026-10-16"] in args["filters"]
+    # The old path fetched every Sales Order, one document at a time.
+    assert not [c for c in env.erp.calls if c[0] == "get_document" and c[1] == "Sales Order"]
+    assert not [c for c in env.erp.calls if c[0] == "get_list" and c[1] == "Sales Order"]
 
 
 def test_conditional_po_is_skipped_when_stock_is_not_low(env):

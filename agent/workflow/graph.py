@@ -2399,45 +2399,28 @@ def call_generic_tool_node(state: AgentState):
                     tool_res = {"status": "not_found", "success": False, "data": None, "error": "No document name/ID provided for get_document lookup."}
             elif tool == "aggregate":
                 query_type = parameters.get("_query_type", "best_selling_item_qty")
-                # Item-level analytics: Frappe's REST API for child doctypes (Sales Order Item)
-                # doesn't return field values — only the 'name' (record ID). Instead, we fetch
-                # Sales Order records with their `items` child table (returned by get_document
-                # and also by get_list when 'items' is in the fields list), then compute the
-                # item-level aggregation in Python.
+                # Item-level analytics read the child table (Sales Order Item) and let ERPNext
+                # group it, in one call. Before, this fetched up to 500 Sales Orders and then
+                # called get_document once per order, silently ignoring the rest.
+                # Filters on Sales Order fields (dates) are sent in the four-item form
+                # [parent, field, operator, value] so they apply to each row's parent; the
+                # docstatus filter is applied to the rows directly.
                 _item_level_queries = {"best_selling_item_qty", "best_selling_item_revenue", "worst_selling_item"}
                 if query_type in _item_level_queries:
-                    agg_filters = parameters.get("filters") or []
-                    # Fetch submitted Sales Orders with their items array
-                    # Note: get_list doesn't return child tables; use pagination over get_document
-                    # for each SO. Instead, fetch SO names first, then batch get_document calls.
-                    so_list_res = get_list(
-                        "Sales Order",
-                        filters=agg_filters if agg_filters else [["docstatus", "=", "1"]],
-                        fields=["name"],
-                        limit=500,
+                    child_filters = [
+                        flt if flt[0] == "docstatus" else ["Sales Order", *flt]
+                        for flt in (parameters.get("filters") or [])
+                    ]
+                    tool_res = aggregate(
+                        doctype_name,
+                        group_by=parameters.get("group_by", "item_code"),
+                        metric=parameters.get("metric", "qty"),
+                        aggregation_fn=parameters.get("aggregation_fn", "sum"),
+                        filters=child_filters or None,
+                        sort=parameters.get("sort"),
+                        limit=parameters.get("limit"),
+                        parent_doctype="Sales Order",
                     )
-                    so_names = [r["name"] for r in (so_list_res.get("data") or [])]
-                    # Aggregate items across all SOs in Python
-                    item_agg: Dict[str, float] = {}
-                    for so_name in so_names:
-                        doc_res = get_document("Sales Order", so_name)
-                        if doc_res.get("status") == "success":
-                            so_doc = doc_res.get("data", {})
-                            for item_row in (so_doc.get("items") or []):
-                                ic = item_row.get("item_code", "Unknown")
-                                if query_type == "best_selling_item_revenue":
-                                    val = float(item_row.get("amount") or item_row.get("base_amount") or 0)
-                                else:
-                                    val = float(item_row.get("qty") or 0)
-                                item_agg[ic] = item_agg.get(ic, 0) + val
-                    # Sort and limit
-                    agg_metric = "qty" if query_type != "best_selling_item_revenue" else "amount"
-                    reverse_sort = query_type != "worst_selling_item"
-                    result_list = [{"item_code": k, agg_metric: v} for k, v in item_agg.items()]
-                    result_list.sort(key=lambda x: x.get(agg_metric, 0), reverse=reverse_sort)
-                    agg_limit = parameters.get("limit") or 10
-                    result_list = result_list[:agg_limit]
-                    tool_res = {"status": "success" if result_list else "empty", "success": True, "data": result_list, "error": None, "has_more": False}
                 else:
                     # Parent-level analytics: aggregate directly on Sales Order
                     tool_res = aggregate(
