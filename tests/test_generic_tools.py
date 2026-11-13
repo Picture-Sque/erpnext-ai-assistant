@@ -1298,44 +1298,54 @@ class TestGenericTools(unittest.TestCase):
 
     @patch("agent.tools.generic_tools.httpx.Client")
     @patch("agent.tools.generic_tools.get_document")
-    def test_update_sales_order_delivery_date_get_doc_failure_silent_fallthrough_known_behavior(self, mock_get_doc, mock_client_cls):
-        """Documents KNOWN silent fall-through: if get_document returns not_found or system_error, PUT proceeds WITHOUT items."""
+    def test_update_sales_order_delivery_date_get_doc_failure_aborts_put_and_returns_error(self, mock_get_doc, mock_client_cls):
+        """If get_document returns non-success, PUT is NOT called and non-success envelope is returned."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
-        mock_resp = MagicMock(is_success=True, status_code=200)
-        mock_resp.json.return_value = {"data": {"name": "SO-001", "delivery_date": "2026-11-01"}}
-        mock_client.put.return_value = mock_resp
 
-        mock_get_doc.return_value = {"status": "not_found", "error": "Sales Order SO-001 not found"}
+        mock_get_doc.return_value = {"status": "not_found", "success": False, "error": "Sales Order SO-001 not found"}
 
         res = update_document("Sales Order", "SO-001", {"delivery_date": "2026-11-01"})
-        self._assert_envelope(res, "success")
-        _, kwargs = mock_client.put.call_args
-        put_payload = kwargs.get("json", {})
-        # Note: items is NOT in payload because the non-success status was silently ignored
-        self.assertNotIn("items", put_payload)
-        self.assertEqual(put_payload["delivery_date"], "2026-11-01")
+        self._assert_envelope(res, "not_found")
+        self.assertIn("Cannot synchronise item delivery dates for Sales Order SO-001: Sales Order SO-001 not found", res["error"])
+        mock_client.put.assert_not_called()
 
     @patch("agent.tools.generic_tools.httpx.Client")
     @patch("agent.tools.generic_tools.get_document")
-    def test_update_sales_order_delivery_date_get_doc_raises_silent_fallthrough_and_logs_warning(self, mock_get_doc, mock_client_cls):
-        """Documents KNOWN silent fall-through: if get_document raises an exception, warning is logged and PUT proceeds WITHOUT items."""
+    def test_update_sales_order_delivery_date_get_doc_raises_aborts_put_logs_warning_and_returns_system_error(self, mock_get_doc, mock_client_cls):
+        """If get_document raises RuntimeError, warning is logged, PUT is NOT called, and system_error envelope is returned."""
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
-        mock_resp = MagicMock(is_success=True, status_code=200)
-        mock_resp.json.return_value = {"data": {"name": "SO-001", "delivery_date": "2026-11-01"}}
-        mock_client.put.return_value = mock_resp
 
         mock_get_doc.side_effect = RuntimeError("Simulated timeout fetching Sales Order")
 
         with self.assertLogs("generic_tools", level="WARNING") as cm:
             res = update_document("Sales Order", "SO-001", {"delivery_date": "2026-11-01"})
 
-        self._assert_envelope(res, "success")
+        self._assert_envelope(res, "system_error")
+        self.assertIn("Cannot synchronise item delivery dates for Sales Order SO-001: Simulated timeout fetching Sales Order", res["error"])
         self.assertTrue(any("Failed to synchronize items delivery_date" in msg for msg in cm.output))
+        mock_client.put.assert_not_called()
+
+    @patch("agent.tools.generic_tools.httpx.Client")
+    @patch("agent.tools.generic_tools.get_document")
+    def test_update_sales_order_delivery_date_get_doc_null_data_sends_put_without_items(self, mock_get_doc, mock_client_cls):
+        """When get_document returns status success but data is None, PUT is sent without items and no exception is raised."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+        mock_resp = MagicMock(is_success=True, status_code=200)
+        mock_resp.json.return_value = {"data": {"name": "SO-001", "delivery_date": "2026-11-01"}}
+        mock_client.put.return_value = mock_resp
+
+        mock_get_doc.return_value = {"status": "success", "data": None}
+
+        res = update_document("Sales Order", "SO-001", {"delivery_date": "2026-11-01"})
+        self._assert_envelope(res, "success")
+        mock_client.put.assert_called_once()
         _, kwargs = mock_client.put.call_args
         put_payload = kwargs.get("json", {})
         self.assertNotIn("items", put_payload)
+        self.assertEqual(put_payload["delivery_date"], "2026-11-01")
 
     # get_count limit pinning
     @patch("agent.tools.generic_tools.httpx.Client")

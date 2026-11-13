@@ -220,24 +220,28 @@ def update_document(
     payload = dict(fields)
     # Special handling for Sales Order parent-synced fields:
     # In ERPNext, Sales Order header delivery_date is synced from items[].delivery_date.
-    # When updating delivery_date, we must also update delivery_date on every row in items,
-    # otherwise ERPNext will revert the header date back to the child items' date.
+    # When updating delivery_date, we must also update delivery_date on every row in items;
+    # do not send a partial update when the current document cannot be read.
     # Note: Other parent-synced fields (e.g. warehouse, or rate/qty which recalculate totals)
     # may require similar child table synchronization in future enhancements.
     if doctype == "Sales Order" and "delivery_date" in payload and "items" not in payload:
         try:
             current_doc_res = doc_getter(doctype, name)
-            if current_doc_res.get("status") == "success":
-                current_items = current_doc_res.get("data", {}).get("items", [])
-                if current_items:
-                    updated_items = []
-                    for it in current_items:
-                        it_copy = dict(it)
-                        it_copy["delivery_date"] = payload["delivery_date"]
-                        updated_items.append(it_copy)
-                    payload["items"] = updated_items
-        except Exception as e:
+            if current_doc_res.get("status") != "success":
+                err_msg = f"Cannot synchronise item delivery dates for Sales Order {name}: {current_doc_res.get('error')}"
+                return _format_result(current_doc_res.get("status", "system_error"), error=err_msg)
+
+            current_items = (current_doc_res.get("data") or {}).get("items") or []
+            if current_items:
+                updated_items = []
+                for it in current_items:
+                    it_copy = dict(it)
+                    it_copy["delivery_date"] = payload["delivery_date"]
+                    updated_items.append(it_copy)
+                payload["items"] = updated_items
+        except RuntimeError as e:
             log.warning(f"Failed to synchronize items delivery_date for {doctype} {name}: {e}")
+            return _format_result("system_error", error=f"Cannot synchronise item delivery dates for Sales Order {name}: {e}")
 
     try:
         c = client or ERPNextClient()
