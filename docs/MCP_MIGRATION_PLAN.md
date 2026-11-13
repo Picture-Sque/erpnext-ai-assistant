@@ -135,3 +135,76 @@ Files: `agent/tools/adapter.py`, `mcp_client.py`, `__init__.py`, `agent/workflow
 Deliverable: direct and MCP backends working with the existing skills, with reads migrated.
 Notes from Member 1:
 - `graph.py` imports `get_default_company` and `get_default_warehouse` from `tools.generic_tools` and calls them directly (confirmation text and submit offer). These bypass any adapter; route them through it, and keep catching only `RuntimeError` there.
+
+### Member 5: Authentication and user identity (critical security)
+Responsibility: make ERPNext recognise the actual user behind each request.
+- Spike comparing per-user Frappe API credentials, a Frappe-side signed assertion endpoint and OAuth; pick and implement one.
+- Put user identity into the MCP request context; verify identity, roles and read-only status from trusted authentication data.
+- Replace the shared service key with per-user identity where supported; scoped read-only credentials for external MCP clients.
+- Harden `verify_token`, CORS and the development mock authentication.
+Files: `ai_assistant/ai_assistant/api.py`, `agent/main.py`, `mcp_erpnext/auth.py`, client credential integration, `useDemoChat.ts` if token exchange changes.
+Deliverable: per-user authentication demonstrated with two users who have different permissions and receive their own ERPNext permissions.
+Notes from Member 1:
+- `Credentials` already supports api_key/secret and custom headers (for example `Authorization: Bearer ...`), and `ERPNextClient(credentials=...)` uses them for every call. Resolver caches are keyed by an HMAC of the credential, so two users never share a cached company or warehouse. Today every user still shares the one service key from `.env`, so the cache is effectively global until your work lands.
+- Open decision D1 is yours to settle with Member 4.
+- Dev mock auth is controlled by `ALLOW_DEV_MOCK_AUTH`.
+
+### Member 6: Testing, security and deployment (quality and deployment)
+Responsibility: the migration works correctly, securely and reliably.
+- Clean test baseline (section 5) and the existing failing tests.
+- Tests for aggregation, reports, pagination and direct-versus-MCP parity; MCP tool registration and execution.
+- Read-only tokens blocked from writes, restricted reports, disallowed tools, empty `allowed_roles`; unauthenticated access denied.
+- Write safety: no automatic retries on writes; send `modified` on update and cancel.
+- Dockerfiles and Docker Compose with persistent volumes for SQLite files; README and deployment documentation.
+Files: existing tests; `tests/test_mcp_server.py`, `test_security_isolation.py`, `test_pagination_and_reports.py`, `Dockerfile`, `docker-compose.yml`, README.
+Deliverable: passing functional and security tests, working deployment configuration, updated documentation.
+Notes from Member 1:
+- `mcp_erpnext` is not packaged by `pyproject.toml` and only works when the repo root is on `sys.path` (in dev an editable install provides that). Docker images and a plain `uvicorn` start in a clean environment need `PYTHONPATH` or an install step.
+- `mcp_erpnext` never loads `.env`; set the ERPNext variables in the container environment.
+- Two auth tests depend on the local `.env` (section 5).
+
+## 7. Coordination
+
+### Recommended sequence
+| Order | Members | Work |
+|---|---|---|
+| 1 | All | Phase 0 security fixes and agreement on shared contracts |
+| 2 | 1 (done), 3, 5, 6 | Tool extraction (done), MCP design, identity spike, test preparation in parallel |
+| 3 | 2 | Aggregation and reports against the extracted tool layer |
+| 4 | 4 | Integrate LangGraph after Member 3 settles the MCP schemas; reads first |
+| 5 | 3, 4, 5 | Verified identity and authorization before enabling more operations or external access |
+| 6 | All | Integration tests, security review, deployment hardening |
+
+### Shared agreements
+- Request context: `user_id`, `roles`, opaque credential, `read_only`, `request_id`.
+- Result format: preserve `{status, data, error, has_more, success}`; add `total_count`, `offset`, `limit`, `truncated`.
+- Tool names: do not rename existing tools.
+- Security: the MCP server verifies the caller from trusted authentication context, never from request arguments.
+- Writes stay in LangGraph until per-user identity works.
+- No merge without relevant tests and end-to-end verification.
+
+### Shared-file ownership
+| File | Ownership |
+|---|---|
+| `generic_tools.py` | Member 1 (done), then Member 2 |
+| `graph.py` | Member 3 prepares shared policy; Member 4 integrates |
+| `main.py` | Member 5 authentication; Member 4 tool integration |
+| `ai_assistant/api.py` | Member 5 identity; Member 2 only if custom aggregation methods are needed |
+| `mcp_erpnext/crud.py` | Member 2 for aggregation and pagination; others coordinate with Member 2 |
+
+## 8. Open decisions and known issues
+
+### Decisions needed
+- D1 (Members 4 and 5): the `generic_tools` wrappers cannot receive per-request credentials (no `client` argument, and their signatures must stay unchanged for the 22 skills). Proposed: a request-scoped context variable that `mcp_erpnext` reads, with the environment service key as the fallback. Settle this before building identity or the adapter.
+
+### Known issues and open items
+- The resolver caches have no TTL or size limit.
+- `ERPNextConfigError` is re-raised as a plain `RuntimeError` inside the default resolvers (message kept) for compatibility with `graph.py`.
+- The nine broad `except Exception` blocks in `crud.py` were kept on purpose: they preserve the "Invalid JSON response" `system_error` envelope for non-object responses. Narrowing them needs a decision.
+- `mcp_erpnext` is not packaged and never loads `.env` (Members 3 and 6).
+- The genericity scan does not cover `mcp_erpnext/crud.py` (section 5).
+- The Sales Order `delivery_date` behaviour of ERPNext was not verified; the abort-on-failed-read change is a safety rule, not a documented ERPNext fact.
+
+## 9. First milestone
+
+A secure, read-only MCP integration working with the existing chatbot: the chatbot keeps working; LangGraph retrieves ERPNext data through MCP; existing skills are unchanged; unauthorized tools are rejected; external agents cannot write; direct mode remains available for rollback; per-user identity is verified before external exposure.
