@@ -13,6 +13,13 @@ from mcp_erpnext.client import (
     ERPNextClient,
     get_env_credentials,
 )
+from mcp_erpnext.defaults import (
+    get_default_company,
+    get_default_warehouse,
+    reset_resolver_caches,
+)
+from mcp_erpnext import defaults
+from mcp_erpnext import crud
 
 __all__ = [
     "ERPNextError",
@@ -22,4 +29,9 @@ __all__ = [
     "Credentials",
     "ERPNextClient",
     "get_env_credentials",
+    "defaults",
+    "crud",
+    "get_default_company",
+    "get_default_warehouse",
+    "reset_resolver_caches",
 ]
