@@ -207,6 +207,48 @@ class TestAuth(unittest.TestCase):
 				get_auth_token()
 			self.assertIn("Invalid CREDENTIAL_ENC_KEY", str(ctx.exception))
 
+	def test_frappe_api_get_readonly_auth_token_minting(self):
+		"""get_readonly_auth_token mints scope='read' and shorter TTL, while get_auth_token output is unchanged."""
+		from cryptography.fernet import Fernet
+		mock_frappe = MagicMock()
+		mock_sessions = MagicMock()
+		mock_sessions.get_csrf_token.return_value = "mock_valid_csrf"
+		mock_frappe.session.user = "jane@example.com"
+		mock_frappe.session.sid = "mock_valid_sid"
+		test_fernet_key = Fernet.generate_key().decode()
+
+		mock_frappe.conf.get.side_effect = lambda k: test_fernet_key if k == "credential_enc_key" else TEST_SECRET
+		mock_frappe.utils.get_fullname.return_value = "Jane Doe"
+		mock_frappe.get_roles.return_value = ["Accounts User"]
+		mock_frappe.whitelist.side_effect = lambda *a, **kw: (a[0] if (len(a) > 0 and callable(a[0])) else (lambda fn: fn))
+
+		with patch.dict(sys.modules, {"frappe": mock_frappe, "frappe.sessions": mock_sessions}):
+			if "ai_assistant.ai_assistant.api" in sys.modules:
+				del sys.modules["ai_assistant.ai_assistant.api"]
+			from ai_assistant.ai_assistant.api import get_auth_token, get_readonly_auth_token
+
+			# 1. get_auth_token output remains unchanged
+			normal_res = get_auth_token()
+			self.assertEqual(normal_res["expires_in_seconds"], 3600)
+			self.assertNotIn("scope", normal_res)
+			normal_payload = jwt.decode(normal_res["token"], TEST_SECRET, algorithms=["HS256"])
+			self.assertNotIn("scope", normal_payload)
+			self.assertEqual(normal_payload["exp"] - normal_payload["iat"], 3600)
+
+			# 2. get_readonly_auth_token mints with scope="read" and 15 min exp
+			ro_res = get_readonly_auth_token()
+			self.assertEqual(ro_res["expires_in_seconds"], 900)
+			self.assertEqual(ro_res["scope"], "read")
+			ro_payload = jwt.decode(ro_res["token"], TEST_SECRET, algorithms=["HS256"])
+			self.assertEqual(ro_payload["scope"], "read")
+			self.assertEqual(ro_payload["exp"] - ro_payload["iat"], 900)
+
+			# Verify encrypted ctx is present and valid
+			f = Fernet(test_fernet_key.encode())
+			decrypted = json.loads(f.decrypt(ro_payload["ctx"].encode()).decode())
+			self.assertEqual(decrypted["sid"], "mock_valid_sid")
+			self.assertEqual(decrypted["csrf_token"], "mock_valid_csrf")
+
 if __name__ == "__main__":
 	unittest.main()
 

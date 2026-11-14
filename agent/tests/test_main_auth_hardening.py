@@ -293,3 +293,96 @@ def test_dev_mock_auth_bypasses_credential_enc_key_when_explicitly_enabled(monke
     ctx = _build_request_context(payload)
     assert ctx.user_id == "dev_user@example.com"
     assert ctx.credentials is None
+
+
+def _make_valid_ctx(enc_key: str) -> str:
+    from cryptography.fernet import Fernet
+    import json
+    f = Fernet(enc_key.encode())
+    return f.encrypt(json.dumps({"sid": "sid_123", "csrf_token": "csrf_123"}).encode()).decode()
+
+
+def test_scope_absent_sets_read_only_false(monkeypatch):
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", key)
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "ctx": _make_valid_ctx(key),
+    }
+    ctx = _build_request_context(payload)
+    assert ctx.read_only is False
+
+
+def test_scope_read_sets_read_only_true(monkeypatch):
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", key)
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "scope": "read",
+        "ctx": _make_valid_ctx(key),
+    }
+    ctx = _build_request_context(payload)
+    assert ctx.read_only is True
+
+
+@pytest.mark.parametrize("invalid_scope", ["banana", ["read"], None, 123, {"scope": "read"}])
+def test_scope_invalid_values_and_types_fail_closed_to_read_only_true(monkeypatch, invalid_scope):
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", key)
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "scope": invalid_scope,
+        "ctx": _make_valid_ctx(key),
+    }
+    ctx = _build_request_context(payload)
+    assert ctx.read_only is True
+
+
+def test_tools_api_blocks_read_only_token_with_403(client, monkeypatch):
+    from cryptography.fernet import Fernet
+    import jwt
+    from unittest.mock import patch
+
+    secret = os.getenv("JWT_SECRET", "test_jwt_secret_key_32_bytes_long!!")
+    monkeypatch.setenv("JWT_SECRET", secret)
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", key)
+
+    payload = {
+        "sub": "admin@example.com",
+        "roles": ["System Manager"],
+        "scope": "read",
+        "ctx": _make_valid_ctx(key),
+    }
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Allowed read operation (POST /api/tools/list) still proceeds
+    with patch("main.get_list", return_value={"status": "success", "data": []}):
+        resp_list = client.post("/api/tools/list", json={"doctype_name": "Customer"}, headers=headers)
+        assert resp_list.status_code == 200
+
+    # 2. Mutating endpoints are blocked with 403
+    resp_add = client.post("/api/tools/add", json={"doctype_name": "Customer", "parameters": {}}, headers=headers)
+    assert resp_add.status_code == 403
+    assert "this session is read-only" in resp_add.json()["detail"]
+
+    resp_update = client.put("/api/tools/update", json={"doctype_name": "Customer", "id": "1", "parameters": {}}, headers=headers)
+    assert resp_update.status_code == 403
+    assert "this session is read-only" in resp_update.json()["detail"]
+
+    resp_del = client.request("DELETE", "/api/tools/delete", json={"doctype_name": "Customer", "id": "1"}, headers=headers)
+    assert resp_del.status_code == 403
+    assert "this session is read-only" in resp_del.json()["detail"]

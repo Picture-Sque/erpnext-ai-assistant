@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, FrozenInstanceError
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Sequence, Tuple
 
+from mcp_erpnext.errors import ERPNextError
+
 if TYPE_CHECKING:
     from mcp_erpnext.client import Credentials
 
@@ -95,3 +97,21 @@ def set_request_context(ctx: Optional[RequestContext]):
         yield ctx
     finally:
         current_request_context.reset(token)
+
+
+class ReadOnlySessionError(ERPNextError):
+    """Raised when a write or mutating operation is attempted in a read-only session."""
+
+    def __init__(self, message: str = "Operation not permitted: this session is read-only."):
+        super().__init__(message)
+
+
+def require_writable(context: Optional[RequestContext] = None) -> None:
+    """
+    Ensure the current or provided RequestContext is permitted to perform mutating operations.
+    Fails closed: raises ReadOnlySessionError if context exists and read_only is anything other than exactly False.
+    """
+    ctx = context if context is not None else get_request_context()
+    if ctx is not None and ctx.read_only is not False:
+        raise ReadOnlySessionError()
+

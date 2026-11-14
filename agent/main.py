@@ -334,11 +334,18 @@ def _build_request_context(payload: dict) -> RequestContext:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if "scope" not in payload:
+        read_only = False
+    elif payload.get("scope") == "read":
+        read_only = True
+    else:
+        read_only = True
+
     return RequestContext(
         user_id=user_sub,
         roles=roles,
         credentials=user_credentials,
-        read_only=False,
+        read_only=read_only,
         request_id=req_id,
     )
 
@@ -542,21 +549,39 @@ async def list_doctype_endpoint(request: GenericToolRequest, payload: dict = Dep
 
 @app.post("/api/tools/add")
 async def add_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
-    with set_request_context(_build_request_context(payload)):
+    ctx = _build_request_context(payload)
+    if ctx.read_only:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operation not permitted: this session is read-only.",
+        )
+    with set_request_context(ctx):
         return create_document(request.doctype_name, request.parameters or {})
 
 @app.put("/api/tools/update")
 async def update_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
     if not request.id:
         raise HTTPException(status_code=400, detail="Missing record 'id' for update")
-    with set_request_context(_build_request_context(payload)):
+    ctx = _build_request_context(payload)
+    if ctx.read_only:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operation not permitted: this session is read-only.",
+        )
+    with set_request_context(ctx):
         return update_document(request.doctype_name, request.id, request.parameters or {})
 
 @app.delete("/api/tools/delete")
 async def delete_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
     if not request.id:
         raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
-    with set_request_context(_build_request_context(payload)):
+    ctx = _build_request_context(payload)
+    if ctx.read_only:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operation not permitted: this session is read-only.",
+        )
+    with set_request_context(ctx):
         return delete_document(request.doctype_name, request.id)
 
 if __name__ == "__main__":

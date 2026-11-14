@@ -1,11 +1,29 @@
 import os
 import logging
 import httpx
-from typing import Optional, Dict, Any
+import urllib.parse
+from typing import Optional, Dict, Any, Set
 from mcp_erpnext.errors import ERPNextConfigError, ERPNextTransportError
-from mcp_erpnext.auth import get_request_context
+from mcp_erpnext.auth import get_request_context, ReadOnlySessionError
 
 logger = logging.getLogger("mcp_erpnext")
+
+READ_ONLY_POST_ALLOWLIST: Set[str] = set()
+
+
+def _normalize_request_path(path: str) -> str:
+    """
+    Normalizes request path and verifies there are no traversal, double-slashes,
+    or percent-encoded traversal characters.
+    """
+    lower_path = path.lower()
+    if "//" in path or ".." in path or "%2f" in lower_path or "%2e" in lower_path:
+        raise ReadOnlySessionError("Operation not permitted: invalid path format in read-only session.")
+    parsed = urllib.parse.urlparse(path)
+    clean_path = parsed.path.rstrip("/")
+    if not clean_path and path.startswith("/"):
+        clean_path = "/"
+    return clean_path
 
 
 class Credentials:
@@ -86,6 +104,49 @@ class ERPNextClient:
             return ctx.credentials
         return get_env_credentials()
 
+    def _send(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Any] = None,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: float = 60.0,
+    ) -> httpx.Response:
+        ctx = get_request_context()
+        method_upper = method.upper()
+
+        if ctx is not None and ctx.read_only is not False:
+            if method_upper == "GET":
+                pass
+            elif method_upper == "POST":
+                normalized = _normalize_request_path(path)
+                if normalized not in READ_ONLY_POST_ALLOWLIST:
+                    raise ReadOnlySessionError()
+            else:
+                raise ReadOnlySessionError()
+
+        creds = self.get_credentials()
+        url = f"{creds.base_url}/{path.lstrip('/')}"
+        req_headers = headers if headers is not None else creds.get_headers()
+        try:
+            with httpx.Client() as client:
+                if method_upper == "GET":
+                    if params is not None:
+                        return client.get(url, headers=req_headers, params=params, timeout=timeout)
+                    return client.get(url, headers=req_headers, timeout=timeout)
+                elif method_upper == "POST":
+                    return client.post(url, headers=req_headers, json=json, timeout=timeout)
+                elif method_upper == "PUT":
+                    return client.put(url, headers=req_headers, json=json, timeout=timeout)
+                elif method_upper == "DELETE":
+                    return client.delete(url, headers=req_headers, timeout=timeout)
+                else:
+                    return client.request(method_upper, url, headers=req_headers, params=params, json=json, timeout=timeout)
+        except httpx.HTTPError as e:
+            logger.warning(f"HTTP transport error during {method_upper} {url}: {e}")
+            raise ERPNextTransportError(str(e)) from e
+
     def get(
         self,
         path: str,
@@ -93,17 +154,7 @@ class ERPNextClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: float = 60.0,
     ) -> httpx.Response:
-        creds = self.get_credentials()
-        url = f"{creds.base_url}/{path.lstrip('/')}"
-        req_headers = headers if headers is not None else creds.get_headers()
-        try:
-            with httpx.Client() as client:
-                if params is not None:
-                    return client.get(url, headers=req_headers, params=params, timeout=timeout)
-                return client.get(url, headers=req_headers, timeout=timeout)
-        except httpx.HTTPError as e:
-            logger.warning(f"HTTP transport error during GET {url}: {e}")
-            raise ERPNextTransportError(str(e)) from e
+        return self._send("GET", path, params=params, headers=headers, timeout=timeout)
 
     def post(
         self,
@@ -112,15 +163,7 @@ class ERPNextClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: float = 60.0,
     ) -> httpx.Response:
-        creds = self.get_credentials()
-        url = f"{creds.base_url}/{path.lstrip('/')}"
-        req_headers = headers if headers is not None else creds.get_headers()
-        try:
-            with httpx.Client() as client:
-                return client.post(url, headers=req_headers, json=json, timeout=timeout)
-        except httpx.HTTPError as e:
-            logger.warning(f"HTTP transport error during POST {url}: {e}")
-            raise ERPNextTransportError(str(e)) from e
+        return self._send("POST", path, json=json, headers=headers, timeout=timeout)
 
     def put(
         self,
@@ -129,15 +172,7 @@ class ERPNextClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: float = 60.0,
     ) -> httpx.Response:
-        creds = self.get_credentials()
-        url = f"{creds.base_url}/{path.lstrip('/')}"
-        req_headers = headers if headers is not None else creds.get_headers()
-        try:
-            with httpx.Client() as client:
-                return client.put(url, headers=req_headers, json=json, timeout=timeout)
-        except httpx.HTTPError as e:
-            logger.warning(f"HTTP transport error during PUT {url}: {e}")
-            raise ERPNextTransportError(str(e)) from e
+        return self._send("PUT", path, json=json, headers=headers, timeout=timeout)
 
     def delete(
         self,
@@ -145,12 +180,4 @@ class ERPNextClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: float = 60.0,
     ) -> httpx.Response:
-        creds = self.get_credentials()
-        url = f"{creds.base_url}/{path.lstrip('/')}"
-        req_headers = headers if headers is not None else creds.get_headers()
-        try:
-            with httpx.Client() as client:
-                return client.delete(url, headers=req_headers, timeout=timeout)
-        except httpx.HTTPError as e:
-            logger.warning(f"HTTP transport error during DELETE {url}: {e}")
-            raise ERPNextTransportError(str(e)) from e
+        return self._send("DELETE", path, headers=headers, timeout=timeout)
