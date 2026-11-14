@@ -157,16 +157,13 @@ class ERPNextClient:
                 else:
                     resp = client.request(method_upper, url, headers=req_headers, params=params, json=json, timeout=timeout)
 
-                is_synthetic_test = bool(req_headers and "sid=test_conftest_sid" in req_headers.get("Cookie", ""))
                 if resp.status_code == 401:
-                    if not is_synthetic_test:
-                        mark_session_expired()
+                    mark_session_expired()
                 elif resp.status_code == 403:
                     try:
                         body_json = resp.json()
                         if isinstance(body_json, dict) and body_json.get("session_expired") == 1:
-                            if not is_synthetic_test:
-                                mark_session_expired()
+                            mark_session_expired()
                     except Exception:
                         pass
 

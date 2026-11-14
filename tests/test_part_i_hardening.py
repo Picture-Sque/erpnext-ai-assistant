@@ -74,10 +74,12 @@ def test_no_context_strict_identity_false_falls_back_to_env(monkeypatch):
 
 
 def test_session_expired_sets_flag_and_chat_returns_401(monkeypatch):
-    """ERPNext returning session_expired or 401 sets the flag and causes /chat to return 401."""
+    """ERPNext returning HTTP 403 {"session_expired": 1} naturally sets the flag and causes /chat to return 401."""
     import jwt
+    import httpx
     from cryptography.fernet import Fernet
     import json
+    from unittest.mock import patch
 
     jwt_secret = "test_jwt_secret_32bytes_long_exact!"
     enc_key = Fernet.generate_key().decode()
@@ -96,19 +98,51 @@ def test_session_expired_sets_flag_and_chat_returns_401(monkeypatch):
     client = TestClient(app)
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Simulate compiled_graph.invoke encountering session_expired in ERPNextClient
-    with patch("agent.main.compiled_graph.invoke") as mock_invoke:
-        def side_effect(*args, **kwargs):
-            # Simulate ERPNextClient getting a 403 with session_expired: 1
-            mark_session_expired()
-            return {"final_response": "Graph finished", "detected_intent": "greeting"}
+    fake_403_resp = httpx.Response(
+        403,
+        json={"session_expired": 1, "message": "Session Expired"},
+        request=httpx.Request("GET", "http://localhost:8080/api/resource/Customer"),
+    )
 
-        mock_invoke.side_effect = side_effect
-        resp = client.post("/chat", json={"message": "hello"}, headers=headers)
-        assert resp.status_code == 401
-        assert "WWW-Authenticate" in resp.headers
-        assert resp.headers["WWW-Authenticate"] == "Bearer"
-        assert "expired" in resp.json()["detail"].lower()
+    def fake_send(self, request, *args, **kwargs):
+        return fake_403_resp
+
+    def graph_step_making_erp_call(*args, **kwargs):
+        erp_client = ERPNextClient()
+        resp = erp_client.get("/api/resource/Customer")
+        return {"final_response": "Graph finished", "detected_intent": "customer-lookup"}
+
+    with patch.object(httpx.Client, "send", fake_send):
+        with patch("agent.main.compiled_graph.invoke", side_effect=graph_step_making_erp_call):
+            resp = client.post("/chat", json={"message": "lookup customer"}, headers=headers)
+            assert resp.status_code == 401
+            assert "WWW-Authenticate" in resp.headers
+            assert resp.headers["WWW-Authenticate"] == "Bearer"
+            assert "expired" in resp.json()["detail"].lower()
+
+
+def test_session_expired_flag_survives_thread_hop_and_is_isolated_between_requests():
+    """Prove flag is visible across a thread hop and a second request does not inherit it."""
+    import asyncio
+
+    ctx1 = RequestContext(user_id="user1@example.com")
+    with set_request_context(ctx1):
+        assert is_session_expired() is False
+
+        def worker_task():
+            assert is_session_expired() is False
+            mark_session_expired()
+            assert is_session_expired() is True
+
+        asyncio.run(asyncio.to_thread(worker_task))
+
+        # Flag must be visible in parent context across thread hop
+        assert is_session_expired() is True
+
+    # Second request must NOT inherit the flag
+    ctx2 = RequestContext(user_id="user2@example.com")
+    with set_request_context(ctx2):
+        assert is_session_expired() is False
 
 
 def test_two_different_session_credentials_never_share_defaults_cache():

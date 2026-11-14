@@ -37,4 +37,14 @@ def setup_auth_environment(monkeypatch):
         return orig_encode(payload, *args, **kwargs)
 
     monkeypatch.setattr(jwt, "encode", wrapped_encode)
+
+    # Unit tests in agent/tests should not make unmocked live network calls to ERPNext
+    from mcp_erpnext.client import ERPNextClient
+    from mcp_erpnext.errors import ERPNextTransportError
+
+    def no_live_calls(self, *args, **kwargs):
+        raise ERPNextTransportError("Live ERPNext transport calls are disabled in agent/tests suite")
+
+    monkeypatch.setattr(ERPNextClient, "_send", no_live_calls)
+
     yield

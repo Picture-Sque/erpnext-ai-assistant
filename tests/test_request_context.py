@@ -10,6 +10,7 @@ from mcp_erpnext.auth import (
     current_request_context,
 )
 from mcp_erpnext.client import Credentials, ERPNextClient
+from mcp_erpnext.errors import ERPNextConfigError
 
 
 def test_default_context_is_none():
@@ -230,7 +231,20 @@ def test_client_credentials_fallback_when_context_credentials_none(monkeypatch):
     monkeypatch.setenv("ERPNEXT_API_KEY", "env_key")
     monkeypatch.setenv("ERPNEXT_API_SECRET", "env_secret")
 
-    ctx = RequestContext(user_id="user@example.com", credentials=None)
+    ctx = RequestContext(user_id="user@example.com", credentials=None, dev_mock=False)
+    with set_request_context(ctx):
+        client = ERPNextClient()
+        with pytest.raises(ERPNextConfigError) as exc_info:
+            client.get_credentials()
+        assert "No per-user credentials available in request context" in str(exc_info.value)
+
+
+def test_client_credentials_fallback_when_context_credentials_none_and_dev_mock_true(monkeypatch):
+    monkeypatch.setenv("ERPNEXT_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("ERPNEXT_API_KEY", "env_key")
+    monkeypatch.setenv("ERPNEXT_API_SECRET", "env_secret")
+
+    ctx = RequestContext(user_id="user@example.com", credentials=None, dev_mock=True)
     with set_request_context(ctx):
         client = ERPNextClient()
         creds = client.get_credentials()
