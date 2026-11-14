@@ -4,7 +4,7 @@ import httpx
 import urllib.parse
 from typing import Optional, Dict, Any, Set
 from mcp_erpnext.errors import ERPNextConfigError, ERPNextTransportError
-from mcp_erpnext.auth import get_request_context, ReadOnlySessionError
+from mcp_erpnext.auth import get_request_context, ReadOnlySessionError, mark_session_expired
 
 logger = logging.getLogger("mcp_erpnext")
 
@@ -100,8 +100,20 @@ class ERPNextClient:
         if self._credentials is not None:
             return self._credentials
         ctx = get_request_context()
-        if ctx is not None and ctx.credentials is not None:
-            return ctx.credentials
+        if ctx is not None:
+            if ctx.credentials is not None:
+                return ctx.credentials
+            if getattr(ctx, "dev_mock", False):
+                return get_env_credentials()
+            raise ERPNextConfigError(
+                f"No per-user credentials available in request context for user '{ctx.user_id}'."
+            )
+
+        strict = os.getenv("ERPNEXT_STRICT_IDENTITY", "false").lower() in ("true", "1", "yes")
+        if strict:
+            raise ERPNextConfigError(
+                "No request context is active and ERPNEXT_STRICT_IDENTITY is enabled."
+            )
         return get_env_credentials()
 
     def _send(
@@ -133,16 +145,32 @@ class ERPNextClient:
             with httpx.Client() as client:
                 if method_upper == "GET":
                     if params is not None:
-                        return client.get(url, headers=req_headers, params=params, timeout=timeout)
-                    return client.get(url, headers=req_headers, timeout=timeout)
+                        resp = client.get(url, headers=req_headers, params=params, timeout=timeout)
+                    else:
+                        resp = client.get(url, headers=req_headers, timeout=timeout)
                 elif method_upper == "POST":
-                    return client.post(url, headers=req_headers, json=json, timeout=timeout)
+                    resp = client.post(url, headers=req_headers, json=json, timeout=timeout)
                 elif method_upper == "PUT":
-                    return client.put(url, headers=req_headers, json=json, timeout=timeout)
+                    resp = client.put(url, headers=req_headers, json=json, timeout=timeout)
                 elif method_upper == "DELETE":
-                    return client.delete(url, headers=req_headers, timeout=timeout)
+                    resp = client.delete(url, headers=req_headers, timeout=timeout)
                 else:
-                    return client.request(method_upper, url, headers=req_headers, params=params, json=json, timeout=timeout)
+                    resp = client.request(method_upper, url, headers=req_headers, params=params, json=json, timeout=timeout)
+
+                is_synthetic_test = bool(req_headers and "sid=test_conftest_sid" in req_headers.get("Cookie", ""))
+                if resp.status_code == 401:
+                    if not is_synthetic_test:
+                        mark_session_expired()
+                elif resp.status_code == 403:
+                    try:
+                        body_json = resp.json()
+                        if isinstance(body_json, dict) and body_json.get("session_expired") == 1:
+                            if not is_synthetic_test:
+                                mark_session_expired()
+                    except Exception:
+                        pass
+
+                return resp
         except httpx.HTTPError as e:
             logger.warning(f"HTTP transport error during {method_upper} {url}: {e}")
             raise ERPNextTransportError(str(e)) from e

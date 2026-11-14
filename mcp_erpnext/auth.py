@@ -27,6 +27,7 @@ class RequestContext:
     correlation_id: Optional[str] = None
     read_only: bool = True
     request_id: Optional[str] = None
+    dev_mock: bool = False
 
     def __init__(
         self,
@@ -39,6 +40,7 @@ class RequestContext:
         read_only: Any = True,
         request_id: Optional[str] = None,
         credential: Optional[Any] = None,
+        dev_mock: bool = False,
     ) -> None:
         if credential is not None and credentials is None:
             credentials = credential
@@ -56,6 +58,7 @@ class RequestContext:
         object.__setattr__(self, "is_admin", bool(is_admin))
         object.__setattr__(self, "is_guest", bool(is_guest))
         object.__setattr__(self, "credentials", credentials)
+        object.__setattr__(self, "dev_mock", bool(dev_mock))
 
         req_id = request_id if request_id is not None else correlation_id
         corr_id = correlation_id if correlation_id is not None else request_id
@@ -77,6 +80,35 @@ current_request_context: contextvars.ContextVar[Optional[RequestContext]] = (
     contextvars.ContextVar("current_request_context", default=None)
 )
 
+_session_expired: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "session_expired", default=False
+)
+_expired_request_contexts: set = set()
+
+
+def mark_session_expired() -> None:
+    """Flag the current request context as having encountered an expired ERPNext session."""
+    _session_expired.set(True)
+    ctx = get_request_context()
+    if ctx is not None:
+        _expired_request_contexts.add(id(ctx))
+
+
+def is_session_expired() -> bool:
+    """Check whether the active request has flagged an expired ERPNext session."""
+    ctx = get_request_context()
+    if ctx is not None and id(ctx) in _expired_request_contexts:
+        return True
+    return _session_expired.get()
+
+
+def reset_session_expired() -> None:
+    """Reset the session expired flag for the current context."""
+    _session_expired.set(False)
+    ctx = get_request_context()
+    if ctx is not None:
+        _expired_request_contexts.discard(id(ctx))
+
 
 def get_request_context() -> Optional[RequestContext]:
     """Retrieve the active RequestContext, or None if outside a request scope."""
@@ -93,10 +125,14 @@ def set_request_context(ctx: Optional[RequestContext]):
     Guarantees token reset in a finally block even on unhandled exceptions.
     """
     token = current_request_context.set(ctx)
+    expired_token = _session_expired.set(False)
     try:
         yield ctx
     finally:
         current_request_context.reset(token)
+        _session_expired.reset(expired_token)
+        if ctx is not None:
+            _expired_request_contexts.discard(id(ctx))
 
 
 class ReadOnlySessionError(ERPNextError):

@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage
 
-from mcp_erpnext.auth import RequestContext, set_request_context, get_request_context
+from mcp_erpnext.auth import RequestContext, set_request_context, get_request_context, is_session_expired
 from mcp_erpnext.client import Credentials
 
 # Ensure environment variables are loaded
@@ -50,6 +50,27 @@ app = FastAPI(
 def on_startup():
     chat_store.init_db()
     resolve_backend()
+    if os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1"):
+        base_url = os.getenv("ERPNEXT_BASE_URL") or os.getenv("ERPNEXT_URL") or "http://localhost:8080"
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in ("localhost", "127.0.0.1", "::1"):
+            logger.error(
+                "====================================================================\n"
+                "SECURITY WARNING: ALLOW_DEV_MOCK_AUTH is set to true, but \n"
+                f"ERPNEXT_BASE_URL host '{hostname}' is not localhost/127.0.0.1.\n"
+                "REFUSING TO ENABLE DEV MOCK AUTH. All unauthenticated requests will be rejected.\n"
+                "===================================================================="
+            )
+        else:
+            logger.warning(
+                "====================================================================\n"
+                "SECURITY WARNING: ALLOW_DEV_MOCK_AUTH is ENABLED.\n"
+                "Unauthenticated requests will run as dev_user@example.com.\n"
+                "NEVER ENABLE THIS IN PRODUCTION ENVIRONMENTS!\n"
+                "===================================================================="
+            )
 
 @app.on_event("shutdown")
 def on_shutdown():
@@ -127,6 +148,23 @@ def get_candidate_secrets() -> List[str]:
 
     return secrets
 
+def is_dev_mock_allowed() -> bool:
+    allow_dev_auth = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1")
+    if not allow_dev_auth:
+        return False
+    base_url = os.getenv("ERPNEXT_BASE_URL") or os.getenv("ERPNEXT_URL") or "http://localhost:8080"
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in ("localhost", "127.0.0.1", "::1"):
+        logger.error(
+            f"REFUSING DEV MOCK AUTH: ALLOW_DEV_MOCK_AUTH is true but ERPNEXT_BASE_URL host "
+            f"'{hostname}' is not localhost/127.0.0.1. Dev mock auth is DISABLED."
+        )
+        return False
+    return True
+
+
 async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
     """
     FastAPI dependency that extracts and validates the Authorization: Bearer <token>
@@ -141,8 +179,7 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
         )
 
     if not authorization:
-        allow_dev_auth = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1")
-        if allow_dev_auth:
+        if is_dev_mock_allowed():
             logger.info("No Authorization header found; using ALLOW_DEV_MOCK_AUTH fallback.")
             return {
                 "sub": "dev_user@example.com",
@@ -276,6 +313,7 @@ def _build_request_context(payload: dict) -> RequestContext:
             credentials=None,
             read_only=False,
             request_id=req_id,
+            dev_mock=True,
         )
 
     enc_key = os.getenv("CREDENTIAL_ENC_KEY")
@@ -347,6 +385,7 @@ def _build_request_context(payload: dict) -> RequestContext:
         credentials=user_credentials,
         read_only=read_only,
         request_id=req_id,
+        dev_mock=False,
     )
 
 
@@ -386,10 +425,25 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
             # Run state machine iteration
             updated_state = compiled_graph.invoke(session_state, config={"recursion_limit": GRAPH_RECURSION_LIMIT})
         except Exception as e:
+            if is_session_expired():
+                logger.warning(f"ERPNext session expired during graph execution for user '{user_sub}'")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session has expired. Please refresh your session or log in again.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
             logger.exception("Error executing conversation graph")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Error executing conversation graph: {str(e)}"
+            )
+
+        if is_session_expired():
+            logger.warning(f"ERPNext session expired during turn for user '{user_sub}'")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has expired. Please refresh your session or log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
             )
 
         final_resp = updated_state.get("final_response", "")
