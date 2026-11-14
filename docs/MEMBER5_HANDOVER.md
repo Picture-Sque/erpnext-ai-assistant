@@ -2,13 +2,13 @@
 
 Last updated: 14 Nov 2026. Branch: `member5-stage2b` (local only, no push).
 Base: `origin/mcp-integration @ 48ca6a9`.
-Status: Parts A through L and Stage 1 cleanup are COMPLETE. Part L (MCP server per-user identity) is IMPLEMENTED and VERIFIED.
+Status: Parts A through L, Stage 1 hardening cleanup, and Part L live proofs are COMPLETE and VERIFIED.
 
 ---
 
 ### Commits on `member5-stage2b` (Oldest First, Rebased on `origin/mcp-integration` @ `48ca6a9`)
 
-All 14 commits applied cleanly during the Stage 0 rebase:
+All 16 commits on this branch:
 
 - `aa150be` feat(mcp-erpnext): add RequestContext and contextvar management for user identity (Part A)
 - `aedecb3` feat(mcp-erpnext): integrate RequestContext credentials into ERPNextClient with fallback (Part B)
@@ -24,6 +24,8 @@ All 14 commits applied cleanly during the Stage 0 rebase:
 - `1bf67fb` feat(auth): enforce read-only scope claim with transport backstop (Part H)
 - `a313900` feat(auth): harden identity resolution, dev-mock guard, and session expiration (Part I+J)
 - `35fd917` fix(auth): clean up test cookies, context flag thread-safety, and test coverage (Part I cleanup)
+- `a9c66b5` docs: add Member 5 handover and test suite baseline documentation (Part K)
+- `d9bd490` feat(mcp): propagate per-user session credentials and enforce read-only HTTP transport (Part L)
 
 ---
 
@@ -108,16 +110,21 @@ Fields of `RequestContext` (`@dataclass(frozen=True)` in `mcp_erpnext/auth.py:26
 | Per-user document ownership (`owner`, `modified_by`) matches the caller | Part J live check with real ERPNext: created Sales Orders audited in database (`owner='Administrator'` vs `owner='sandra@gmail.com'`). | VERIFIED |
 | Permission isolation across users | Part J live check: Administrator allowed GET `/api/resource/Sales Invoice` (200 OK); Sandra forbidden (403 Forbidden). **Note: this was a direct ERPNext REST API check, NOT via `/chat`.** | VERIFIED |
 | `/chat` behavior for Administrator vs Sandra | Part J live check: Customer lookup (read) and Sales Order creation (write) succeeded for both users, creating documents with caller's `owner`/`modified_by`. The cancel request returned a draft rejection ("Sales Order is in Draft status — only Submitted documents can be cancelled") for **both** users, proving business precondition handling rather than a permission divergence. | VERIFIED |
-| Read-only tokens block write verbs | Unit test `test_read_only_post_not_in_allowlist_raises_read_only_session_error` and `test_read_only_blocks_put_and_delete` in `tests/test_part_h_readonly.py`. | VERIFIED |
-| Read-only allowlist permits RPC reads | Unit test `test_read_only_allows_get_and_allowlisted_post_endpoints` in `tests/test_part_h_readonly.py`. | VERIFIED |
+| Read-only tokens block write verbs | Unit tests `test_readonly_transport_blocks_writes_before_httpx_is_called` and `test_require_writable_behavior` in `tests/test_read_only_transport.py`. | VERIFIED |
+| Read-only allowlist permits RPC reads | Unit test `test_readonly_transport_allows_allowlisted_post_and_denies_traversals` in `tests/test_read_only_transport.py:71`. | VERIFIED |
 | Missing user credentials in context fails closed | Unit test `test_ctx_with_credentials_none_and_not_dev_mock_never_reaches_env` in `tests/test_part_i_hardening.py`. | VERIFIED |
 | Session expiration triggers HTTP 401 with `WWW-Authenticate: Bearer` | Unit test `test_session_expired_sets_flag_and_chat_returns_401` in `tests/test_part_i_hardening.py` and Part J live session logout check. | VERIFIED |
 | Session expired flag survives thread hops without memory address collisions | Unit test `test_session_expired_flag_survives_thread_hop_and_is_isolated_between_requests` in `tests/test_part_i_hardening.py`. | VERIFIED |
 | Resolver cache isolation between sessions | Unit test `test_two_different_session_credentials_never_share_defaults_cache` in `tests/test_part_i_hardening.py`. | VERIFIED |
 | Dev-mock refusal on non-localhost hosts | Unit test `test_dev_mock_refusal_on_non_local_base_url` in `tests/test_part_i_hardening.py`. | VERIFIED |
-| MCP HTTP middleware decrypts credentials and binds per-user identity | Unit test `test_middleware_extracts_session_credentials_into_request_context` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
-| MCP read-only scope blocks write tools via policy | Unit test `test_mcp_dispatch_blocks_write_tools_for_read_only_context` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
-| Backend parity (direct vs MCP) preserves caller session | Unit test `test_both_backends_parity_identity_preservation` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| Unified JWT verification and fail-closed base URL | Unit tests `test_verify_jwt_unified_helper` and `test_base_url_fails_closed_when_unset` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| MCP HTTP transport forces read-only and denies all 5 write tools | Unit test `test_http_forces_read_only_and_denies_write_tools_for_all_external_tokens` and Step 2 live MCP server check on port 8009. | VERIFIED |
+| MCP HTTP rejects unauthenticated/invalid/expired before tool execution | Unit test `test_http_rejects_unauthenticated_requests_before_tool_runs` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| Multi-user concurrency preserves identity without leakage | Unit test `test_concurrent_requests_with_different_users_do_not_leak_identity` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| InMemoryMCPClient enforces active context under strict identity | Unit test `test_in_memory_mcp_client_requires_active_context_in_strict_mode` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| STDIO transport is never writable and refuses to start without credentials | Unit test `test_stdio_transport_guards_refuses_writable_and_unconfigured_credentials` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| Backend parity (direct vs MCP) preserves caller session | Unit test `test_direct_backend_and_in_memory_mcp_parity` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| Live instance token minting & read-only write protection (0 mutation) | Step 2 live checks against `http://localhost:8080`: normal token creates/deletes customer; read-only token blocks writes in client backstop and policy; database confirmed 0 mutation (HTTP 404). | VERIFIED |
 | All 384 existing agent tests pass | Verified via `$env:PYTHONPATH="agent;."; $env:ALLOW_DEV_MOCK_AUTH="false"; python -m pytest agent/tests -q`. | VERIFIED |
 
 ---
@@ -199,10 +206,10 @@ The five write functions in `mcp_erpnext/crud.py` are:
 
 ### Test Suite Baseline and .env Investigation
 
-Measured at commit `35fd917`:
-- **`agent/tests`**: **384 passed**, 0 failed.
-- **`tests` (Root Suite)**: **469 passed**, **8 failures at 35fd917 with current local .env (owner assumed: see Part 2 breakdown below)**.
-- New failures introduced by Member 5: **0**.
+Measured at commit `d9bd490` (HEAD):
+- **`agent/tests`**: **384 passed**, 0 failed (12.03s).
+- **`tests` (Root Suite)**: **478 passed**, **8 baseline failures with current local .env (see Part 2 breakdown below)** (6.89s).
+- New failures introduced by Member 5: **0**. All 9 new Part L unit tests in `tests/test_part_l_mcp_identity.py` pass.
 
 #### Part 2 Breakdown: .env Dependence of the 8 Baseline Failures
 
