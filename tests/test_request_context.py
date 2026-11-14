@@ -88,18 +88,32 @@ def test_both_construction_styles_work():
     assert ctx_b.credentials == "token_b"
 
 
-def test_credential_alias_round_trip():
+def test_credential_alias_read_only_and_immutability():
+    from dataclasses import replace
+
     ctx = RequestContext(user_id="carol", credential="token_init")
     assert ctx.credential == "token_init"
     assert ctx.credentials == "token_init"
 
-    ctx.credential = "token_updated"
-    assert ctx.credential == "token_updated"
-    assert ctx.credentials == "token_updated"
+    # All attributes raise FrozenInstanceError on assignment
+    for attr in ("credentials", "credential", "roles", "user_id", "read_only", "request_id"):
+        with pytest.raises(FrozenInstanceError):
+            setattr(ctx, attr, "attempted_mutation")
 
-    ctx.credentials = "token_final"
-    assert ctx.credential == "token_final"
-    assert ctx.credentials == "token_final"
+    # dataclasses.replace works properly
+    ctx_replaced = replace(ctx, user_id="david")
+    assert ctx_replaced.user_id == "david"
+    assert ctx_replaced.credential == "token_init"
+    assert ctx_replaced.credentials == "token_init"
+
+
+def test_roles_strictness_fail_closed():
+    # Pinning fail-closed behavior for invalid/mixed roles
+    ctx_mixed_number = RequestContext(roles=["Sales User", 5])
+    assert ctx_mixed_number.roles == ()
+
+    ctx_empty_string = RequestContext(roles=["Sales User", ""])
+    assert ctx_empty_string.roles == ()
 
 
 def test_correlation_and_request_id_sync():

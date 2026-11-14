@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from mcp_erpnext.client import Credentials
 
 
-@dataclass
+@dataclass(frozen=True)
 class RequestContext:
     """
     Canonical request context carrying caller identity and execution constraints.
@@ -65,25 +65,10 @@ class RequestContext:
         else:
             object.__setattr__(self, "read_only", read_only)
 
-        object.__setattr__(self, "_initialized", True)
-
     @property
     def credential(self) -> Optional[Any]:
-        """Backward-compatibility read/write alias for credentials."""
+        """Backward-compatibility read-only alias for credentials."""
         return self.credentials
-
-    @credential.setter
-    def credential(self, value: Any) -> None:
-        object.__setattr__(self, "credentials", value)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if not getattr(self, "_initialized", False):
-            super().__setattr__(name, value)
-            return
-        if name in ("credential", "credentials"):
-            object.__setattr__(self, "credentials", value)
-            return
-        raise FrozenInstanceError(f"cannot assign to field {name!r}")
 
 
 current_request_context: contextvars.ContextVar[Optional[RequestContext]] = (
