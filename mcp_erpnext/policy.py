@@ -8,6 +8,7 @@ It has zero upward dependencies on agent, tools, workflow, ai_assistant, main, o
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Optional, Tuple
 
+from mcp_erpnext.auth import RequestContext
 from mcp_erpnext.crud import (
     IDENTIFIER_PATTERN,
     ORDER_BY_PATTERN,
@@ -67,38 +68,8 @@ def denied_envelope(decision: PolicyDecision) -> Dict[str, Any]:
     }
 
 
-@dataclass(frozen=True)
-class RequestContext:
-    """
-    Context representing caller identity and execution mode.
-
-    Attributes:
-        user_id: Caller's identity identifier.
-        roles: Immutable tuple of validated non-empty string role names.
-        credential: Sensitive authentication token or secret (excluded from string representations).
-        read_only: Whether operations are restricted to read-only tools (defaults to True).
-        request_id: Tracing/correlation identifier.
-    """
-
-    user_id: Optional[str] = None
-    roles: Tuple[str, ...] = ()
-    credential: Optional[Any] = field(default=None, repr=False)
-    read_only: bool = True
-    request_id: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        raw_roles = self.roles
-        if isinstance(raw_roles, (list, tuple, set, frozenset)):
-            if all(isinstance(r, str) and len(r) > 0 for r in raw_roles):
-                object.__setattr__(self, "roles", tuple(raw_roles))
-            else:
-                object.__setattr__(self, "roles", ())
-        else:
-            object.__setattr__(self, "roles", ())
-
-        raw_ro = self.read_only
-        if type(raw_ro) is not bool:
-            object.__setattr__(self, "read_only", True)
+# Canonical RequestContext is imported from mcp_erpnext.auth and re-exported here
+# for backward compatibility with policy callers.
 
 
 READ_TOOLS: FrozenSet[str] = frozenset({

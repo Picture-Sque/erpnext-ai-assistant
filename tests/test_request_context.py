@@ -18,18 +18,31 @@ def test_default_context_is_none():
 
 
 def test_request_context_creation_and_defaults():
-    ctx = RequestContext(user_id="user@example.com")
-    assert ctx.user_id == "user@example.com"
+    ctx = RequestContext()
+    assert ctx.user_id is None
     assert ctx.roles == ()
     assert ctx.credentials is None
+    assert ctx.credential is None
+    assert ctx.is_admin is False
+    assert ctx.is_guest is False
     assert ctx.read_only is True
     assert ctx.request_id is None
+    assert ctx.correlation_id is None
+
+    ctx_user = RequestContext(user_id="user@example.com")
+    assert ctx_user.user_id == "user@example.com"
+    assert ctx_user.roles == ()
+    assert ctx_user.credentials is None
 
 
 def test_request_context_roles_normalization():
-    ctx = RequestContext(user_id="user@example.com", roles=["System Manager", 123])
-    assert ctx.roles == ("System Manager", "123")
+    ctx = RequestContext(user_id="user@example.com", roles=["System Manager", "Desk User"])
+    assert ctx.roles == ("System Manager", "Desk User")
     assert isinstance(ctx.roles, tuple)
+
+    # Fail closed on non-string or invalid items
+    ctx_invalid = RequestContext(user_id="user@example.com", roles=["System Manager", 123])
+    assert ctx_invalid.roles == ()
 
 
 def test_request_context_frozen_immutability():
@@ -53,11 +66,55 @@ def test_request_context_repr_never_reveals_credentials():
         request_id="req-123",
     )
     repr_str = repr(ctx)
+    str_str = str(ctx)
     assert "super_secret_key" not in repr_str
     assert "super_secret_secret" not in repr_str
     assert "sensitive_token" not in repr_str
-    assert "credentials='[REDACTED]'" in repr_str
+    assert "super_secret_key" not in str_str
+    assert "super_secret_secret" not in str_str
+    assert "sensitive_token" not in str_str
     assert "user@example.com" in repr_str
+
+
+def test_both_construction_styles_work():
+    # Style A: credential=...
+    ctx_a = RequestContext(user_id="alice", credential="token_a")
+    assert ctx_a.credential == "token_a"
+    assert ctx_a.credentials == "token_a"
+
+    # Style B: credentials=...
+    ctx_b = RequestContext(user_id="bob", credentials="token_b")
+    assert ctx_b.credential == "token_b"
+    assert ctx_b.credentials == "token_b"
+
+
+def test_credential_alias_round_trip():
+    ctx = RequestContext(user_id="carol", credential="token_init")
+    assert ctx.credential == "token_init"
+    assert ctx.credentials == "token_init"
+
+    ctx.credential = "token_updated"
+    assert ctx.credential == "token_updated"
+    assert ctx.credentials == "token_updated"
+
+    ctx.credentials = "token_final"
+    assert ctx.credential == "token_final"
+    assert ctx.credentials == "token_final"
+
+
+def test_correlation_and_request_id_sync():
+    ctx1 = RequestContext(request_id="req-99")
+    assert ctx1.request_id == "req-99"
+    assert ctx1.correlation_id == "req-99"
+
+    ctx2 = RequestContext(correlation_id="corr-101")
+    assert ctx2.request_id == "corr-101"
+    assert ctx2.correlation_id == "corr-101"
+
+
+def test_policy_request_context_is_auth_request_context():
+    from mcp_erpnext import auth, policy
+    assert policy.RequestContext is auth.RequestContext
 
 
 def test_set_request_context_and_reset():
