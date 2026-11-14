@@ -284,8 +284,7 @@ async def chat_endpoint(request: ChatRequest, payload: dict = Depends(verify_tok
     session_id = request.conversation_id or user_sub
     user_id = payload.get("full_name") or user_sub
 
-    req_ctx = _build_request_context(payload)
-    with set_request_context(req_ctx):
+    with set_request_context(_build_request_context(payload)):
         try:
             # A conversation belongs to the user who created it; nobody else may load it,
             # read its history, or answer its pending confirmations.
@@ -343,15 +342,14 @@ async def reset_session(payload: dict = Depends(verify_token)):
     """
     Helper endpoint to clear conversation session memory.
     """
-    with set_request_context(_build_request_context(payload)):
-        session_id = payload.get("sub")
-        if not session_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Token payload missing required 'sub' claim"
-            )
-        chat_store.reset_session_state(session_id)
-        return {"status": "session reset successful"}
+    session_id = payload.get("sub")
+    if not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token payload missing required 'sub' claim"
+        )
+    chat_store.reset_session_state(session_id)
+    return {"status": "session reset successful"}
 
 
 def _require_sub(payload: dict) -> str:
@@ -367,24 +365,22 @@ def _require_sub(payload: dict) -> str:
 @app.get("/conversations")
 async def list_conversations_endpoint(payload: dict = Depends(verify_token)):
     """The caller's past conversations for the chat history sidebar, newest first."""
-    with set_request_context(_build_request_context(payload)):
-        user_sub = _require_sub(payload)
-        try:
-            return {"conversations": chat_store.list_conversations(user_sub)}
-        except chat_store.ChatStoreError as e:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    user_sub = _require_sub(payload)
+    try:
+        return {"conversations": chat_store.list_conversations(user_sub)}
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.get("/conversations/{conversation_id}/messages")
 async def conversation_messages_endpoint(conversation_id: str, payload: dict = Depends(verify_token)):
-    with set_request_context(_build_request_context(payload)):
-        user_sub = _require_sub(payload)
-        try:
-            return {"messages": chat_store.get_conversation_messages(conversation_id, user_sub)}
-        except chat_store.ConversationAccessError:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
-        except chat_store.ChatStoreError as e:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    user_sub = _require_sub(payload)
+    try:
+        return {"messages": chat_store.get_conversation_messages(conversation_id, user_sub)}
+    except chat_store.ConversationAccessError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 class RenameConversationRequest(BaseModel):
@@ -395,34 +391,32 @@ class RenameConversationRequest(BaseModel):
 async def rename_conversation_endpoint(
     conversation_id: str, request: RenameConversationRequest, payload: dict = Depends(verify_token)
 ):
-    with set_request_context(_build_request_context(payload)):
-        user_sub = _require_sub(payload)
-        try:
-            renamed = chat_store.rename_conversation(conversation_id, user_sub, request.title)
-        except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-        except chat_store.ConversationAccessError:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
-        except chat_store.ChatStoreError as e:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-        if not renamed:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-        return {"status": "renamed", "title": " ".join(request.title.split())}
+    user_sub = _require_sub(payload)
+    try:
+        renamed = chat_store.rename_conversation(conversation_id, user_sub, request.title)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except chat_store.ConversationAccessError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    if not renamed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return {"status": "renamed", "title": " ".join(request.title.split())}
 
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str, payload: dict = Depends(verify_token)):
-    with set_request_context(_build_request_context(payload)):
-        user_sub = _require_sub(payload)
-        try:
-            deleted = chat_store.delete_conversation(conversation_id, user_sub)
-        except chat_store.ConversationAccessError:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
-        except chat_store.ChatStoreError as e:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-        if not deleted:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-        return {"status": "deleted"}
+    user_sub = _require_sub(payload)
+    try:
+        deleted = chat_store.delete_conversation(conversation_id, user_sub)
+    except chat_store.ConversationAccessError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    except chat_store.ChatStoreError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return {"status": "deleted"}
 
 
 # Standalone endpoints for Generic CRUD Tools
@@ -452,16 +446,16 @@ async def add_doctype_endpoint(request: GenericToolRequest, payload: dict = Depe
 
 @app.put("/api/tools/update")
 async def update_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+    if not request.id:
+        raise HTTPException(status_code=400, detail="Missing record 'id' for update")
     with set_request_context(_build_request_context(payload)):
-        if not request.id:
-            raise HTTPException(status_code=400, detail="Missing record 'id' for update")
         return update_document(request.doctype_name, request.id, request.parameters or {})
 
 @app.delete("/api/tools/delete")
 async def delete_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+    if not request.id:
+        raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
     with set_request_context(_build_request_context(payload)):
-        if not request.id:
-            raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
         return delete_document(request.doctype_name, request.id)
 
 if __name__ == "__main__":
