@@ -37,6 +37,7 @@ from mcp_erpnext import crud
 from mcp_erpnext import reports
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.errors import ERPNextError
+from mcp_erpnext.auth import current_request_context
 from mcp_erpnext.policy import (
     ALL_TOOLS,
     READ_TOOLS,
@@ -59,10 +60,8 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Request-scoped context variable for identity propagation
-_current_request_context: contextvars.ContextVar[Optional[RequestContext]] = contextvars.ContextVar(
-    "mcp_request_context", default=None
-)
+# Request-scoped context variable for identity propagation (aliased to canonical auth ContextVar)
+_current_request_context: contextvars.ContextVar[Optional[RequestContext]] = current_request_context
 
 # Tool metadata and descriptions
 TOOL_METADATA: Dict[str, Dict[str, str]] = {
@@ -381,9 +380,12 @@ def create_server(
         tool_name = params.name
         arguments = params.arguments or {}
 
-        ctx = _current_request_context.get() or default_context or get_default_context()
-
-        result = await asyncio.to_thread(dispatch_tool, tool_name, arguments, ctx, client)
+        ctx = current_request_context.get() or default_context or get_default_context()
+        token = current_request_context.set(ctx)
+        try:
+            result = await asyncio.to_thread(dispatch_tool, tool_name, arguments, ctx, client)
+        finally:
+            current_request_context.reset(token)
 
         is_error = result.get("status") == "error"
         return types.CallToolResult(
@@ -498,11 +500,11 @@ class BearerAuthMiddleware:
         read_only = claims.get("read_only", self.default_read_only)
 
         ctx = RequestContext(user_id=user_id, roles=roles, read_only=read_only)
-        token_ctx = _current_request_context.set(ctx)
+        token_ctx = current_request_context.set(ctx)
         try:
             await self.app(scope, receive, send)
         finally:
-            _current_request_context.reset(token_ctx)
+            current_request_context.reset(token_ctx)
 
 
 def create_http_app(

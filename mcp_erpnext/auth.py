@@ -81,6 +81,9 @@ def get_request_context() -> Optional[RequestContext]:
     return current_request_context.get()
 
 
+get_current_request_context = get_request_context
+
+
 @contextmanager
 def set_request_context(ctx: Optional[RequestContext]):
     """
