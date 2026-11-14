@@ -1,4 +1,4 @@
-## 4c. Member 5 handover: Authentication, User Identity, and Per-User ERPNext Sessions
+## 4e. Member 5 handover: Authentication, User Identity, and Per-User ERPNext Sessions
 
 Last updated: 14 Nov 2026. Branch: `member5-stage2b` (local only, no push).
 Base: `origin/mcp-integration @ 48ca6a9`.
@@ -242,22 +242,22 @@ The five write functions in `mcp_erpnext/crud.py` are:
 
 ### Test Suite Baseline and .env Investigation
 
-Measured at commit `d9bd490` (HEAD):
+Measured at commit `97cb74d` (HEAD):
 - **`agent/tests`**: **387 passed**, 0 failed.
-- **`tests` (Root Suite)**: **479 passed**, **8 baseline failures with current local .env (see Part 2 breakdown below)**.
-- New failures introduced by Member 5: **0**. All 10 Part L unit tests in `tests/test_part_l_mcp_identity.py` pass.
+- **`tests` (Root Suite)**: **486 passed**, **1 pre-existing baseline failure in a clean environment** (no local `agent/.env` / `DOCTYPE_WHITELIST` unset).
+- New failures introduced by Member 5: **0**. All 120 Member 5 tests across both suites pass.
 
-#### Part 2 Breakdown: .env Dependence of the 8 Baseline Failures
+#### Matrix Attribution Result (.env vs Pre-Existing Failures)
 
-When running `tests` in a clean environment where `agent/.env` is NOT loaded (or `DOCTYPE_WHITELIST` is unset):
-- **1 test fails regardless of .env**:
+A matrix run across `merge-base` (`48ca6a9`), `origin tip` (`48ca6a9`), and `HEAD` (`97cb74d`) under both `env set` and `env cleared` verified:
+- **1 test fails regardless of environment (pre-existing baseline failure)**:
   - `tests/test_generic_pipeline_genericity.py::TestGenericPipelineGenericity::test_static_scan_for_hardcoded_literals`:
     Fails with `AssertionError: <re.Match object; span=(4015, 4023), match='customer'> is not None : Found forbidden hardcoded literal 'Customer' in graph node 'collect_parameters_node'!`.
-    **Owner**: Member 1 (`agent/workflow/graph.py`).
-- **7 tests fail ONLY because of `agent/.env` `DOCTYPE_WHITELIST`**:
+    **Owner**: Member 4 (`agent/workflow/graph.py`).
+- **7 tests fail ONLY when `agent/.env` defines `DOCTYPE_WHITELIST`**:
   `agent/.env` defines `DOCTYPE_WHITELIST=Customer, Item, Sales Order, Bin, Quotation, Sales Invoice, Purchase Order, Supplier, Sales Order Item, Purchase Order Item, Company, Warehouse` (12 DocTypes, omitting `Stock Ledger Entry`, `Delivery Note`, `Purchase Receipt`).
   In contrast, code defaults in `mcp_erpnext/crud.py:DEFAULT_WHITELIST` include all 17 DocTypes (including `Stock Ledger Entry`).
-  When `agent/.env` is loaded into the test process by `generic_tools.py:load_dotenv()`, the following 7 tests fail:
+  When `agent/.env` is loaded into the test process by `generic_tools.py:load_dotenv()`, the following 7 tests fail; **when `DOCTYPE_WHITELIST` is cleared, all 7 pass on merge-base, origin tip, and HEAD**:
   1. `tests/test_generic_tools.py::TestGenericTools::test_custom_whitelist_env`: Fails on `self.assertNotIn("DOCTYPE_WHITELIST", os.environ)` because `agent/.env` populated the variable.
   2. `tests/test_generic_tools.py::TestGenericTools::test_get_list_invalid_direction_and_malformed_clauses_rejected`: Calls `get_list("Stock Ledger Entry", ...)` which fails at the whitelist check (`permission_denied`) before testing SQL injection / order_by direction.
   3. `tests/test_generic_tools.py::TestGenericTools::test_get_list_sql_injection_rejected_before_http_call`: Calls `get_list("Stock Ledger Entry", ...)` which fails at the whitelist check before SQL injection validation.
@@ -265,7 +265,7 @@ When running `tests` in a clean environment where `agent/.env` is NOT loaded (or
   5. `tests/test_generic_tools.py::TestGenericTools::test_get_list_valid_single_order_by`: Calls `get_list("Stock Ledger Entry", ...)` which fails with `permission_denied` at the whitelist check.
   6. `tests/test_generic_tools.py::TestGenericTools::test_workflow_call_generic_tool_node_order_by_passthrough`: Calls `call_generic_tool_node` for intent `stock-movement-analysis` with doctype `Stock Ledger Entry`. `graph.py:2182` rejects it with `DocType 'Stock Ledger Entry' is not permitted by whitelist`, preventing `get_list` from being called.
   7. `tests/test_mcp_erpnext_crud.py::TestMCPErpnextCrudDirect::test_search_unmapped_doctype_searches_name_only`: Calls `search_document("Stock Ledger Entry", "Entry")`. `crud.py:484` returns `permission_denied` before calling `client.get`, causing `_, kwargs = self.mock_client.get.call_args` to raise `TypeError: cannot unpack non-iterable NoneType object`.
-  **Owner of the 7 tests**: Member 3 (`mcp_erpnext/crud.py`, `tests/test_generic_tools.py`, `tests/test_mcp_erpnext_crud.py`) and Member 1 (`graph.py`).
+  **Owner of the 7 tests**: Member 3 (`mcp_erpnext/crud.py`, `tests/test_generic_tools.py`, `tests/test_mcp_erpnext_crud.py`) and Member 1/4 (`graph.py`).
 
 #### Line Number Shift in `test_generic_tools.py`
 In `test_generic_tools.py`, `test_workflow_call_generic_tool_node_order_by_passthrough` was originally added in commit `3daf050`. It shifted down to line 518 (with failure at line 538) due to earlier additions:
