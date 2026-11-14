@@ -1,7 +1,7 @@
 # ERPNext Assistant: MCP Migration Plan, Status and Handover
 
 Last updated: 14 Nov 2026. Branch: `mcp-integration` (cut from `integration-fixed` at `d3d75bd`).
-Status: Members 1, 2, 3 and 4 are COMPLETE. Members 5 and 6 are pending.
+Status: Members 1 to 5 are COMPLETE. Member 6 is pending.
 
 This document is the work allocation plus the handover notes from Members 1, 2, 3 and 4. It is a plan, not evidence that work 5 to 6 is done.
 
@@ -32,7 +32,7 @@ Build a separately maintainable Python MCP component while keeping the existing 
 | 2 | Aggregation, reports, pagination | DONE (section 4b) |
 | 3 | MCP server and shared security policy | DONE (section 4c) |
 | 4 | LangGraph adapter and MCP integration | DONE (section 4d) |
-| 5 | Authentication and user identity | Not started |
+| 5 | Authentication and user identity | DONE (section 4e; docs/MEMBER5_HANDOVER.md) |
 | 6 | Testing, security, deployment | Not started (baseline numbers in section 5) |
 
 ## 4. Member 1 handover: what was delivered
@@ -265,6 +265,43 @@ The remaining failure is `tests/test_generic_pipeline_genericity.py::test_static
 
 **Member 4 status: COMPLETE.**
 
+## 4e. Member 5 handover: authentication and user identity
+
+See `docs/MEMBER5_HANDOVER.md` for full implementation details, architectural memos, and audit traces.
+
+### Commits delivered
+- Commit range: `aa150be..97cb74d` (21 commits on `mcp-integration`).
+- Working tree clean; all files staged by explicit path.
+
+### Key deliverables and contracts
+- **Token Claims Contract:** JWTs contain `sub`, `roles`, `full_name`, `ctx` (Fernet-encrypted ERPNext session cookie/credentials), `scope`, and `exp`.
+  - `scope` rules: absent = writable; `"read"` = read-only; any other value = read-only (fail-closed).
+- **Request Context:** Canonical `RequestContext` defined in `mcp_erpnext/auth.py` and propagated via `current_request_context` ContextVar. Credentials are made read-only post-init.
+- **Contract for Members 3 and 4 (`require_writable` & write routing):**
+  - `require_writable()` is **NOT** yet called in `mcp_erpnext/crud.py` (Member 5 did not edit `crud.py`). The five write functions are: `create_document` (`crud.py:233`), `update_document` (`crud.py:309`), `delete_document` (`crud.py:370`), `cancel_document` (`crud.py:753`), and `submit_document` (`crud.py:760`).
+  - In `agent/tools/adapter.py:352-365`, all five write methods bypass MCP and invoke `generic_tools.<func>` directly.
+  - Read-only write attempts currently trigger `ERPNextClient._send()` transport backstop, which raises `ReadOnlySessionError` and surfaces in `crud.py` as `{"status": "system_error", "message": "Operation failed: Session is read-only..."}` until Members 3 and 4 wire `require_writable()` into `crud.py` (which will return `{"status": "error", "error": "permission_denied"}`).
+- **Files Edited Belonging to Member 3:**
+  - `mcp_erpnext/server.py` and `mcp_erpnext/policy.py`: only identity hooks were added (canonical ContextVar aliasing, token verification in `BearerAuthMiddleware`, `InMemoryMCPClient` identity bridge, and read-only STDIO transport enforcement).
+- **Environment Variables:**
+  - `CREDENTIAL_ENC_KEY`: Fernet encryption key for encrypting session credentials in JWTs (must match Frappe `site_config.json`). Fails closed if unset.
+  - `ALLOW_DEV_MOCK_AUTH=false`: Refuses mock authentication (allowed only on localhost/127.0.0.1 if explicitly enabled).
+  - `ERPNEXT_STRICT_IDENTITY=true`: Fails closed if no user context is active; eliminates silent fallback to service credentials.
+  - `READONLY_TOKEN_TTL_MINUTES=15`: Expiration for read-only tokens minted for tools.
+  - `CORS_ALLOWED_ORIGINS`: Comma-separated allowed origins (e.g. `http://localhost:8080`). Disallows wildcard `*` when credentials are permitted.
+- **Verified Facts & Live Proof:**
+  - Live ERPNext instance token minting & zero-mutation proof: customer create/delete verified in database under normal token; under read-only token, write blocked by transport backstop and database verified 0 mutation (HTTP 404).
+  - Session expiration: expired session returns HTTP 401 with `WWW-Authenticate: Bearer`.
+  - Permission isolation: direct ERPNext check confirmed Administrator 200 OK vs Sandra 403 Forbidden on `Sales Invoice`.
+  - Multi-user concurrency: concurrent requests with differing user tokens do not leak identity across async/thread boundaries.
+- **Known Limits:**
+  - Roles inside JWT are fixed at mint time.
+  - Resolver defaults cache has no TTL.
+  - No automatic Fernet key rotation.
+  - Frappe session lifetime governs access after token minting.
+
+**Member 5 status: COMPLETE.**
+
 ## 5. What every member must know
 
 ### Run the tests (PowerShell, from the repo root)
@@ -273,11 +310,12 @@ $env:PYTHONPATH="agent;."; $env:ALLOW_DEV_MOCK_AUTH="false"
 python -m pytest tests -q
 python -m pytest agent/tests -q
 ```
-Baseline at `529f7d9`: `tests` gives 1 failed, 190 passed; `agent/tests` gives 358 passed. On bash use `PYTHONPATH=agent:.`.
+Baseline at `97cb74d` (clean env, `DOCTYPE_WHITELIST` unset): `tests` gives 1 failed, 486 passed; `agent/tests` gives 387 passed (0 failed). On bash use `PYTHONPATH=agent:.`.
+Note: 7 tests in `tests` fail only when a local `agent/.env` (or shell environment) sets `DOCTYPE_WHITELIST`.
 
 ### Known failing or fragile tests (not caused by the migration)
 - `tests/test_generic_pipeline_genericity.py::test_static_scan_for_hardcoded_literals` fails on a hard-coded literal ('Customer') in `graph.py` `collect_parameters_node`, and the scan also matches other literals in `call_generic_tool_node`. It never scans `mcp_erpnext/crud.py`, so literals such as 'Sales Order' that used to sit in `generic_tools.create_document` are now invisible to it. Do not edit the test without agreeing it with Antony.
-- `tests/test_auth.py::test_verify_token_missing_header` and `agent/tests/test_conversations_api.py::test_endpoints_require_a_token` fail only when a local `.env` sets `ALLOW_DEV_MOCK_AUTH=true`. They pass with `ALLOW_DEV_MOCK_AUTH=false`. Members 5 and 6: make them independent of the local `.env`.
+- `tests/test_auth.py::test_verify_token_missing_header` and `agent/tests/test_conversations_api.py::test_endpoints_require_a_token`: Made independent of local `.env` by Member 5 (autouse fixtures in commit `dea25e5`). Both tests now pass consistently with `ALLOW_DEV_MOCK_AUTH=false`, `ALLOW_DEV_MOCK_AUTH=true`, or unset.
 
 ### Conventions
 - Do not rename tools. The 22 YAML skills depend on the names.
@@ -393,7 +431,7 @@ Notes from Member 1:
 ## 8. Open decisions and known issues
 
 ### Decisions needed
-- D1 (Members 4 and 5): the `generic_tools` wrappers cannot receive per-request credentials (no `client` argument, and their signatures must stay unchanged for the 22 skills). Proposed: a request-scoped context variable that `mcp_erpnext` reads, with the environment service key as the fallback. Settle this before building identity or the adapter.
+- D1 (Members 4 and 5): Resolved by Member 5. Implemented via request-scoped `current_request_context` (`contextvars.ContextVar` in `mcp_erpnext/auth.py`), bound at the request boundary in `agent/main.py`. `mcp_erpnext.client.ERPNextClient` and `mcp_erpnext.server.InMemoryMCPClient` read this active context automatically without altering legacy tool signatures. Fallback to service credentials occurs only when `ALLOW_DEV_MOCK_AUTH=true` and `ERPNEXT_STRICT_IDENTITY=false`; in production/strict mode it fails closed.
 
 ### Known issues and open items
 - The resolver caches have no TTL or size limit.
