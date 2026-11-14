@@ -144,3 +144,102 @@ def test_dev_mock_auth_never_returned_when_invalid_token_is_supplied(monkeypatch
         asyncio.run(verify_token(authorization="Bearer this_is_a_completely_invalid_token"))
     assert exc_info.value.status_code == 401
     assert "Invalid token" in exc_info.value.detail
+
+
+def test_encrypted_ctx_claim_populates_credentials_and_redacts(monkeypatch):
+    import json
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    enc_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", enc_key)
+
+    sid_secret = "sensitive_sid_secret_value_12345"
+    csrf_secret = "sensitive_csrf_secret_value_abcde"
+
+    fernet = Fernet(enc_key.encode())
+    encrypted_ctx = fernet.encrypt(json.dumps({"sid": sid_secret, "csrf_token": csrf_secret}).encode()).decode()
+
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "ctx": encrypted_ctx,
+    }
+
+    ctx = _build_request_context(payload)
+    assert ctx.user_id == "alice@example.com"
+    assert ctx.credentials is not None
+
+    headers = ctx.credentials.get_headers()
+    assert headers["Cookie"] == f"sid={sid_secret}"
+    assert headers["X-Frappe-CSRF-Token"] == csrf_secret
+
+    # Verify complete redaction in repr and str
+    assert sid_secret not in repr(ctx)
+    assert csrf_secret not in repr(ctx)
+    assert sid_secret not in repr(ctx.credentials)
+    assert csrf_secret not in repr(ctx.credentials)
+    assert sid_secret not in str(ctx)
+    assert csrf_secret not in str(ctx)
+
+
+def test_missing_ctx_claim_fails_closed_with_401(monkeypatch):
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    enc_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", enc_key)
+
+    payload_no_ctx = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        _build_request_context(payload_no_ctx)
+    assert exc_info.value.status_code == 401
+    assert "claim required" in exc_info.value.detail
+
+
+def test_tampered_ctx_claim_fails_closed_with_401(monkeypatch):
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    enc_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", enc_key)
+
+    payload_tampered = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "ctx": "gAAAAABl_tampered_ciphertext_that_is_invalid",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        _build_request_context(payload_tampered)
+    assert exc_info.value.status_code == 401
+    assert "Invalid, tampered, or undecryptable" in exc_info.value.detail
+
+
+def test_wrong_fernet_key_fails_closed_with_401(monkeypatch):
+    import json
+    from cryptography.fernet import Fernet
+    from main import _build_request_context
+
+    key_a = Fernet.generate_key().decode()
+    key_b = Fernet.generate_key().decode()
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", key_b)
+
+    # Encrypted with Key A, agent configured with Key B
+    fernet_a = Fernet(key_a.encode())
+    encrypted_ctx_a = fernet_a.encrypt(json.dumps({"sid": "sid_val", "csrf_token": "csrf_val"}).encode()).decode()
+
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "ctx": encrypted_ctx_a,
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        _build_request_context(payload)
+    assert exc_info.value.status_code == 401
+    assert "Invalid, tampered, or undecryptable" in exc_info.value.detail
