@@ -106,12 +106,14 @@ def test_tools_endpoints_require_authentication(client, valid_token_header):
     resp_del = client.request("DELETE", "/api/tools/delete", json={"doctype_name": "Customer", "id": "1"})
     assert resp_del.status_code == 401
 
-    # With valid token -> authenticated
+    # With valid token possessing allowed role (System Manager) -> authenticated
+    secret = os.getenv("JWT_SECRET", "test_jwt_secret_key_32_bytes_long!!")
+    sys_token = jwt.encode({"sub": "admin@example.com", "roles": ["System Manager"]}, secret, algorithm="HS256")
     with patch("main.get_list", return_value={"status": "success", "data": []}):
         resp_authed = client.post(
             "/api/tools/list",
             json={"doctype_name": "Customer"},
-            headers=valid_token_header,
+            headers={"Authorization": f"Bearer {sys_token}"},
         )
         assert resp_authed.status_code == 200
 

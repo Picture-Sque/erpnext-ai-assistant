@@ -427,8 +427,39 @@ class GenericToolRequest(BaseModel):
     id: Optional[str] = None
     parameters: Optional[dict] = None
 
+def get_tools_api_allowed_roles() -> List[str]:
+    raw = os.getenv("TOOLS_API_ALLOWED_ROLES")
+    if raw is not None:
+        roles = [r.strip() for r in raw.split(",") if r.strip()]
+        if roles:
+            return roles
+    # Fail closed: empty or missing config means System Manager only
+    return ["System Manager"]
+
+def verify_tools_api_role(payload: dict = Depends(verify_token)) -> dict:
+    """
+    Role gate for /api/tools/* endpoints.
+    Requires caller to possess at least one of the configured TOOLS_API_ALLOWED_ROLES.
+    Fails closed: defaults to ['System Manager'].
+    """
+    allowed_roles = get_tools_api_allowed_roles()
+    user_roles = payload.get("roles", [])
+    if not isinstance(user_roles, (list, tuple, set)):
+        user_roles = [user_roles] if user_roles else []
+
+    if not any(role in allowed_roles for role in user_roles):
+        logger.warning(
+            f"Access denied to /api/tools for user '{payload.get('sub')}': "
+            f"roles {user_roles} lack required {allowed_roles}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: System Manager role required for direct tools API."
+        )
+    return payload
+
 @app.post("/api/tools/list")
-async def list_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+async def list_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
     with set_request_context(_build_request_context(payload)):
         params = request.parameters or {}
         return get_list(
@@ -440,19 +471,19 @@ async def list_doctype_endpoint(request: GenericToolRequest, payload: dict = Dep
         )
 
 @app.post("/api/tools/add")
-async def add_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+async def add_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
     with set_request_context(_build_request_context(payload)):
         return create_document(request.doctype_name, request.parameters or {})
 
 @app.put("/api/tools/update")
-async def update_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+async def update_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
     if not request.id:
         raise HTTPException(status_code=400, detail="Missing record 'id' for update")
     with set_request_context(_build_request_context(payload)):
         return update_document(request.doctype_name, request.id, request.parameters or {})
 
 @app.delete("/api/tools/delete")
-async def delete_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_token)):
+async def delete_doctype_endpoint(request: GenericToolRequest, payload: dict = Depends(verify_tools_api_role)):
     if not request.id:
         raise HTTPException(status_code=400, detail="Missing record 'id' for delete")
     with set_request_context(_build_request_context(payload)):
