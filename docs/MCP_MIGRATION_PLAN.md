@@ -1,9 +1,9 @@
 # ERPNext Assistant: MCP Migration Plan, Status and Handover
 
 Last updated: 14 Nov 2026. Branch: `mcp-integration` (cut from `integration-fixed` at `d3d75bd`).
-Status: Members 1, 2 and 3 are COMPLETE. Members 4, 5 and 6 are pending.
+Status: Members 1, 2, 3 and 4 are COMPLETE. Members 5 and 6 are pending.
 
-This document is the work allocation plus the handover notes from Members 1 and 2. It is a plan, not evidence that work 3 to 6 is done.
+This document is the work allocation plus the handover notes from Members 1, 2, 3 and 4. It is a plan, not evidence that work 5 to 6 is done.
 
 ## 1. Direction and security boundary
 
@@ -30,8 +30,8 @@ Build a separately maintainable Python MCP component while keeping the existing 
 |---|---|---|
 | 1 | ERPNext tool layer extraction | DONE (section 4) |
 | 2 | Aggregation, reports, pagination | DONE (section 4b) |
-| 3 | MCP server and shared security policy | DONE ( section 4c) |
-| 4 | LangGraph adapter and MCP integration | Not started |
+| 3 | MCP server and shared security policy | DONE (section 4c) |
+| 4 | LangGraph adapter and MCP integration | DONE (section 4d) |
 | 5 | Authentication and user identity | Not started |
 | 6 | Testing, security, deployment | Not started (baseline numbers in section 5) |
 
@@ -209,6 +209,61 @@ The remaining failure is `tests/test_generic_pipeline_genericity.py::test_static
 - Keep STDIO read-only until the authentication integration is complete.
 
 **Member 3 status: COMPLETE.** MCP server, shared security policy, schemas and dedicated tests have been implemented and committed as `5436b02`.
+
+## 4d. Member 4 handover: LangGraph adapter and MCP integration
+
+### Delivered components and files
+1. `agent/tools/mcp_client.py`:
+   - STDIO transport client using the official Python MCP SDK (`mcp.client.stdio.stdio_client`, `mcp.ClientSession`).
+   - Managed background event loop thread (`_loop`) with persistent single-task runner (`_session_runner`) processing an `asyncio.Queue`, ensuring full AnyIO context manager task affinity.
+   - Credential masking via `mask_sensitive()` preventing sensitive tokens or keys from leaking into log outputs or exception envelopes.
+   - Clean lifecycle management: lazy connection, graceful shutdown (`close()`), atexit registry, process cleanup, and configurable timeout (`MCP_TIMEOUT`).
+2. `agent/tools/adapter.py`:
+   - `ToolAdapter` providing seamless backend routing between `direct` and `mcp` via `TOOL_BACKEND` env var (defaults to `direct`, fails-closed on invalid values).
+   - Routes eligible READ operations to MCP: `get_list`, `get_document`, `search_document`, `get_count`, `aggregate`.
+   - Strictly keeps all 5 WRITE operations DIRECT: `create_document`, `update_document`, `delete_document`, `cancel_document`, `submit_document` (explicit error if MCP routing is attempted for writes).
+   - Preserves write-verification read security: `write_verification_scope()` context manager ensures post-write verification reads in `result_validation_node` stay direct regardless of `TOOL_BACKEND`.
+   - Routes default company and warehouse resolvers (`get_default_company`, `get_default_warehouse`) with proper fallback behavior and `RuntimeError` preservation.
+   - Maintains exact function signatures, argument contracts, and result envelope structure (`{status, data, error, has_more, ...}`) without modifying existing YAML skills.
+3. `agent/workflow/graph.py`:
+   - Integrated with `agent.tools.adapter` for ordinary read operations and helper resolution.
+   - Multi-turn confirmation and write-execution nodes remain strictly direct.
+   - Enclosed document re-fetch in `result_validation_node()` within `write_verification_scope()`.
+4. `agent/tools/__init__.py`:
+   - Exported `ToolAdapter`, `adapter`, `get_tool_adapter`, `ERPNextMCPClient`, and `MCPClient`.
+5. `agent/main.py`:
+   - Validates `TOOL_BACKEND` on startup via `resolve_backend()`.
+   - Closes adapter / MCP client sessions cleanly in lifespan shutdown (`close_adapter()`).
+6. `agent/.env.example`:
+   - Documented `TOOL_BACKEND=direct` and `MCP_TIMEOUT=30.0`.
+
+### Security and architectural guarantees verified
+- **Fail-Closed Backend Selection:** Invalid `TOOL_BACKEND` values trigger an immediate `ValueError` at startup / resolution; no silent fallbacks.
+- **Strict Write Isolation:** All write operations execute directly via Frappe REST API. No write execution can be triggered via MCP in this stage.
+- **Write Verification Integrity:** Write-verification reads inside `result_validation_node` execute directly against Frappe REST API to guarantee verification accuracy and prevent poisoning.
+- **No Direct Fallback on MCP Error:** If `TOOL_BACKEND=mcp` and the MCP server fails or times out, the error is raised directly to the caller. Silent fallback to direct execution is explicitly disallowed to preserve security boundaries.
+- **Skill Integrity:** All 22 YAML skill definitions execute with zero modifications.
+
+### Test results
+**Member 4 dedicated test results:**
+| Test Suite | Tests Passed | Status |
+|---|---:|---|
+| `tests/test_mcp_client.py` | 8 | PASSED |
+| `tests/test_adapter.py` | 10 | PASSED |
+| `tests/test_graph_mcp_integration.py` | 6 | PASSED |
+| **Total dedicated Member 4 tests** | **24** | **PASSED** |
+
+**Full regression results:**
+- `tests`: 434 passed, 1 failed (`test_static_scan_for_hardcoded_literals` - pre-existing baseline).
+- `agent/tests`: 359 passed, 0 failed.
+- All 47 tests in `agent/tests/test_mixed_chains.py` passed with 100% compatibility.
+
+### Handover to Member 5
+- Member 4 implementation is complete, backwards-compatible, and verified.
+- The `ToolAdapter` and `ERPNextMCPClient` are ready for Member 5's per-user authentication and request-context propagation (Open Decision D1).
+- Context-variable scoping (`write_verification_scope`) established in `adapter.py` provides an established design pattern for passing per-request user credentials or session tokens down to `mcp_erpnext` without altering legacy tool signatures.
+
+**Member 4 status: COMPLETE.**
 
 ## 5. What every member must know
 

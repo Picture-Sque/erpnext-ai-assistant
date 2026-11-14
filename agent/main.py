@@ -29,6 +29,7 @@ logger = logging.getLogger("agent_main")
 # Import compiled graph and states
 from workflow.graph import compiled_graph
 import chat_store
+from tools.adapter import resolve_backend, close_adapter
 
 # Setup FastAPI App
 app = FastAPI(
@@ -40,6 +41,11 @@ app = FastAPI(
 @app.on_event("startup")
 def on_startup():
     chat_store.init_db()
+    resolve_backend()
+
+@app.on_event("shutdown")
+def on_shutdown():
+    close_adapter()
 
 # CORS Configuration
 origins = [

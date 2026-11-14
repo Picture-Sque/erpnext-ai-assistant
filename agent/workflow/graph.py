@@ -22,22 +22,44 @@ from workflow.followup_router import (
     FOLLOWUP_MAX_MINUTES,
     _BACK_REFERENCE_RE,
 )
-from tools.generic_tools import (
-    create_document,
-    get_list,
-    update_document,
-    delete_document,
-    get_document,
-    search_document,
-    get_count,
-    aggregate,
-    cancel_document,
-    submit_document,
-    is_doctype_allowed,
-    get_allowed_doctypes,
-    get_default_company,
-    get_default_warehouse,
-)
+try:
+    from agent.tools.adapter import (
+        create_document,
+        get_list,
+        update_document,
+        delete_document,
+        get_document,
+        get_document_direct,
+        write_verification_scope,
+        search_document,
+        get_count,
+        aggregate,
+        cancel_document,
+        submit_document,
+        is_doctype_allowed,
+        get_allowed_doctypes,
+        get_default_company,
+        get_default_warehouse,
+    )
+except ImportError:
+    from tools.adapter import (
+        create_document,
+        get_list,
+        update_document,
+        delete_document,
+        get_document,
+        get_document_direct,
+        write_verification_scope,
+        search_document,
+        get_count,
+        aggregate,
+        cancel_document,
+        submit_document,
+        is_doctype_allowed,
+        get_allowed_doctypes,
+        get_default_company,
+        get_default_warehouse,
+    )
 
 logger = logging.getLogger("workflow_graph")
 logger.setLevel(logging.INFO)
@@ -2562,7 +2584,8 @@ def result_validation_node(state: AgentState):
                 
         if is_ambiguous and record_id:
             logger.info(f"[Step 8] Re-reading {doctype} '{record_id}' for write verification.")
-            read_res = get_document(doctype, record_id)
+            with write_verification_scope():
+                read_res = get_document(doctype, record_id)
             if operation == "delete":
                 if read_res.get("status") == "not_found":
                     write_verified = True
