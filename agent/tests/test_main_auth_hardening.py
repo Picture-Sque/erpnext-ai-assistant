@@ -71,8 +71,113 @@ def test_contextvar_propagates_into_graph_and_resets_after_request(client, valid
     assert get_request_context() is None
 
 
-def test_cors_allowed_and_disallowed_origins(client):
+def _build_cors_test_client(monkeypatch, cors_origins=None, dev_mock="false", base_url="http://localhost:8080"):
+    import main
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    if cors_origins is not None:
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", cors_origins)
+    else:
+        monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("ALLOW_DEV_MOCK_AUTH", dev_mock)
+    monkeypatch.setenv("ERPNEXT_BASE_URL", base_url)
+
+    test_app = FastAPI()
+    test_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=main.get_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    @test_app.post("/chat")
+    def dummy_chat():
+        return {"status": "ok"}
+
+    return TestClient(test_app)
+
+
+def test_cors_allowed_and_disallowed_origins(monkeypatch):
+    client = _build_cors_test_client(monkeypatch, cors_origins="http://localhost:8080, http://example.com")
+
     # Allowed origin gets access-control-allow-origin
+    resp = client.options(
+        "/chat",
+        headers={
+            "Origin": "http://localhost:8080",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization, content-type",
+        },
+    )
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:8080"
+    assert resp.headers.get("access-control-allow-credentials") == "true"
+    allow_methods = resp.headers.get("access-control-allow-methods", "")
+    assert "POST" in allow_methods
+    allow_headers = resp.headers.get("access-control-allow-headers", "").lower()
+    assert "authorization" in allow_headers
+    assert "content-type" in allow_headers
+
+    # Disallowed origin does NOT get access-control-allow-origin
+    resp_evil = client.options(
+        "/chat",
+        headers={
+            "Origin": "http://evil-attacker-site.com",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert resp_evil.headers.get("access-control-allow-origin") is None
+
+
+def test_cors_wildcard_is_dropped(monkeypatch):
+    import main
+    # "*" alone is dropped, leaving empty list
+    client_star = _build_cors_test_client(monkeypatch, cors_origins="*")
+    assert main.get_cors_origins() == []
+    resp = client_star.options(
+        "/chat",
+        headers={
+            "Origin": "http://anything.com",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert resp.headers.get("access-control-allow-origin") is None
+
+    # "*" combined with valid origin is dropped, keeping only valid origin
+    client_mixed = _build_cors_test_client(monkeypatch, cors_origins="*, http://localhost:8080, ")
+    assert main.get_cors_origins() == ["http://localhost:8080"]
+    resp_valid = client_mixed.options(
+        "/chat",
+        headers={
+            "Origin": "http://localhost:8080",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert resp_valid.headers.get("access-control-allow-origin") == "http://localhost:8080"
+
+
+def test_cors_unset_gives_no_headers_fail_closed(monkeypatch):
+    import main
+    client = _build_cors_test_client(monkeypatch, cors_origins=None, dev_mock="false")
+    assert main.get_cors_origins() == []
+    resp = client.options(
+        "/chat",
+        headers={
+            "Origin": "http://localhost:8080",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_cors_unset_plus_dev_mock_gives_localhost_only(monkeypatch):
+    import main
+    client = _build_cors_test_client(monkeypatch, cors_origins=None, dev_mock="true")
+    origins = main.get_cors_origins()
+    assert "http://localhost:8080" in origins
+    assert "http://127.0.0.1:8080" in origins
+
+    # Localhost gets headers
     resp = client.options(
         "/chat",
         headers={
@@ -82,7 +187,7 @@ def test_cors_allowed_and_disallowed_origins(client):
     )
     assert resp.headers.get("access-control-allow-origin") == "http://localhost:8080"
 
-    # Disallowed origin does NOT get access-control-allow-origin
+    # Non-localhost origin does not get headers
     resp_evil = client.options(
         "/chat",
         headers={

@@ -86,28 +86,57 @@ def on_startup():
 def on_shutdown():
     close_adapter()
 
+def is_dev_mock_allowed() -> bool:
+    allow_dev_auth = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1")
+    if not allow_dev_auth:
+        return False
+    base_url = os.getenv("ERPNEXT_BASE_URL") or os.getenv("ERPNEXT_URL") or "http://localhost:8080"
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in ("localhost", "127.0.0.1", "::1"):
+        logger.error(
+            f"REFUSING DEV MOCK AUTH: ALLOW_DEV_MOCK_AUTH is true but ERPNEXT_BASE_URL host "
+            f"'{hostname}' is not localhost/127.0.0.1. Dev mock auth is DISABLED."
+        )
+        return False
+    return True
+
 # CORS Configuration
 def get_cors_origins() -> List[str]:
     cors_env = os.getenv("CORS_ALLOWED_ORIGINS")
-    if cors_env:
-        return [o.strip() for o in cors_env.split(",") if o.strip()]
-    return [
-        "http://localhost:5173",  # Standalone Vite dev server
-        "http://127.0.0.1:5173",
-        "http://localhost:8000",  # Default Frappe Bench port
-        "http://127.0.0.1:8000",
-        "http://localhost:8080",  # ERPNext target instance port (confirmed port 8080)
-        "http://127.0.0.1:8080",
-        "http://localhost:8081",
-        "http://127.0.0.1:8081",
-    ]
+    if cors_env is not None:
+        origins = []
+        for o in cors_env.split(","):
+            trimmed = o.strip()
+            if not trimmed:
+                continue
+            if trimmed == "*":
+                logger.warning(
+                    "Wildcard '*' origin is disallowed when allow_credentials=True and has been dropped from CORS origins."
+                )
+                continue
+            origins.append(trimmed)
+        return origins
+    if is_dev_mock_allowed():
+        return [
+            "http://localhost:5173",  # Standalone Vite dev server
+            "http://127.0.0.1:5173",
+            "http://localhost:8000",  # Default Frappe Bench port
+            "http://127.0.0.1:8000",
+            "http://localhost:8080",  # ERPNext target instance port
+            "http://127.0.0.1:8080",
+            "http://localhost:8081",
+            "http://127.0.0.1:8081",
+        ]
+    return []
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # TODO: Original static-token auth logic kept for diff comparison
@@ -157,22 +186,6 @@ def get_candidate_secrets() -> List[str]:
             pass
 
     return secrets
-
-def is_dev_mock_allowed() -> bool:
-    allow_dev_auth = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1")
-    if not allow_dev_auth:
-        return False
-    base_url = os.getenv("ERPNEXT_BASE_URL") or os.getenv("ERPNEXT_URL") or "http://localhost:8080"
-    from urllib.parse import urlparse
-    parsed = urlparse(base_url)
-    hostname = (parsed.hostname or "").lower()
-    if hostname not in ("localhost", "127.0.0.1", "::1"):
-        logger.error(
-            f"REFUSING DEV MOCK AUTH: ALLOW_DEV_MOCK_AUTH is true but ERPNEXT_BASE_URL host "
-            f"'{hostname}' is not localhost/127.0.0.1. Dev mock auth is DISABLED."
-        )
-        return False
-    return True
 
 
 async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
