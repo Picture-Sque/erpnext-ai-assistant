@@ -459,6 +459,108 @@ class TestPartLMCPIdentity(unittest.TestCase):
         self.assertEqual(direct_headers[0]["X-Frappe-CSRF-Token"], "parity_csrf")
         self.assertEqual(mcp_headers[0]["X-Frappe-CSRF-Token"], "parity_csrf")
 
+    def test_two_user_mcp_backend_uses_per_user_credentials_and_no_env_fallback(self):
+        """
+        Verify two users on TOOL_BACKEND=mcp with InMemoryMCPClient each send their own
+        credentials/cookies to ERPNext over httpx, and that no call falls back to the
+        .env service key when ERPNEXT_STRICT_IDENTITY=true.
+        """
+        import httpx
+        from agent.tools.adapter import ToolAdapter
+
+        creds_alice = Credentials(
+            base_url="http://localhost:8080",
+            auth_headers={"Cookie": "sid=alice_session_sid_111", "X-Frappe-CSRF-Token": "alice_csrf_111"},
+        )
+        ctx_alice = RequestContext(
+            user_id="alice@example.com",
+            roles=("Sales User",),
+            credentials=creds_alice,
+            read_only=True,
+        )
+
+        creds_bob = Credentials(
+            base_url="http://localhost:8080",
+            auth_headers={"Cookie": "sid=bob_session_sid_222", "X-Frappe-CSRF-Token": "bob_csrf_222"},
+        )
+        ctx_bob = RequestContext(
+            user_id="bob@example.com",
+            roles=("Accounts User",),
+            credentials=creds_bob,
+            read_only=True,
+        )
+
+        sent_requests = []
+
+        def fake_send(self, request, *args, **kwargs):
+            sent_requests.append(request)
+            return httpx.Response(
+                200,
+                json={"data": [{"name": f"Customer-for-{request.headers.get('cookie')}"}]},
+                request=request,
+            )
+
+        env_overrides = {
+            "TOOL_BACKEND": "mcp",
+            "ERPNEXT_STRICT_IDENTITY": "true",
+            "ERPNEXT_BASE_URL": "http://localhost:8080",
+            "ERPNEXT_API_KEY": "forbidden_env_service_key",
+            "ERPNEXT_API_SECRET": "forbidden_env_service_secret",
+            "ALLOW_DEV_MOCK_AUTH": "false",
+        }
+
+        with patch.dict(os.environ, env_overrides):
+            in_mem_client = InMemoryMCPClient()
+            adapter = ToolAdapter(backend="mcp", mcp_client=in_mem_client)
+
+            with patch("mcp_erpnext.client.httpx.Client.send", new=fake_send):
+                # 1. User Alice executes read tool via MCP backend
+                with set_request_context(ctx_alice):
+                    res_alice = adapter.get_list("Customer")
+                    self.assertEqual(res_alice.get("status"), "success")
+
+                # 2. User Bob executes read tool via MCP backend
+                with set_request_context(ctx_bob):
+                    res_bob = adapter.get_list("Customer")
+                    self.assertEqual(res_bob.get("status"), "success")
+
+                # Verify each request presented its own credentials to httpx
+                self.assertEqual(len(sent_requests), 2)
+
+                alice_req = sent_requests[0]
+                bob_req = sent_requests[1]
+
+                # Assert Alice's session cookie and CSRF token
+                self.assertEqual(alice_req.headers.get("cookie"), "sid=alice_session_sid_111")
+                self.assertEqual(alice_req.headers.get("x-frappe-csrf-token"), "alice_csrf_111")
+                self.assertNotIn("forbidden_env_service_key", alice_req.headers.get("authorization", ""))
+
+                # Assert Bob's session cookie and CSRF token
+                self.assertEqual(bob_req.headers.get("cookie"), "sid=bob_session_sid_222")
+                self.assertEqual(bob_req.headers.get("x-frappe-csrf-token"), "bob_csrf_222")
+                self.assertNotIn("forbidden_env_service_key", bob_req.headers.get("authorization", ""))
+
+                # Neither request used Authorization header with service credentials
+                self.assertIsNone(alice_req.headers.get("authorization"))
+                self.assertIsNone(bob_req.headers.get("authorization"))
+
+                # 3. Caller with NO context: fails closed with strict identity, httpx NEVER called
+                res_no_ctx = adapter.get_list("Customer")
+                self.assertEqual(res_no_ctx.get("status"), "system_error")
+                self.assertEqual(len(sent_requests), 2)  # No new outbound HTTP request
+
+                # 4. Caller with context but NO credentials: fails closed, httpx NEVER called
+                ctx_no_creds = RequestContext(
+                    user_id="carol@example.com",
+                    roles=("System Manager",),
+                    credentials=None,
+                    read_only=True,
+                )
+                with set_request_context(ctx_no_creds):
+                    res_carol = adapter.get_list("Customer")
+                    self.assertEqual(res_carol.get("status"), "system_error")
+                    self.assertEqual(len(sent_requests), 2)  # No new outbound HTTP request
+
 
 if __name__ == "__main__":
     unittest.main()
