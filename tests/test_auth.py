@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import unittest
 import asyncio
 import jwt
@@ -110,8 +111,9 @@ class TestAuth(unittest.TestCase):
 		mock_frappe.PermissionError = Exception
 		mock_frappe.whitelist.side_effect = lambda *a, **kw: (a[0] if (len(a) > 0 and callable(a[0])) else (lambda fn: fn))
 		mock_frappe.throw.side_effect = Exception("PermissionError: Guest user")
+		mock_sessions = MagicMock()
 
-		with patch.dict(sys.modules, {"frappe": mock_frappe}):
+		with patch.dict(sys.modules, {"frappe": mock_frappe, "frappe.sessions": mock_sessions}):
 			if "ai_assistant.ai_assistant.api" in sys.modules:
 				del sys.modules["ai_assistant.ai_assistant.api"]
 			from ai_assistant.ai_assistant.api import get_auth_token
@@ -120,15 +122,26 @@ class TestAuth(unittest.TestCase):
 			self.assertIn("Guest", str(ctx.exception))
 
 	def test_frappe_api_authenticated_user_identity(self):
-		"""Frappe API derives identity strictly from frappe.session.user."""
+		"""Frappe API derives identity strictly from frappe.session.user and includes encrypted ctx."""
+		from cryptography.fernet import Fernet
 		mock_frappe = MagicMock()
+		mock_sessions = MagicMock()
+		mock_sessions.get_csrf_token.return_value = "mock_valid_csrf_token"
 		mock_frappe.session.user = "jane@example.com"
-		mock_frappe.conf.get.return_value = TEST_SECRET
+		mock_frappe.session.sid = "mock_valid_session_sid"
+		test_fernet_key = Fernet.generate_key().decode()
+
+		def mock_conf_get(key):
+			if key == "credential_enc_key":
+				return test_fernet_key
+			return TEST_SECRET
+
+		mock_frappe.conf.get.side_effect = mock_conf_get
 		mock_frappe.utils.get_fullname.return_value = "Jane Doe"
 		mock_frappe.get_roles.return_value = ["Accounts User"]
 		mock_frappe.whitelist.side_effect = lambda *a, **kw: (a[0] if (len(a) > 0 and callable(a[0])) else (lambda fn: fn))
 
-		with patch.dict(sys.modules, {"frappe": mock_frappe}):
+		with patch.dict(sys.modules, {"frappe": mock_frappe, "frappe.sessions": mock_sessions}):
 			if "ai_assistant.ai_assistant.api" in sys.modules:
 				del sys.modules["ai_assistant.ai_assistant.api"]
 			from ai_assistant.ai_assistant.api import get_auth_token
@@ -141,6 +154,58 @@ class TestAuth(unittest.TestCase):
 			decoded = jwt.decode(res["token"], TEST_SECRET, algorithms=["HS256"])
 			self.assertEqual(decoded["sub"], "jane@example.com")
 			self.assertEqual(decoded["full_name"], "Jane Doe")
+			self.assertIn("ctx", decoded)
+
+			# Verify decrypted ctx
+			f = Fernet(test_fernet_key.encode())
+			decrypted = json.loads(f.decrypt(decoded["ctx"].encode()).decode())
+			self.assertEqual(decrypted["sid"], "mock_valid_session_sid")
+			self.assertEqual(decrypted["csrf_token"], "mock_valid_csrf_token")
+
+	def test_frappe_api_empty_sid_or_csrf_fails_closed(self):
+		"""Frappe API must raise AuthenticationError when sid or csrf token is missing."""
+		from cryptography.fernet import Fernet
+		mock_frappe = MagicMock()
+		mock_sessions = MagicMock()
+		mock_frappe.session.user = "jane@example.com"
+		mock_frappe.session.sid = None
+		mock_frappe.local.session.sid = None
+		mock_sessions.get_csrf_token.return_value = "csrf_token"
+		mock_frappe.AuthenticationError = type("AuthenticationError", (Exception,), {})
+		mock_frappe.throw.side_effect = lambda msg, exc: (_ for _ in ()).throw(exc(msg))
+		test_fernet_key = Fernet.generate_key().decode()
+
+		mock_frappe.conf.get.side_effect = lambda k: test_fernet_key if k == "credential_enc_key" else TEST_SECRET
+		mock_frappe.whitelist.side_effect = lambda *a, **kw: (a[0] if (len(a) > 0 and callable(a[0])) else (lambda fn: fn))
+
+		with patch.dict(sys.modules, {"frappe": mock_frappe, "frappe.sessions": mock_sessions}):
+			if "ai_assistant.ai_assistant.api" in sys.modules:
+				del sys.modules["ai_assistant.ai_assistant.api"]
+			from ai_assistant.ai_assistant.api import get_auth_token
+			with self.assertRaises(mock_frappe.AuthenticationError) as ctx:
+				get_auth_token()
+			self.assertIn("Missing active session sid or CSRF token", str(ctx.exception))
+
+	def test_frappe_api_malformed_credential_enc_key_fails_closed(self):
+		"""Frappe API must raise ValidationError when CREDENTIAL_ENC_KEY is not a valid Fernet key."""
+		mock_frappe = MagicMock()
+		mock_sessions = MagicMock()
+		mock_frappe.session.user = "jane@example.com"
+		mock_frappe.session.sid = "sid"
+		mock_sessions.get_csrf_token.return_value = "csrf_token"
+		mock_frappe.ValidationError = type("ValidationError", (Exception,), {})
+		mock_frappe.throw.side_effect = lambda msg, exc: (_ for _ in ()).throw(exc(msg))
+
+		mock_frappe.conf.get.side_effect = lambda k: "malformed_not_base64_key" if k == "credential_enc_key" else TEST_SECRET
+		mock_frappe.whitelist.side_effect = lambda *a, **kw: (a[0] if (len(a) > 0 and callable(a[0])) else (lambda fn: fn))
+
+		with patch.dict(sys.modules, {"frappe": mock_frappe, "frappe.sessions": mock_sessions}):
+			if "ai_assistant.ai_assistant.api" in sys.modules:
+				del sys.modules["ai_assistant.ai_assistant.api"]
+			from ai_assistant.ai_assistant.api import get_auth_token
+			with self.assertRaises(mock_frappe.ValidationError) as ctx:
+				get_auth_token()
+			self.assertIn("Invalid CREDENTIAL_ENC_KEY", str(ctx.exception))
 
 if __name__ == "__main__":
 	unittest.main()

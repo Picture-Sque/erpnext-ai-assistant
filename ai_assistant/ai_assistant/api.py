@@ -1,19 +1,10 @@
 import json
 import os
-import base64
-import hashlib
 import jwt
 import frappe
 from datetime import datetime, timedelta, timezone
 from cryptography.fernet import Fernet
-
-try:
-	from frappe.sessions import get_csrf_token
-except ImportError:
-	try:
-		get_csrf_token = getattr(getattr(frappe, "sessions", None), "get_csrf_token", lambda: "")
-	except Exception:
-		get_csrf_token = lambda: ""
+from frappe.sessions import get_csrf_token
 
 @frappe.whitelist()
 def get_auth_token():
@@ -36,24 +27,23 @@ def get_auth_token():
 	if not enc_key:
 		frappe.throw("AI Assistant authentication failed: CREDENTIAL_ENC_KEY is not configured.", frappe.ValidationError)
 
+	try:
+		fernet = Fernet(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key)
+	except Exception:
+		frappe.throw("AI Assistant authentication failed: Invalid CREDENTIAL_ENC_KEY.", frappe.ValidationError)
+
 	full_name = frappe.utils.get_fullname(session_user) or session_user
 	roles = frappe.get_roles(session_user) or []
 
 	sid = getattr(frappe.session, "sid", None)
 	if not sid and hasattr(frappe, "local") and hasattr(frappe.local, "session"):
 		sid = getattr(frappe.local.session, "sid", None)
-	if not isinstance(sid, str):
-		sid = str(sid) if (sid is not None and not hasattr(sid, "_mock_name")) else ""
 
 	csrf_token = get_csrf_token()
-	if not isinstance(csrf_token, str):
-		csrf_token = str(csrf_token) if (csrf_token is not None and not hasattr(csrf_token, "_mock_name")) else ""
 
-	try:
-		fernet = Fernet(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key)
-	except ValueError:
-		derived = base64.urlsafe_b64encode(hashlib.sha256(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key).digest())
-		fernet = Fernet(derived)
+	if not sid or not csrf_token:
+		frappe.throw("AI Assistant authentication failed: Missing active session sid or CSRF token.", frappe.AuthenticationError)
+
 	ctx_payload = json.dumps({"sid": sid, "csrf_token": csrf_token})
 	encrypted_ctx = fernet.encrypt(ctx_payload.encode("utf-8")).decode("utf-8")
 
@@ -70,11 +60,8 @@ def get_auth_token():
 	# Sign token with HMAC-SHA256
 	token = jwt.encode(payload, jwt_secret, algorithm="HS256")
 
-	# PyJWT Compatibility: Convert bytes to string if PyJWT v1 returns bytes
-	if isinstance(token, bytes):
-		token = token.decode("utf-8")
-
 	return {
+		"status": "success",
 		"token": token,
 		"user": session_user,
 		"full_name": full_name,
@@ -84,8 +71,7 @@ def get_auth_token():
 
 @frappe.whitelist()
 def get_chat_token():
-	"""Alias endpoint for get_auth_token."""
+	"""
+	Alias for get_auth_token to preserve backwards compatibility with desk assets.
+	"""
 	return get_auth_token()
-
-
-

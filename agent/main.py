@@ -148,6 +148,7 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
                 "sub": "dev_user@example.com",
                 "full_name": "Standalone Developer",
                 "roles": ["System Manager", "Developer"],
+                "is_dev_mock": True,
             }
         logger.warning("Missing Authorization header in request")
         raise HTTPException(
@@ -267,52 +268,71 @@ def _build_request_context(payload: dict) -> RequestContext:
     roles = tuple(payload.get("roles", []))
     req_id = f"req-{uuid.uuid4().hex[:12]}"
 
+    is_dev_mock = payload.get("is_dev_mock", False)
+    if is_dev_mock:
+        return RequestContext(
+            user_id=user_sub,
+            roles=roles,
+            credentials=None,
+            read_only=False,
+            request_id=req_id,
+        )
+
     enc_key = os.getenv("CREDENTIAL_ENC_KEY")
+    if not enc_key:
+        logger.warning("CREDENTIAL_ENC_KEY is unset or empty; failing closed for ERPNext-issued token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Server security error: CREDENTIAL_ENC_KEY is unconfigured.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     ctx_claim = payload.get("ctx")
-    user_credentials = None
+    if not ctx_claim:
+        logger.warning("Missing 'ctx' claim in authenticated token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing encrypted session credentials in token ('ctx' claim required).",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    if enc_key:
-        if not ctx_claim:
-            logger.warning("Missing 'ctx' claim in authenticated token")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing encrypted session credentials in token ('ctx' claim required).",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    try:
+        from cryptography.fernet import Fernet
         try:
-            from cryptography.fernet import Fernet
-            try:
-                fernet = Fernet(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key)
-            except ValueError:
-                import base64
-                import hashlib
-                derived = base64.urlsafe_b64encode(hashlib.sha256(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key).digest())
-                fernet = Fernet(derived)
-            decrypted_bytes = fernet.decrypt(ctx_claim.encode("utf-8"))
-            data = json.loads(decrypted_bytes.decode("utf-8"))
-            sid = data.get("sid")
-            csrf_token = data.get("csrf_token")
-            if not sid:
-                raise ValueError("Missing 'sid' in session credentials")
-
-            base_url = os.getenv("ERPNEXT_BASE_URL", "http://localhost:8080").rstrip("/")
-            auth_headers = {"Cookie": f"sid={sid}"}
-            if csrf_token:
-                auth_headers["X-Frappe-CSRF-Token"] = csrf_token
-
-            user_credentials = Credentials(
-                base_url=base_url,
-                auth_headers=auth_headers,
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.warning("Decryption of session credentials failed: %s", type(exc).__name__)
+            fernet = Fernet(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key)
+        except Exception:
+            logger.warning("Invalid CREDENTIAL_ENC_KEY configured")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid, tampered, or undecryptable session credentials.",
+                detail="Server configuration error: Invalid CREDENTIAL_ENC_KEY.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+        decrypted_bytes = fernet.decrypt(ctx_claim.encode("utf-8"))
+        data = json.loads(decrypted_bytes.decode("utf-8"))
+        sid = data.get("sid")
+        csrf_token = data.get("csrf_token")
+        if not sid:
+            raise ValueError("Missing 'sid' in session credentials")
+
+        base_url = os.getenv("ERPNEXT_BASE_URL", "http://localhost:8080").rstrip("/")
+        auth_headers = {"Cookie": f"sid={sid}"}
+        if csrf_token:
+            auth_headers["X-Frappe-CSRF-Token"] = csrf_token
+
+        user_credentials = Credentials(
+            base_url=base_url,
+            auth_headers=auth_headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Decryption of session credentials failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid, tampered, or undecryptable session credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     return RequestContext(
         user_id=user_sub,

@@ -62,7 +62,8 @@ def test_contextvar_propagates_into_graph_and_resets_after_request(client, valid
     assert observed_context is not None
     assert observed_context.user_id == "user@example.com"
     assert observed_context.roles == ("Sales User", "Desk User")
-    assert observed_context.credentials is None
+    assert observed_context.credentials is not None
+    assert "Cookie" in observed_context.credentials.get_headers()
     assert observed_context.read_only is False
     assert observed_context.request_id.startswith("req-")
 
@@ -243,3 +244,52 @@ def test_wrong_fernet_key_fails_closed_with_401(monkeypatch):
         _build_request_context(payload)
     assert exc_info.value.status_code == 401
     assert "Invalid, tampered, or undecryptable" in exc_info.value.detail
+
+
+def test_key_unset_fails_closed_with_401(monkeypatch):
+    from main import _build_request_context
+
+    monkeypatch.delenv("CREDENTIAL_ENC_KEY", raising=False)
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        _build_request_context(payload)
+    assert exc_info.value.status_code == 401
+    assert "CREDENTIAL_ENC_KEY is unconfigured" in exc_info.value.detail
+
+
+def test_malformed_credential_enc_key_fails_closed_with_401(monkeypatch):
+    from main import _build_request_context
+
+    monkeypatch.setenv("CREDENTIAL_ENC_KEY", "not_a_valid_fernet_key_at_all!")
+    payload = {
+        "sub": "alice@example.com",
+        "roles": ["Sales User"],
+        "ctx": "gAAAAABl_some_ciphertext",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        _build_request_context(payload)
+    assert exc_info.value.status_code == 401
+    assert "Invalid CREDENTIAL_ENC_KEY" in exc_info.value.detail
+
+
+def test_dev_mock_auth_bypasses_credential_enc_key_when_explicitly_enabled(monkeypatch):
+    from main import _build_request_context
+
+    monkeypatch.delenv("CREDENTIAL_ENC_KEY", raising=False)
+    monkeypatch.setenv("ALLOW_DEV_MOCK_AUTH", "true")
+
+    payload = {
+        "sub": "dev_user@example.com",
+        "full_name": "Standalone Developer",
+        "roles": ["System Manager", "Developer"],
+        "is_dev_mock": True,
+    }
+
+    ctx = _build_request_context(payload)
+    assert ctx.user_id == "dev_user@example.com"
+    assert ctx.credentials is None
