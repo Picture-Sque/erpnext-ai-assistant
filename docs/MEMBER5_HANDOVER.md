@@ -2,7 +2,7 @@
 
 Last updated: 14 Nov 2026. Branch: `member5-stage2b` (local only, no push).
 Base: `origin/mcp-integration @ 48ca6a9`.
-Status: Parts A through J and Stage 1 cleanup are COMPLETE. Part L (MCP server per-user identity) is pending Stage 3–4.
+Status: Parts A through L and Stage 1 cleanup are COMPLETE. Part L (MCP server per-user identity) is IMPLEMENTED and VERIFIED.
 
 ---
 
@@ -93,6 +93,12 @@ Fields of `RequestContext` (`@dataclass(frozen=True)` in `mcp_erpnext/auth.py:26
 5. **Dev-Mock Guard (Part I-3)**:
    - `ALLOW_DEV_MOCK_AUTH=true` is strictly prohibited if `ERPNEXT_BASE_URL` hostname is anything other than `localhost`, `127.0.0.1`, or `::1`. If configured with an external host, dev-mock auth is automatically refused, disabled, and logged as an error on startup.
 
+6. **MCP Server Per-User Identity (Part L)**:
+   - `BearerAuthMiddleware` in `mcp_erpnext/server.py` now parses the JWT's encrypted `ctx` claim, decrypts `sid` and `csrf_token`, and attaches `Credentials` to `RequestContext`.
+   - External clients over HTTP transport are unconditionally forced to `read_only=True`; write tools are blocked server-side by `mcp_erpnext.policy` before reaching `crud.py`.
+   - `InMemoryMCPClient` in `mcp_erpnext/server.py` preserves `current_request_context` and fails closed if no context is active under strict identity.
+   - Parity between direct backend and `ToolAdapter(backend='mcp', mcp_client=InMemoryMCPClient())` is verified without modifying Member 4's `adapter.py` or `mcp_client.py`.
+
 ---
 
 ### Verified Facts & Evidence
@@ -109,6 +115,9 @@ Fields of `RequestContext` (`@dataclass(frozen=True)` in `mcp_erpnext/auth.py:26
 | Session expired flag survives thread hops without memory address collisions | Unit test `test_session_expired_flag_survives_thread_hop_and_is_isolated_between_requests` in `tests/test_part_i_hardening.py`. | VERIFIED |
 | Resolver cache isolation between sessions | Unit test `test_two_different_session_credentials_never_share_defaults_cache` in `tests/test_part_i_hardening.py`. | VERIFIED |
 | Dev-mock refusal on non-localhost hosts | Unit test `test_dev_mock_refusal_on_non_local_base_url` in `tests/test_part_i_hardening.py`. | VERIFIED |
+| MCP HTTP middleware decrypts credentials and binds per-user identity | Unit test `test_middleware_extracts_session_credentials_into_request_context` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| MCP read-only scope blocks write tools via policy | Unit test `test_mcp_dispatch_blocks_write_tools_for_read_only_context` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
+| Backend parity (direct vs MCP) preserves caller session | Unit test `test_both_backends_parity_identity_preservation` in `tests/test_part_l_mcp_identity.py`. | VERIFIED |
 | All 384 existing agent tests pass | Verified via `$env:PYTHONPATH="agent;."; $env:ALLOW_DEV_MOCK_AUTH="false"; python -m pytest agent/tests -q`. | VERIFIED |
 
 ---

@@ -24,7 +24,17 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage
 
-from mcp_erpnext.auth import RequestContext, set_request_context, get_request_context, is_session_expired
+from mcp_erpnext.auth import (
+    RequestContext,
+    set_request_context,
+    get_request_context,
+    is_session_expired,
+    verify_jwt,
+    build_request_context_from_payload,
+    AuthTokenError,
+    TokenExpiredError,
+)
+from mcp_erpnext.errors import ERPNextConfigError
 from mcp_erpnext.client import Credentials
 
 # Ensure environment variables are loaded
@@ -205,29 +215,24 @@ async def verify_token(authorization: Optional[str] = Header(None)) -> dict:
         )
 
     token = parts[1]
-    last_err = None
-
-    for secret in candidate_secrets:
-        try:
-            payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
-            logger.info(f"Successfully authenticated JWT for user: {payload.get('sub')}")
-            return payload
-        except jwt.ExpiredSignatureError:
-            logger.warning("JWT token has expired")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token has expired. Please refresh your session.",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        except jwt.InvalidTokenError as err:
-            last_err = err
-
-    logger.error(f"JWT validation failed: {str(last_err)}")
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail=f"Invalid token: {str(last_err)}",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+    try:
+        payload = verify_jwt(token, candidate_secrets, algorithms=[JWT_ALGORITHM], require_exp=False, require_sub=False)
+        logger.info(f"Successfully authenticated JWT for user: {payload.get('sub')}")
+        return payload
+    except TokenExpiredError:
+        logger.warning("JWT token has expired")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired. Please refresh your session.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except AuthTokenError as err:
+        logger.error(f"JWT validation failed: {str(err)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(err),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 # Request and Response models
 class ChatRequest(BaseModel):
@@ -301,92 +306,15 @@ def build_persisted_state(updated_state: dict) -> dict:
 
 
 def _build_request_context(payload: dict) -> RequestContext:
-    user_sub = payload.get("sub", "")
-    roles = tuple(payload.get("roles", []))
-    req_id = f"req-{uuid.uuid4().hex[:12]}"
-
-    is_dev_mock = payload.get("is_dev_mock", False)
-    if is_dev_mock:
-        return RequestContext(
-            user_id=user_sub,
-            roles=roles,
-            credentials=None,
-            read_only=False,
-            request_id=req_id,
-            dev_mock=True,
-        )
-
-    enc_key = os.getenv("CREDENTIAL_ENC_KEY")
-    if not enc_key:
-        logger.warning("CREDENTIAL_ENC_KEY is unset or empty; failing closed for ERPNext-issued token")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Server security error: CREDENTIAL_ENC_KEY is unconfigured.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    ctx_claim = payload.get("ctx")
-    if not ctx_claim:
-        logger.warning("Missing 'ctx' claim in authenticated token")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing encrypted session credentials in token ('ctx' claim required).",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
     try:
-        from cryptography.fernet import Fernet
-        try:
-            fernet = Fernet(enc_key.encode("utf-8") if isinstance(enc_key, str) else enc_key)
-        except Exception:
-            logger.warning("Invalid CREDENTIAL_ENC_KEY configured")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Server configuration error: Invalid CREDENTIAL_ENC_KEY.",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        decrypted_bytes = fernet.decrypt(ctx_claim.encode("utf-8"))
-        data = json.loads(decrypted_bytes.decode("utf-8"))
-        sid = data.get("sid")
-        csrf_token = data.get("csrf_token")
-        if not sid:
-            raise ValueError("Missing 'sid' in session credentials")
-
-        base_url = os.getenv("ERPNEXT_BASE_URL", "http://localhost:8080").rstrip("/")
-        auth_headers = {"Cookie": f"sid={sid}"}
-        if csrf_token:
-            auth_headers["X-Frappe-CSRF-Token"] = csrf_token
-
-        user_credentials = Credentials(
-            base_url=base_url,
-            auth_headers=auth_headers,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("Decryption of session credentials failed: %s", type(exc).__name__)
+        return build_request_context_from_payload(payload, require_ctx=True)
+    except (ERPNextConfigError, AuthTokenError) as exc:
+        logger.warning("Request context build failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid, tampered, or undecryptable session credentials.",
+            detail=str(exc),
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    if "scope" not in payload:
-        read_only = False
-    elif payload.get("scope") == "read":
-        read_only = True
-    else:
-        read_only = True
-
-    return RequestContext(
-        user_id=user_sub,
-        roles=roles,
-        credentials=user_credentials,
-        read_only=read_only,
-        request_id=req_id,
-        dev_mock=False,
-    )
 
 
 @app.post("/chat", response_model=ChatResponse)

@@ -35,9 +35,15 @@ from starlette.types import Receive, Scope, Send
 
 from mcp_erpnext import crud
 from mcp_erpnext import reports
-from mcp_erpnext.client import ERPNextClient
-from mcp_erpnext.errors import ERPNextError
-from mcp_erpnext.auth import current_request_context
+from mcp_erpnext.client import Credentials, ERPNextClient
+from mcp_erpnext.errors import ERPNextConfigError, ERPNextError
+from mcp_erpnext.auth import (
+    current_request_context,
+    verify_jwt,
+    build_request_context_from_payload,
+    AuthTokenError,
+    TokenExpiredError,
+)
 from mcp_erpnext.policy import (
     ALL_TOOLS,
     READ_TOOLS,
@@ -469,23 +475,37 @@ class BearerAuthMiddleware:
             user_id = parts[1] if len(parts) > 1 else "dev_user"
             roles_str = parts[2] if len(parts) > 2 else ""
             roles = tuple(r.strip() for r in roles_str.split(",") if r.strip())
-            claims = {"sub": user_id, "roles": roles, "read_only": self.default_read_only}
+            mock_claims = {"sub": user_id, "roles": roles, "is_dev_mock": True}
+            ctx = build_request_context_from_payload(mock_claims, force_read_only=True, require_ctx=False)
         else:
             try:
-                claims = jwt.decode(
-                    token,
-                    secret,
-                    algorithms=["HS256"],
-                    options={
-                        "require": ["exp", "sub"],
-                        "verify_signature": True,
-                        "verify_exp": True,
-                        "verify_nbf": True,
-                    },
+                claims = verify_jwt(token, secret, require_exp=True, require_sub=True)
+                ctx = build_request_context_from_payload(claims, force_read_only=True, require_ctx=False)
+            except TokenExpiredError as exc:
+                clean_msg = mask_sensitive(str(exc))
+                response = JSONResponse(
+                    {"detail": f"Invalid or expired token: {clean_msg}"},
+                    status_code=401,
                 )
-                sub_val = claims.get("sub")
-                if not isinstance(sub_val, str) or not sub_val.strip():
-                    raise jwt.InvalidTokenError("Token 'sub' claim must be a non-empty string.")
+                await response(scope, receive, send)
+                return
+            except ERPNextConfigError as exc:
+                clean_msg = mask_sensitive(str(exc))
+                response = JSONResponse(
+                    {"detail": clean_msg},
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+            except AuthTokenError as exc:
+                clean_msg = mask_sensitive(str(exc))
+                detail = f"Invalid session credentials in token: {clean_msg}" if "credentials" in str(exc).lower() else f"Invalid or expired token: {clean_msg}"
+                response = JSONResponse(
+                    {"detail": detail},
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
             except Exception as exc:
                 clean_msg = mask_sensitive(str(exc))
                 response = JSONResponse(
@@ -495,11 +515,6 @@ class BearerAuthMiddleware:
                 await response(scope, receive, send)
                 return
 
-        user_id = claims.get("sub") or claims.get("user_id") or "anonymous"
-        roles = tuple(claims.get("roles") or ())
-        read_only = claims.get("read_only", self.default_read_only)
-
-        ctx = RequestContext(user_id=user_id, roles=roles, read_only=read_only)
         token_ctx = current_request_context.set(ctx)
         try:
             await self.app(scope, receive, send)
@@ -552,6 +567,55 @@ def create_http_app(
     return app
 
 
+class InMemoryMCPClient:
+    """
+    In-process MCP client that validates schema, enforces policy,
+    and dispatches tools while preserving ContextVar user identity.
+    """
+
+    def __init__(self, client: Optional[ERPNextClient] = None):
+        self._connected = True
+        self._client = client
+
+    def connect(self) -> List[str]:
+        self._connected = True
+        return list(ALL_TOOLS)
+
+    def close(self) -> None:
+        self._connected = False
+
+    def list_tools(self) -> List[str]:
+        return list(ALL_TOOLS)
+
+    def is_tool_registered(self, tool_name: str) -> bool:
+        return tool_name in ALL_TOOLS
+
+    def call_tool(
+        self,
+        tool_name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        context: Optional[RequestContext] = None,
+    ) -> Dict[str, Any]:
+        if not self._connected:
+            raise RuntimeError("InMemoryMCPClient is closed.")
+        ctx = context or current_request_context.get()
+        if ctx is None:
+            strict = os.environ.get("ERPNEXT_STRICT_IDENTITY", "true").strip().lower() in ("true", "1")
+            allow_mock = os.environ.get("ALLOW_DEV_MOCK_AUTH", "false").strip().lower() in ("true", "1")
+            if not strict and allow_mock:
+                ctx = get_default_context()
+            else:
+                raise ERPNextConfigError(
+                    "No active RequestContext found. InMemoryMCPClient requires an active "
+                    "request context when ERPNEXT_STRICT_IDENTITY is enabled."
+                )
+        token = current_request_context.set(ctx)
+        try:
+            return dispatch_tool(tool_name, arguments or {}, ctx, client=self._client)
+        finally:
+            current_request_context.reset(token)
+
+
 async def run_stdio(
     server: Optional[Server] = None,
     default_context: Optional[RequestContext] = None,
@@ -559,7 +623,45 @@ async def run_stdio(
 ) -> None:
     """
     Run MCP server using STDIO transport.
+    Refuses to start unless an explicit read-only service credential is configured.
+    STDIO transport is never writable.
     """
+    if default_context is not None and not default_context.read_only:
+        raise RuntimeError("STDIO transport is never writable: read_only must be True.")
+
+    creds = None
+    if client is not None and getattr(client, "_credentials", None) is not None:
+        creds = client._credentials
+    elif default_context is not None and default_context.credentials is not None:
+        creds = default_context.credentials
+    else:
+        try:
+            from mcp_erpnext.client import get_env_credentials
+            creds = get_env_credentials()
+        except Exception:
+            creds = None
+
+    if creds is None:
+        raise RuntimeError(
+            "STDIO transport refuses to start: no explicit read-only service credential configured. "
+            "Provide credentials in default_context, a configured client, or environment service credentials."
+        )
+
+    if default_context is None:
+        default_context = RequestContext(
+            user_id="stdio_service",
+            roles=("System Manager",),
+            credentials=creds,
+            read_only=True,
+        )
+    elif default_context.credentials is None:
+        default_context = RequestContext(
+            user_id=default_context.user_id,
+            roles=default_context.roles,
+            credentials=creds,
+            read_only=True,
+        )
+
     if server is None:
         server = create_server(default_context=default_context, client=client)
 
@@ -638,6 +740,9 @@ def main() -> None:
     )
 
     if args.transport == "stdio":
+        if read_only is False:
+            logger.error("STDIO transport is never writable: read_only must be True.")
+            sys.exit(1)
         asyncio.run(run_stdio(default_context=default_context))
     else:
         secret = resolve_jwt_secret()
