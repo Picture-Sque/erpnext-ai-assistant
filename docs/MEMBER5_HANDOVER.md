@@ -129,6 +129,36 @@ Fields of `RequestContext` (`@dataclass(frozen=True)` in `mcp_erpnext/auth.py:26
 
 ---
 
+### Open Decision D1 Resolution
+
+**Context:** The existing `generic_tools.py` functions are called by 22 YAML skills and LangGraph workflow nodes without any `client` argument, and their function signatures and return envelopes could not be modified without breaking skills.
+**Resolution:** Member 5 introduced a request-scoped Python `contextvars.ContextVar` (`current_request_context` in `mcp_erpnext/auth.py`), set at the request boundary in `agent/main.py`. Both `mcp_erpnext.client.ERPNextClient` and `mcp_erpnext.server.InMemoryMCPClient` read this active context automatically.
+**Result:** All 22 YAML skills and `generic_tools` function signatures remain 100% unchanged, while per-user credentials and read-only status transparently govern all underlying ERPNext REST transport calls.
+
+---
+
+### Desk Widget & `useDemoChat.ts` Compatibility
+
+`frontend/src/hooks/useDemoChat.ts` required **zero code changes** for per-user identity:
+1. **Contract Unchanged:** `useDemoChat.ts` requests a JWT by calling Frappe's whitelisted endpoint `ai_assistant.ai_assistant.api.get_chat_token`, expecting a response payload containing `{ "message": { "token": "<jwt>" } }`.
+2. **Backwards Compatibility:** In `ai_assistant/ai_assistant/api.py:106`, `get_chat_token()` is an alias for `get_auth_token()`. The encrypted session credentials (`sid` and `csrf_token`) are packed inside the JWT's `ctx` claim, completely transparent to the React frontend.
+3. **Automatic Refresh on 401:** `useDemoChat.ts` natively listens for HTTP 401 responses and triggers a one-time token refresh by re-calling `get_chat_token`, ensuring that when a session expires, the widget attempts to refresh gracefully.
+
+---
+
+### CORS Architecture & Decision
+
+1. **Agent Service Gateway (`agent/main.py`):**
+   - Configured via `CORS_ALLOWED_ORIGINS` (comma-separated, whitespace-trimmed).
+   - **Fail-Closed by Default:** If `CORS_ALLOWED_ORIGINS` is unset, no cross-origin requests are allowed (empty origin allowlist), except localhost origins when `ALLOW_DEV_MOCK_AUTH` is explicitly enabled.
+   - **Wildcard Refusal:** Wildcard `"*"` is strictly disallowed when `allow_credentials=True`. Any `"*"` entry in `CORS_ALLOWED_ORIGINS` is dropped with a logged security warning.
+   - **Restricted Methods & Headers:** Methods are restricted to what the widget and agent API use (`["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]`). Headers are restricted to `["Authorization", "Content-Type"]`.
+2. **Frappe Side CORS Configuration:**
+   - The assistant app does not touch Frappe CORS.
+   - *Note:* The assertion that Frappe reads `allow_cors` from `site_config.json` is a standard Frappe framework capability, but is marked **[UNVERIFIED]** for custom headers on this specific bench instance.
+
+---
+
 ### Status of `require_writable()` and Write Routing
 
 The five write functions in `mcp_erpnext/crud.py` are:
@@ -141,6 +171,11 @@ The five write functions in `mcp_erpnext/crud.py` are:
 **Audit Status**:
 - `require_writable()` is **NOT** called in `mcp_erpnext/crud.py` at all.
 - Neither Member 3 nor Member 4 inserted `require_writable()` into `crud.py`.
+- **Effect on Error Envelopes**:
+  - When `read_only=True`, calling `crud.py` write operations triggers `ERPNextClient._send()` transport check, which raises `ReadOnlySessionError`.
+  - Because `crud.py` catches generic exceptions, it maps `ReadOnlySessionError` to `{"status": "system_error", "message": "Operation failed: Session is read-only..."}` instead of `{"status": "error", "error": "permission_denied"}`.
+  - However, the server policy layer (`mcp_erpnext.server.dispatch_tool` and `mcp_erpnext.policy`) still blocks writes over MCP with `permission_denied`.
+  - **Action Required for Owners:** Member 3 (`crud.py`) and Member 4 (`adapter.py`) must be informed to add `require_writable()` to `crud.py` write functions or route writes through MCP policy. Member 5 leaves these files untouched.
 - **Adapter Routing**: In `agent/tools/adapter.py:352-365`, all five write methods call `generic_tools.<func>` directly, completely bypassing MCP:
   ```python
   def create_document(self, doctype: str, fields: dict) -> dict:
@@ -201,15 +236,16 @@ The five write functions in `mcp_erpnext/crud.py` are:
 3. **No Key Rotation**: `CREDENTIAL_ENC_KEY` currently expects a single Fernet key; multiple simultaneous keys are unsupported.
 4. **Session Lifetime Coupling**: Access validity is bound to the Frappe web session. Logging out of ERPNext Desk terminates the session and invalidates subsequent agent requests with HTTP 401.
 5. **Library Defaults**: `ERPNEXT_STRICT_IDENTITY` defaults to `"false"` in the library code (`mcp_erpnext/client.py`) so that standalone non-request unit tests from other members do not break, and is set to `"true"` in `agent/.env.example`.
+6. **In-Process ContextVar Boundary**: Identity and per-user credentials pass through Python's `contextvars.ContextVar` for the in-process MCP client (`InMemoryMCPClient`) only. A remote external HTTP MCP backend would require `ToolAdapter` to forward the user JWT token explicitly in the HTTP `Authorization: Bearer <token>` header.
 
 ---
 
 ### Test Suite Baseline and .env Investigation
 
 Measured at commit `d9bd490` (HEAD):
-- **`agent/tests`**: **384 passed**, 0 failed (12.03s).
-- **`tests` (Root Suite)**: **478 passed**, **8 baseline failures with current local .env (see Part 2 breakdown below)** (6.89s).
-- New failures introduced by Member 5: **0**. All 9 new Part L unit tests in `tests/test_part_l_mcp_identity.py` pass.
+- **`agent/tests`**: **387 passed**, 0 failed.
+- **`tests` (Root Suite)**: **479 passed**, **8 baseline failures with current local .env (see Part 2 breakdown below)**.
+- New failures introduced by Member 5: **0**. All 10 Part L unit tests in `tests/test_part_l_mcp_identity.py` pass.
 
 #### Part 2 Breakdown: .env Dependence of the 8 Baseline Failures
 
