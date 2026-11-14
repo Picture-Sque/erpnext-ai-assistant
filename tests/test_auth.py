@@ -21,6 +21,11 @@ class TestAuth(unittest.TestCase):
 	def setUp(self):
 		self.secret = TEST_SECRET
 		self.algorithm = JWT_ALGORITHM
+		self._env_patch = patch.dict(os.environ, {"ALLOW_DEV_MOCK_AUTH": "false"})
+		self._env_patch.start()
+
+	def tearDown(self):
+		self._env_patch.stop()
 
 	def create_valid_token(self, user="testuser@example.com", full_name="Test User", roles=None):
 		if roles is None:
@@ -48,11 +53,10 @@ class TestAuth(unittest.TestCase):
 
 	def test_verify_token_missing_header(self):
 		async def run():
-			with patch.dict(os.environ, {"ALLOW_DEV_MOCK_AUTH": "false"}):
-				with self.assertRaises(HTTPException) as ctx:
-					await verify_token(authorization=None)
-				self.assertEqual(ctx.exception.status_code, 401)
-				self.assertIn("Missing Authorization header", ctx.exception.detail)
+			with self.assertRaises(HTTPException) as ctx:
+				await verify_token(authorization=None)
+			self.assertEqual(ctx.exception.status_code, 401)
+			self.assertIn("Missing Authorization header", ctx.exception.detail)
 		asyncio.run(run())
 
 	def test_verify_token_malformed_header(self):

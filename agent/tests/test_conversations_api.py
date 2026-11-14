@@ -21,6 +21,11 @@ import main
 SECRET = "conversations-api-test-secret-0123456789abcdef"
 
 
+@pytest.fixture(autouse=True)
+def force_disable_dev_mock_in_conversations(monkeypatch):
+    monkeypatch.setenv("ALLOW_DEV_MOCK_AUTH", "false")
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("JWT_SECRET", SECRET)
