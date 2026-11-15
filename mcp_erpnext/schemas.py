@@ -27,7 +27,9 @@ class GetListInput(BaseToolModel):
     """Input parameters for the get_list tool."""
 
     doctype: str = Field(..., min_length=1, description="The ERPNext DocType to query.")
-    filters: Optional[Dict[str, Any]] = Field(default=None, description="Field-value filter dictionary.")
+    filters: Optional[Union[Dict[str, Any], List[Any]]] = Field(
+        default=None, description="Field-value filter dictionary or list of filter expressions."
+    )
     fields: Optional[List[str]] = Field(default=None, description="List of field names to retrieve.")
     limit: Optional[int] = Field(default=None, ge=1, description="Maximum number of records to return.")
     order_by: Optional[str] = Field(default=None, min_length=1, description="Sort order expression.")
@@ -59,7 +61,9 @@ class GetCountInput(BaseToolModel):
     """Input parameters for the get_count tool."""
 
     doctype: str = Field(..., min_length=1, description="The ERPNext DocType to count records in.")
-    filters: Optional[Dict[str, Any]] = Field(default=None, description="Optional filter dictionary.")
+    filters: Optional[Union[Dict[str, Any], List[Any]]] = Field(
+        default=None, description="Optional filter dictionary or list of expressions."
+    )
 
 
 class AggregateInput(BaseToolModel):
@@ -71,7 +75,9 @@ class AggregateInput(BaseToolModel):
     aggregation_fn: Literal["sum", "avg", "count", "max", "min"] = Field(
         ..., description="Aggregation function: sum, avg, count, max, or min."
     )
-    filters: Optional[Dict[str, Any]] = Field(default=None, description="Optional filter dictionary.")
+    filters: Optional[Union[Dict[str, Any], List[Any]]] = Field(
+        default=None, description="Optional filter dictionary or list of expressions."
+    )
     sort: Optional[str] = Field(default=None, min_length=1, description="Sort specification (metric or group).")
     limit: Optional[int] = Field(default=None, ge=0, description="Maximum number of aggregate groups to return.")
     parent_doctype: Optional[str] = Field(default=None, min_length=1, description="Parent DocType if aggregating child table.")

@@ -186,7 +186,7 @@ class ToolAdapter:
 
         # Route through MCP
         args: Dict[str, Any] = {"doctype": doctype}
-        if filters is not None:
+        if filters:
             args["filters"] = filters
         if fields is not None:
             args["fields"] = fields

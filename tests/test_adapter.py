@@ -208,6 +208,27 @@ class TestToolAdapter(unittest.TestCase):
             self.assertEqual(adapter.get_allowed_doctypes(), ["Item", "Customer"])
             mock_gad.assert_called_once()
 
+    def test_get_list_filters_empty_list_and_list_of_expressions(self):
+        """Verify adapter handles filters=[] (omitted) and filters=[[col, op, val]] in MCP mode."""
+        mock_client = MagicMock()
+        mock_client.call_tool.return_value = {"status": "success", "data": [], "success": True}
+        adapter = ToolAdapter(backend="mcp", mcp_client=mock_client)
+        adapter._mcp_initialized = True
+
+        # 1. filters=[] should be omitted from MCP call arguments to avoid passing empty list
+        res1 = adapter.get_list("Customer", filters=[])
+        mock_client.call_tool.assert_called_with("get_list", {"doctype": "Customer", "offset": 0})
+        self.assertEqual(res1["status"], "success")
+
+        # 2. filters=[["status", "=", "Draft"]] should be forwarded to MCP client
+        list_filters = [["status", "=", "Draft"]]
+        res2 = adapter.get_list("Sales Order", filters=list_filters)
+        mock_client.call_tool.assert_called_with(
+            "get_list",
+            {"doctype": "Sales Order", "filters": list_filters, "offset": 0},
+        )
+        self.assertEqual(res2["status"], "success")
+
 
 if __name__ == "__main__":
     unittest.main()

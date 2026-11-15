@@ -45,6 +45,14 @@ class TestGetListSchema(unittest.TestCase):
         self.assertEqual(m.offset, 0)
         self.assertFalse(m.include_total)
 
+    def test_valid_filters_list_and_empty_list(self):
+        """Verify GetListInput accepts empty list and list of filter expressions."""
+        m_empty = GetListInput(doctype="CustomDoc", filters=[])
+        self.assertEqual(m_empty.filters, [])
+
+        m_list = GetListInput(doctype="CustomDoc", filters=[["status", "=", "Draft"]])
+        self.assertEqual(m_list.filters, [["status", "=", "Draft"]])
+
     def test_valid_full(self):
         m = GetListInput(
             doctype="CustomDoc",
