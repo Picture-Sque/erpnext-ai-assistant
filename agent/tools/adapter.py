@@ -21,6 +21,11 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from mcp_erpnext.auth import get_request_context, RequestContext
+from mcp_erpnext.client import is_strict_identity
+from mcp_erpnext.errors import ERPNextConfigError
+from mcp_erpnext.server import InMemoryMCPClient
+
 try:
     from agent.tools import generic_tools
     from agent.tools.mcp_client import (
@@ -98,11 +103,12 @@ class ToolAdapter:
     def __init__(
         self,
         backend: Optional[str] = None,
-        mcp_client: Optional[ERPNextMCPClient] = None,
+        mcp_client: Optional[Any] = None,
     ):
         self._backend = resolve_backend(backend)
         self._mcp_client = mcp_client
         self._mcp_initialized = False
+        self._in_memory_client: Optional[InMemoryMCPClient] = None
 
     @property
     def backend(self) -> str:
@@ -120,14 +126,35 @@ class ToolAdapter:
         """Dynamically update backend for testing or runtime reconfiguration."""
         self._backend = resolve_backend(backend)
 
-    def _get_mcp_client(self) -> ERPNextMCPClient:
-        """Lazily initialize MCPClient when backend is 'mcp'."""
-        if self._mcp_client is None:
-            self._mcp_client = ERPNextMCPClient()
-        if not self._mcp_initialized:
-            self._mcp_client.connect()
-            self._mcp_initialized = True
-        return self._mcp_client
+    def _get_mcp_client(self) -> Any:
+        """
+        Lazily initialize MCPClient when backend is 'mcp'.
+        If an explicit client was provided, use it.
+        Otherwise, default to in-process InMemoryMCPClient preserving user context.
+        Fails closed if no active RequestContext exists for chat tool execution.
+        """
+        if self._mcp_client is not None:
+            if not self._mcp_initialized:
+                if hasattr(self._mcp_client, "connect"):
+                    self._mcp_client.connect()
+                self._mcp_initialized = True
+            return self._mcp_client
+
+        ctx = get_request_context()
+        if ctx is None:
+            allow_mock = os.getenv("ALLOW_DEV_MOCK_AUTH", "false").strip().lower() in ("true", "1")
+            strict = is_strict_identity(default=False)
+            if not strict and allow_mock:
+                from mcp_erpnext.server import get_default_context
+                ctx = get_default_context()
+            else:
+                raise ERPNextConfigError(
+                    "Strict identity enforcement: no active user RequestContext found for chat tool execution."
+                )
+
+        if self._in_memory_client is None:
+            self._in_memory_client = InMemoryMCPClient()
+        return self._in_memory_client
 
     def close(self) -> None:
         """Cleanly close any active MCP client resources."""
@@ -137,6 +164,46 @@ class ToolAdapter:
             except Exception as exc:
                 logger.debug("Error closing MCP client in adapter: %s", exc)
             self._mcp_initialized = False
+        if self._in_memory_client is not None:
+            try:
+                self._in_memory_client.close()
+            except Exception as exc:
+                logger.debug("Error closing in-memory client in adapter: %s", exc)
+            self._in_memory_client = None
+
+    def _invoke_mcp(self, tool_name: str, args: Dict[str, Any], doctype: str = "") -> dict:
+        """
+        Invoke an MCP tool with structured lifecycle logging and typed error envelope handling.
+        """
+        ctx = get_request_context()
+        user_id = ctx.user_id if ctx and ctx.user_id else "unknown"
+        transport = "stdio" if self._mcp_client is not None else "in-process"
+        logger.info("MCP call: tool=%s, user_id=%s, transport=%s", tool_name, user_id, transport)
+
+        try:
+            client = self._get_mcp_client()
+            res = client.call_tool(tool_name, args)
+            status = res.get("status") if isinstance(res, dict) else "unknown"
+            logger.info("MCP call completed: tool=%s, status=%s", tool_name, status)
+            if isinstance(res, dict) and status in ("permission_denied", "error"):
+                reason = res.get("error") or res.get("message") or "policy_denied"
+                logger.warning(
+                    "MCP policy denial: tool=%s, user_id=%s, reason=%s",
+                    tool_name,
+                    user_id,
+                    mask_sensitive(str(reason)),
+                )
+            return res
+        except Exception as exc:
+            clean_err = mask_sensitive(str(exc))
+            logger.error("MCP %s failed for %s: %s", tool_name, doctype, clean_err)
+            return {
+                "status": "system_error",
+                "success": False,
+                "data": None,
+                "error": f"MCP execution failed: {clean_err}",
+                "has_more": False,
+            }
 
     # -------------------------------------------------------------------------
     # Supporting helpers (always direct to preserve local logic and resolution)
@@ -205,19 +272,7 @@ class ToolAdapter:
         if or_filters is not None:
             args["or_filters"] = or_filters
 
-        try:
-            client = self._get_mcp_client()
-            return client.call_tool("get_list", args)
-        except Exception as exc:
-            clean_err = mask_sensitive(str(exc))
-            logger.error("MCP get_list failed for %s: %s", doctype, clean_err)
-            return {
-                "status": "system_error",
-                "success": False,
-                "data": None,
-                "error": f"MCP execution failed: {clean_err}",
-                "has_more": False,
-            }
+        return self._invoke_mcp("get_list", args, doctype)
 
     def get_document(self, doctype: str, name: str, *, verification: Optional[bool] = None) -> dict:
         """
@@ -232,19 +287,7 @@ class ToolAdapter:
         if is_verification or self._backend == "direct":
             return generic_tools.get_document(doctype=doctype, name=name)
 
-        try:
-            client = self._get_mcp_client()
-            return client.call_tool("get_document", {"doctype": doctype, "name": name})
-        except Exception as exc:
-            clean_err = mask_sensitive(str(exc))
-            logger.error("MCP get_document failed for %s '%s': %s", doctype, name, clean_err)
-            return {
-                "status": "system_error",
-                "success": False,
-                "data": None,
-                "error": f"MCP execution failed: {clean_err}",
-                "has_more": False,
-            }
+        return self._invoke_mcp("get_document", {"doctype": doctype, "name": name}, doctype)
 
     def get_document_direct(self, doctype: str, name: str) -> dict:
         """Explicitly direct read for write-verification in result_validation_node."""
@@ -254,22 +297,11 @@ class ToolAdapter:
         if self._backend == "direct":
             return generic_tools.search_document(doctype=doctype, query=query, limit=limit)
 
-        try:
-            client = self._get_mcp_client()
-            return client.call_tool(
-                "search_document",
-                {"doctype": doctype, "query": query, "limit": limit},
-            )
-        except Exception as exc:
-            clean_err = mask_sensitive(str(exc))
-            logger.error("MCP search_document failed for %s '%s': %s", doctype, query, clean_err)
-            return {
-                "status": "system_error",
-                "success": False,
-                "data": None,
-                "error": f"MCP execution failed: {clean_err}",
-                "has_more": False,
-            }
+        return self._invoke_mcp(
+            "search_document",
+            {"doctype": doctype, "query": query, "limit": limit},
+            doctype,
+        )
 
     def get_count(self, doctype: str, filters: Optional[dict] = None) -> dict:
         if self._backend == "direct":
@@ -279,19 +311,7 @@ class ToolAdapter:
         if filters is not None:
             args["filters"] = filters
 
-        try:
-            client = self._get_mcp_client()
-            return client.call_tool("get_count", args)
-        except Exception as exc:
-            clean_err = mask_sensitive(str(exc))
-            logger.error("MCP get_count failed for %s: %s", doctype, clean_err)
-            return {
-                "status": "system_error",
-                "success": False,
-                "data": None,
-                "error": f"MCP execution failed: {clean_err}",
-                "has_more": False,
-            }
+        return self._invoke_mcp("get_count", args, doctype)
 
     def aggregate(
         self,
@@ -331,37 +351,58 @@ class ToolAdapter:
         if parent_doctype is not None:
             args["parent_doctype"] = parent_doctype
 
-        try:
-            client = self._get_mcp_client()
-            return client.call_tool("aggregate", args)
-        except Exception as exc:
-            clean_err = mask_sensitive(str(exc))
-            logger.error("MCP aggregate failed for %s: %s", doctype, clean_err)
-            return {
-                "status": "system_error",
-                "success": False,
-                "data": None,
-                "error": f"MCP execution failed: {clean_err}",
-                "has_more": False,
-            }
+        return self._invoke_mcp("aggregate", args, doctype)
 
     # -------------------------------------------------------------------------
     # Write operations (MUST ALWAYS REMAIN DIRECT - NEVER ROUTED TO MCP)
     # -------------------------------------------------------------------------
 
+    def _check_read_only_write(self, tool_name: str) -> Optional[dict]:
+        ctx = get_request_context()
+        if ctx is not None and getattr(ctx, "read_only", False):
+            user_id = ctx.user_id or "unknown"
+            logger.warning(
+                "MCP read-only write blocked: tool=%s, user_id=%s, reason=read_only_session",
+                tool_name,
+                user_id,
+            )
+            return {
+                "status": "permission_denied",
+                "success": False,
+                "data": None,
+                "error": f"Write tool '{tool_name}' is denied because request context is read-only.",
+                "has_more": False,
+            }
+        return None
+
     def create_document(self, doctype: str, fields: dict) -> dict:
+        blocked = self._check_read_only_write("create_document")
+        if blocked is not None:
+            return blocked
         return generic_tools.create_document(doctype=doctype, fields=fields)
 
     def update_document(self, doctype: str, name: str, fields: dict) -> dict:
+        blocked = self._check_read_only_write("update_document")
+        if blocked is not None:
+            return blocked
         return generic_tools.update_document(doctype=doctype, name=name, fields=fields)
 
     def delete_document(self, doctype: str, name: str) -> dict:
+        blocked = self._check_read_only_write("delete_document")
+        if blocked is not None:
+            return blocked
         return generic_tools.delete_document(doctype=doctype, name=name)
 
     def cancel_document(self, doctype: str, name: str) -> dict:
+        blocked = self._check_read_only_write("cancel_document")
+        if blocked is not None:
+            return blocked
         return generic_tools.cancel_document(doctype=doctype, name=name)
 
     def submit_document(self, doctype: str, name: str) -> dict:
+        blocked = self._check_read_only_write("submit_document")
+        if blocked is not None:
+            return blocked
         return generic_tools.submit_document(doctype=doctype, name=name)
 
 

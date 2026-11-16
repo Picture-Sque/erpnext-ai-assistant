@@ -35,7 +35,7 @@ from starlette.types import Receive, Scope, Send
 
 from mcp_erpnext import crud
 from mcp_erpnext import reports
-from mcp_erpnext.client import Credentials, ERPNextClient
+from mcp_erpnext.client import Credentials, ERPNextClient, is_strict_identity
 from mcp_erpnext.errors import ERPNextConfigError, ERPNextError
 from mcp_erpnext.auth import (
     current_request_context,
@@ -600,7 +600,7 @@ class InMemoryMCPClient:
             raise RuntimeError("InMemoryMCPClient is closed.")
         ctx = context or current_request_context.get()
         if ctx is None:
-            strict = os.environ.get("ERPNEXT_STRICT_IDENTITY", "true").strip().lower() in ("true", "1")
+            strict = is_strict_identity(default=True)
             allow_mock = os.environ.get("ALLOW_DEV_MOCK_AUTH", "false").strip().lower() in ("true", "1")
             if not strict and allow_mock:
                 ctx = get_default_context()
@@ -653,6 +653,7 @@ async def run_stdio(
             roles=("System Manager",),
             credentials=creds,
             read_only=True,
+            is_service=True,
         )
     elif default_context.credentials is None:
         default_context = RequestContext(
@@ -660,6 +661,7 @@ async def run_stdio(
             roles=default_context.roles,
             credentials=creds,
             read_only=True,
+            is_service=True,
         )
 
     if server is None:

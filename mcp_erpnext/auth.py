@@ -36,6 +36,7 @@ class RequestContext:
     read_only: bool = True
     request_id: Optional[str] = None
     dev_mock: bool = False
+    is_service: bool = False
     _session_expired_flag: list = field(default_factory=lambda: [False], repr=False, init=False)
 
     def __init__(
@@ -50,6 +51,7 @@ class RequestContext:
         request_id: Optional[str] = None,
         credential: Optional[Any] = None,
         dev_mock: bool = False,
+        is_service: bool = False,
         _session_expired_flag: Optional[Any] = None,
     ) -> None:
         if credential is not None and credentials is None:
@@ -69,6 +71,7 @@ class RequestContext:
         object.__setattr__(self, "is_guest", bool(is_guest))
         object.__setattr__(self, "credentials", credentials)
         object.__setattr__(self, "dev_mock", bool(dev_mock))
+        object.__setattr__(self, "is_service", bool(is_service))
         flag = _session_expired_flag if _session_expired_flag is not None else [False]
         object.__setattr__(self, "_session_expired_flag", flag)
 

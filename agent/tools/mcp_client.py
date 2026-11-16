@@ -20,6 +20,9 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from mcp_erpnext.auth import get_request_context
+from mcp_erpnext.errors import ERPNextConfigError
+
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -264,6 +267,14 @@ class ERPNextMCPClient:
         Preserves existing response envelopes ({status, data, error, has_more, success})
         and pagination metadata ({total_count, offset, limit, truncated}).
         """
+        # Guard: refuse whenever a user RequestContext is active, regardless of ERPNEXT_STRICT_IDENTITY
+        ctx = get_request_context()
+        if ctx is not None and not getattr(ctx, "is_service", False) and not getattr(ctx, "dev_mock", False):
+            raise ERPNextConfigError(
+                "ERPNextMCPClient (STDIO) refuses to execute user request: active user RequestContext "
+                "cannot be served by subprocess service credentials."
+            )
+
         if not self._connected:
             self.connect()
 

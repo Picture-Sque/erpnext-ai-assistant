@@ -11,6 +11,17 @@ logger = logging.getLogger("mcp_erpnext")
 READ_ONLY_POST_ALLOWLIST: Set[str] = set()
 
 
+def is_strict_identity(default: bool = False) -> bool:
+    """
+    Unified helper to determine if ERPNEXT_STRICT_IDENTITY is enabled.
+    Accepts explicit default (False for library client, True for chat runtime).
+    """
+    val = os.getenv("ERPNEXT_STRICT_IDENTITY")
+    if val is None or not str(val).strip():
+        return default
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
 def _normalize_request_path(path: str) -> str:
     """
     Normalizes request path and verifies there are no traversal, double-slashes,
@@ -39,11 +50,13 @@ class Credentials:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         auth_headers: Optional[Dict[str, str]] = None,
+        is_service: bool = False,
     ):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key
         self.api_secret = api_secret
         self._custom_headers = auth_headers
+        self.is_service = is_service
 
     def get_headers(self) -> Dict[str, str]:
         if self._custom_headers is not None:
@@ -83,7 +96,7 @@ def get_env_credentials() -> Credentials:
             "ERPNext credentials not configured. Set ERPNEXT_API_KEY and ERPNEXT_API_SECRET or provide Credentials."
         )
 
-    return Credentials(base_url=base_url, api_key=api_key, api_secret=api_secret)
+    return Credentials(base_url=base_url, api_key=api_key, api_secret=api_secret, is_service=True)
 
 
 class ERPNextClient:
@@ -99,8 +112,21 @@ class ERPNextClient:
     def get_credentials(self) -> Credentials:
         if self._credentials is not None:
             return self._credentials
+
         ctx = get_request_context()
+        strict = is_strict_identity(default=False)
+
         if ctx is not None:
+            # Check if context or its credentials are explicitly marked as service credentials
+            is_svc = getattr(ctx, "is_service", False) or getattr(getattr(ctx, "credentials", None), "is_service", False)
+            if is_svc:
+                if strict:
+                    raise ERPNextConfigError(
+                        "Strict identity enforcement enabled: tool execution requires an authenticated "
+                        "per-user session or agent token. Shared service credentials are prohibited."
+                    )
+                return ctx.credentials
+
             if ctx.credentials is not None:
                 return ctx.credentials
             if getattr(ctx, "dev_mock", False):
@@ -109,7 +135,6 @@ class ERPNextClient:
                 f"No per-user credentials available in request context for user '{ctx.user_id}'."
             )
 
-        strict = os.getenv("ERPNEXT_STRICT_IDENTITY", "false").lower() in ("true", "1", "yes")
         if strict:
             raise ERPNextConfigError(
                 "No request context is active and ERPNEXT_STRICT_IDENTITY is enabled."
