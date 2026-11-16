@@ -444,3 +444,22 @@ Notes from Member 1:
 ## 9. First milestone
 
 A secure, read-only MCP integration working with the existing chatbot: the chatbot keeps working; LangGraph retrieves ERPNext data through MCP; existing skills are unchanged; unauthorized tools are rejected; external agents cannot write; direct mode remains available for rollback; per-user identity is verified before external exposure.
+
+## 10. Chat MCP Identity Fix and Handover to Member 6
+
+### Identity Leak, Cause, and Resolution
+Live testing revealed that with `TOOL_BACKEND=mcp`, chat reads by a restricted user returned all customer records. This occurred because `ToolAdapter` spawned an `ERPNextMCPClient` (STDIO subprocess) that inherited environment service credentials and executed as `System Manager`, bypassing ERPNext User Permissions. The fix routes chat reads through the MCP tool and policy layer in-process with the caller's active `RequestContext`, ensuring the user's session cookie is forwarded directly. Additionally, the STDIO client now refuses to run whenever an active user context is present, and service credentials are explicitly flagged (`is_service`) and blocked under strict identity.
+
+### Architecture & Terminology
+- **Chat Reads**: Use the MCP tool and policy layer in-process per user (via `InMemoryMCPClient` and `dispatch_tool()`), preserving request-scoped user credentials and permissions.
+- **External Agents**: Communicate via the real MCP protocol over HTTP with per-request JWT validation.
+
+### Open Items & Technical Debt
+1. **`ERPNEXT_STRICT_IDENTITY` default & single helper**: Align on whether the unified helper should default to strict mode across all modules once legacy test dependencies are reviewed.
+2. **`require_writable()` in `crud.py`**: Explicitly enforce write-context barriers in `crud.py` for direct and MCP write operations.
+3. **HTTP Server Forwarding Option**: Investigate future architectural option for the chatbot to call the MCP HTTP server directly and forward the user's JWT/session token over the wire rather than in-process dispatch.
+4. **Dev-mock fallback in adapter**: Clean up or deprecate the `ALLOW_DEV_MOCK_AUTH` fallback in `ToolAdapter._get_mcp_client()` for stricter production invariants.
+5. **Concurrency Test Duration**: Optimize the 50-iteration concurrent test in `tests/test_adapter_mcp_identity.py` (currently ~19s) to reduce total CI/test suite runtime.
+
+### Member 6 Test Requirement
+- The two-user permission check must be executed and verified under both `TOOL_BACKEND=direct` and `TOOL_BACKEND=mcp` to ensure strict permission parity across backends.
