@@ -155,6 +155,40 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 
 
+WRITE_REGISTRY["Quotation"] = {
+    # The customer is stored in party_name (with quotation_to = "Customer"), but the skill asks
+    # the user for the "customer", so the duplicate check reads that slot.
+    "duplicate_keys": ["party_name"],
+    "duplicate_slots": {"party_name": "customer"},
+    "operations": {
+        "create": {
+            "roles": _roles("Sales User", "Sales Manager"),
+            "fields": ["quotation_to", "party_name", "company", "transaction_date", "valid_till", "items"],
+            "child_fields": {"items": ["item_code", "qty", "rate"]},
+            "date_fields": ["transaction_date", "valid_till"],
+        },
+        "update": {
+            "roles": _roles("Sales User", "Sales Manager"),
+            "fields": ["valid_till", "item_updates"],
+            "child_fields": {"item_updates": ["item_code", "qty", "rate"]},
+            "date_fields": ["valid_till"],
+            "row_edits": {
+                "item_updates": {
+                    "table": "items",
+                    "match_on": "item_code",
+                    "positive": ["qty"],
+                    "non_negative": ["rate"],
+                },
+            },
+            "draft_only": ["item_updates"],
+            "confirm": ["item_updates"],
+        },
+        "submit": {"roles": _roles("Sales Manager")},
+        "cancel": {"roles": _roles("Sales Manager")},
+    },
+}
+
+
 def get_write_registry() -> Dict[str, Dict[str, Any]]:
     """The active registry. Read through this function so tests can substitute it."""
     return WRITE_REGISTRY
@@ -215,6 +249,18 @@ def get_duplicate_keys(doctype: Any) -> List[str]:
     if not isinstance(keys, (list, tuple)):
         return []
     return [k for k in keys if isinstance(k, str) and k]
+
+
+def get_duplicate_slot(doctype: Any, key: str) -> str:
+    """
+    The conversation slot that holds the value of duplicate key `key`. It is the key itself
+    unless the registry maps it (a Quotation's party_name is asked for as the "customer").
+    """
+    spec = get_write_spec(doctype)
+    slots = spec.get("duplicate_slots") if spec else None
+    if isinstance(slots, dict) and isinstance(slots.get(key), str) and slots[key]:
+        return slots[key]
+    return key
 
 
 def get_operation_roles(doctype: Any, operation: Any) -> List[str]:
@@ -609,11 +655,19 @@ def validate_write_skill(skill: Dict[str, Any]) -> List[str]:
     if operation in ("create", "update"):
         allowed = set(get_writable_fields(doctype, operation))
         declared = set(skill.get("required_fields") or []) | set(skill.get("optional_fields") or [])
-        mappings = (skill.get("payload_structure") or {}).get("field_mappings") or {}
-        if operation == "create":
-            declared |= {k for k in mappings if isinstance(k, str)}
+        payload_structure = skill.get("payload_structure") or {}
+        mappings = payload_structure.get("field_mappings") or {}
         declared |= set(skill.get("require_any_of") or [])
         declared -= {"name", "id", "filters"}
+        if operation == "create":
+            # A create builds its payload from `fixed` and `field_mappings` ({document field: slot}),
+            # so the slot a user is asked for may have another name than the field it fills
+            # (a Quotation's "customer" slot fills party_name). What must be writable is the
+            # document field each slot lands in, and every field the payload sets.
+            slot_to_field = {slot: field for field, slot in mappings.items() if isinstance(field, str) and isinstance(slot, str)}
+            declared = {slot_to_field.get(slot, slot) for slot in declared}
+            declared |= {k for k in mappings if isinstance(k, str)}
+            declared |= {k for k in (payload_structure.get("fixed") or {}) if isinstance(k, str)}
         undeclared = sorted(declared - allowed)
         if undeclared:
             problems.append(

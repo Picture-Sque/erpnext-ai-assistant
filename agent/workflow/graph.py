@@ -71,6 +71,7 @@ from mcp_erpnext.write_registry import (
     get_date_fields,
     get_draft_only_fields,
     get_duplicate_keys,
+    get_duplicate_slot,
     get_operation_roles,
     get_row_edits,
     get_row_sync,
@@ -2103,8 +2104,13 @@ def precondition_validation_node(state: AgentState):
             # Build filters from the most important collected fields
             # The fields that identify a likely duplicate come from the write registry,
             # so every registered doctype gets the check, not only one with a customer.
-            idem_keys = [k for k in get_duplicate_keys(doctype) if collected.get(k)]
-            idem_filters = [[k, "=", collected[k]] for k in idem_keys]
+            # A key may be asked for under another name than the field it filters on (a
+            # Quotation's party_name is the "customer" the user named).
+            idem_pairs = [(k, get_duplicate_slot(doctype, k)) for k in get_duplicate_keys(doctype)]
+            idem_pairs = [(k, slot) for k, slot in idem_pairs if collected.get(slot)]
+            idem_keys = [k for k, _ in idem_pairs]
+            idem_slots = [slot for _, slot in idem_pairs]
+            idem_filters = [[k, "=", collected[slot]] for k, slot in idem_pairs]
 
             if idem_filters:
                 recent_result = get_list(
@@ -2148,7 +2154,7 @@ def precondition_validation_node(state: AgentState):
                         "failure_classification": "validation_error",
                         "final_response": (
                             f"A similar {doctype} was just created "
-                            f"({dup_names}) for the same {' and '.join(idem_keys)}. "
+                            f"({dup_names}) for the same {' and '.join(idem_slots)}. "
                             f"Proceed with creating another one?"
                         ),
                     }

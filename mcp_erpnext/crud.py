@@ -305,15 +305,16 @@ def create_document(
 
     payload = dict(fields)
 
-    # Dynamic default resolution for Sales Order and Purchase Order
-    if doctype in ("Sales Order", "Purchase Order"):
+    # Dynamic default resolution for Sales Order, Purchase Order and Quotation. A Quotation needs
+    # a company and a date but, unlike the orders, its item rows take no warehouse or row date.
+    if doctype in ("Sales Order", "Purchase Order", "Quotation"):
         try:
             if not payload.get("company"):
                 payload["company"] = comp_resolver()
 
             items = payload.get("items")
             default_wh = None
-            if isinstance(items, list) and any(isinstance(it, dict) and not it.get("warehouse") for it in items):
+            if doctype != "Quotation" and isinstance(items, list) and any(isinstance(it, dict) and not it.get("warehouse") for it in items):
                 default_wh = wh_resolver(payload.get("company"))
         except RuntimeError as e:
             err_msg = str(e)

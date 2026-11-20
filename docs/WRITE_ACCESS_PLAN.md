@@ -253,6 +253,33 @@ Still not verified live:
 - User Permissions that restrict by company, territory or similar. A create is only checked at doctype level, so such a restriction would be enforced by ERPNext at write time.
 - Item changes where the user names the product rather than its code.
 
+## 6f. Quotation (21 Nov 2026)
+
+The first new doctype after Sales Order and Purchase Order. Five skills: `create-quotation`, `update-quotation`, `submit-quotation`, `cancel-quotation` and a read-only `quotation-lookup` (without a lookup a user could not even view a quotation they had created).
+
+| Operation | Who | Notes |
+|---|---|---|
+| create | Sales User and up | for a customer, with items (code, quantity, optional rate), optional date and valid-till; saved as a Draft; a manager is offered "submit it now?" |
+| update | Sales User and up | the valid-till date, and quantity or rate of existing item rows (Draft only, always confirmed with old and new values); same rules as the orders |
+| submit | Sales Manager and up | always confirmed |
+| cancel | Sales Manager and up | always confirmed |
+| delete | nobody | not registered |
+
+What is different from the orders, all read from the live Frappe 16.24 definition rather than guessed:
+
+- The customer is stored in `party_name` with `quotation_to` set to `Customer`, but the user is asked for the "customer". The skill fixes `quotation_to`, maps the slot into `party_name`, and the registry maps the duplicate check back to the slot (`duplicate_slots`). Entity resolution of the customer and the items works unchanged.
+- A Quotation needs a company and a date on create. `crud.create_document` now resolves the company for a Quotation as it does for the orders, but adds no warehouse or row dates, because Quotation item rows take neither.
+- Item rows accept only item code, quantity and rate. A header date is not derived from the rows, so there is no row-date sync (`row_sync` is empty).
+- Only customers are supported as the party; a Quotation to a Lead is not.
+
+Behaviour added for this: the create-skill validation in the registry now accepts a slot that fills a differently named field, as long as the field it lands in (and every field the payload sets, including `fixed`) is writable.
+
+Live check (one throwaway Quotation, deleted afterwards, 16 of 16 passed): create with the skill's exact payload works with ERPNext filling in currency, price list, order type, item names and units; item edits keep rows by name and recalculate amounts and the total; a stale update, submit and cancel are each refused as a Conflict and change nothing; submit and cancel with the fresh version succeed; ERPNext itself refuses an item edit on a submitted quotation (the assistant stops it earlier with a clearer message); the quotation is readable through the normal read path.
+
+Tests: 51 at the registry and tool layers (`tests/test_quotation.py`), and 16 on the conversation flow and end to end through `/chat` (`agent/tests/test_quotation_flow.py`), including the submit offer for a manager and none for a Sales User, a Sales User refused on submit, a repeated create within a minute questioned, and a confirmed cancel. Both suites together: 792 and 590 passed, plus the 1 known failure.
+
+Not covered: turning a Quotation into a Sales Order (a mapped-document operation, Tier 2), listing quotations, and the checks listed as not verified in section 6e (pricing rules, company-level User Permissions, product names instead of codes).
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.
