@@ -61,6 +61,14 @@ except ImportError:
         get_default_warehouse,
     )
 
+from mcp_erpnext.write_registry import (
+    get_bulk_max_records,
+    get_duplicate_keys,
+    get_operation_roles,
+    sanitize_payload,
+    validate_write_skill,
+)
+
 logger = logging.getLogger("workflow_graph")
 logger.setLevel(logging.INFO)
 
@@ -139,7 +147,7 @@ def load_skills() -> List[Dict[str, Any]]:
                             inst = data.get("instructions") or parts[2].strip()
 
                             if name and desc:
-                                skills.append({
+                                loaded = {
                                     "name": name,
                                     "intent": data.get("intent", name),
                                     "description": desc,
@@ -167,7 +175,15 @@ def load_skills() -> List[Dict[str, Any]]:
                                     "field_values": data.get("field_values") or {},
                                     # Result fields later chain steps can reference; defaults to query_parameters.fields
                                     "outputs": data.get("outputs") or [],
-                                })
+                                }
+                                # A write skill may never declare more roles, fields or
+                                # operations than the write registry allows.
+                                problems = validate_write_skill(loaded)
+                                if problems:
+                                    for problem in problems:
+                                        logger.error(f"Write skill not loaded: {problem}")
+                                else:
+                                    skills.append(loaded)
                 except OSError as e:
                     logger.error(f"Failed to read skill {skill_md}; skill not loaded: {e}")
 
@@ -226,6 +242,32 @@ def _check_role_access(user_roles: List[str], skill: Dict[str, Any]) -> Tuple[bo
         f"required roles ({', '.join(allowed)}) for this action."
     )
     return False, reason
+
+
+# Keys a write skill's slot extraction may fill besides its declared fields: the record
+# reference, and the filter list that selects the targets of a bulk request.
+_WRITE_SLOT_EXTRAS = frozenset({"name", "id", "filters"})
+
+
+def _declared_slots(skill: Dict[str, Any]) -> set:
+    """Fields the skill declares (required and optional), plus the record reference slots."""
+    declared = set(skill.get("required_fields") or []) | set(skill.get("optional_fields") or [])
+    return declared | set(_WRITE_SLOT_EXTRAS)
+
+
+def _update_payload(skill: Dict[str, Any], collected: dict) -> Dict[str, Any]:
+    """
+    The fields an update sends to ERPNext: only those the skill declares AND the write
+    registry lists as writable for the doctype. Everything else collected from the
+    conversation (record reference, filters, notes, anything a model invented) stays out.
+    """
+    doctype = skill.get("doctype", "")
+    declared = _declared_slots(skill) - set(_WRITE_SLOT_EXTRAS)
+    picked = {k: v for k, v in (collected or {}).items() if k in declared}
+    clean, dropped = sanitize_payload(doctype, "update", picked)
+    if dropped:
+        logger.warning(f"[Write] Dropped undeclared update fields for {doctype}: {sorted(dropped)}")
+    return clean
 
 
 def _target_record_id(collected: dict, resolved_entities: dict) -> Optional[str]:
@@ -670,6 +712,14 @@ def collect_parameters_node(state: AgentState):
         )
 
         if res and isinstance(res, dict):
+            # For a write skill, only the fields it declares may enter the conversation
+            # state. A model (or text it was shown) cannot add fields the skill never asked for.
+            if _is_write_intent(skill):
+                allowed_slots = _declared_slots(skill)
+                ignored = sorted(k for k in res if k not in allowed_slots)
+                if ignored:
+                    logger.warning(f"[Collect] Ignoring undeclared fields {ignored} for write skill '{skill['name']}'")
+                res = {k: v for k, v in res.items() if k in allowed_slots}
             for k, v in res.items():
                 if v is not None and str(v).strip() != "" and v != "null":
                     if (is_continuation or chain_plan) and k in current_fields and current_fields.get(k):
@@ -1510,6 +1560,20 @@ def write_rbac_gate_node(state: AgentState):
 
     passed, reason = _check_role_access(user_roles, skill)
 
+    if passed:
+        # Writes fail closed. A write skill with no roles is not "open to everyone", and
+        # the write registry (the single source of truth for who may write what) must
+        # agree with the skill before anything is confirmed or executed.
+        registry_roles = get_operation_roles(doctype, operation)
+        if not skill.get("allowed_roles"):
+            passed, reason = False, "No roles are configured for this action."
+        elif not set(user_roles) & set(registry_roles):
+            passed = False
+            reason = (
+                f"Your role(s) ({', '.join(user_roles) or 'none'}) do not include any of the "
+                f"roles the write policy requires for this action ({', '.join(registry_roles) or 'none configured'})."
+            )
+
     if not passed:
         logger.warning(
             f"[Step 5] Write RBAC denied: operation='{operation}', doctype='{doctype}', "
@@ -1796,16 +1860,16 @@ def precondition_validation_node(state: AgentState):
         idempotency_check_performed = True
         try:
             # Build filters from the most important collected fields
-            idem_filters = []
-            customer_val = collected.get("customer")
-            if customer_val:
-                idem_filters.append(["customer", "=", customer_val])
+            # The fields that identify a likely duplicate come from the write registry,
+            # so every registered doctype gets the check, not only one with a customer.
+            idem_keys = [k for k in get_duplicate_keys(doctype) if collected.get(k)]
+            idem_filters = [[k, "=", collected[k]] for k in idem_keys]
 
             if idem_filters:
                 recent_result = get_list(
                     doctype,
                     filters=idem_filters,
-                    fields=["name", "creation", "customer"],
+                    fields=["name", "creation", *idem_keys],
                     limit=5,
                 )
                 recent_docs = recent_result.get("data") or []
@@ -1843,7 +1907,7 @@ def precondition_validation_node(state: AgentState):
                         "failure_classification": "validation_error",
                         "final_response": (
                             f"A similar {doctype} was just created "
-                            f"({dup_names}) for the same customer. "
+                            f"({dup_names}) for the same {' and '.join(idem_keys)}. "
                             f"Proceed with creating another one?"
                         ),
                     }
@@ -1973,6 +2037,12 @@ def confirmation_node(state: AgentState):
 
     # 3. Build the pending action
     if is_bulk:
+        if operation == "delete":
+            logger.warning(f"[Step 6] Bulk delete on {doctype} refused.")
+            return {
+                "failure_classification": "validation_error",
+                "final_response": "Deleting several records at once is not available from the assistant. Nothing was executed.",
+            }
         _LARGE_BULK_THRESHOLD = 50
         count_res = get_count(doctype, filters=filters)
         if count_res.get("status") == "permission_denied":
@@ -1995,6 +2065,17 @@ def confirmation_node(state: AgentState):
             return {
                 "failure_classification": "not_found",
                 "final_response": f"No matching {doctype} records found to {operation}.",
+            }
+
+        bulk_cap = get_bulk_max_records()
+        if affected_count > bulk_cap:
+            logger.warning(f"[Step 6] Bulk {operation} on {doctype} refused: {affected_count} records exceeds the limit of {bulk_cap}.")
+            return {
+                "failure_classification": "validation_error",
+                "final_response": (
+                    f"That would {operation} {affected_count} {doctype} records, and the limit for one request is {bulk_cap}. "
+                    f"Please narrow the request. Nothing was executed."
+                ),
             }
 
         list_res = get_list(doctype, filters=filters, fields=["name"], limit=5)
@@ -2257,10 +2338,24 @@ def call_generic_tool_node(state: AgentState):
                         else:
                             row[dk] = dv
 
+        # Only fields the write registry declares writable are sent. Extra keys a model
+        # added (to the document or to its item rows) are dropped and logged.
+        parameters, dropped = sanitize_payload(doctype_name, "create", parameters)
+        if dropped:
+            logger.warning(f"[Step 7] Dropped undeclared create fields for {doctype_name}: {sorted(dropped)}")
+
     elif tool == "update_document":
-        parameters = dict(collected)
-        parameters.pop("id", None)
-        parameters.pop("name", None)
+        parameters = _update_payload(skill, collected) if skill else {}
+        if not parameters:
+            msg = f"There is nothing to update: none of the requested fields can be changed on {doctype_name or 'this record'} through the assistant."
+            logger.warning(f"[Step 7] {msg}")
+            return {
+                "target_tool": tool,
+                "target_doctype": doctype_name,
+                "tool_raw_response": {"success": False, "data": None, "error": msg},
+                "failure_classification": "validation_error",
+                "final_response": msg,
+            }
 
     elif tool == "get_document":
         # For lookup skills using get_document: resolve record_id from collected fields.
@@ -2365,8 +2460,23 @@ def call_generic_tool_node(state: AgentState):
                     "error": f"Bulk operation aborted. Expected {expected_count} matching documents, but found {current_count}. The system state has changed since confirmation. Please try again."
                 }
             }
-            
-        list_res = get_list(doctype_name, filters=filters, fields=["name"], limit=999999)
+
+        bulk_cap = get_bulk_max_records()
+        if tool == "delete_document" or current_count > bulk_cap:
+            reason = (
+                "Deleting several records at once is not available from the assistant."
+                if tool == "delete_document"
+                else f"{current_count} records exceeds the limit of {bulk_cap} for one request."
+            )
+            logger.warning(f"[Step 7] Bulk {tool} on {doctype_name} aborted: {reason}")
+            return {
+                "target_tool": tool,
+                "target_doctype": doctype_name,
+                "tool_raw_response": {"success": False, "error": f"Bulk operation aborted. {reason}"},
+            }
+
+        # The count is already within the cap, so the read is bounded by it.
+        list_res = get_list(doctype_name, filters=filters, fields=["name"], limit=bulk_cap)
         targets = [str(r.get("name")) for r in list_res.get("data", []) if r.get("name")]
         
         successes = 0
@@ -2598,7 +2708,9 @@ def result_validation_node(state: AgentState):
                     doc = read_res.get("data", {})
                     if operation == "update":
                         write_verified = True
-                        for k, expected_val in collected.items():
+                        # Verify what was sent, not everything collected in the conversation.
+                        sent_fields = _update_payload(skill, collected) if skill else collected
+                        for k, expected_val in sent_fields.items():
                             if k in ("id", "name", "filters", "_auto_resolved_note"): continue
                             if k in doc and str(doc[k]) != str(expected_val):
                                 write_verified = False
