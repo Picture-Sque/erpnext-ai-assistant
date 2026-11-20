@@ -362,6 +362,30 @@ Tests: 50 at the registry and tool layers (`tests/test_item.py`) and 22 on the c
 
 Not covered: prices (a price-list change is a different, more sensitive operation), stock adjustments, disabling or deleting an item, variants, barcodes.
 
+## 6j. Tier 2, first slice: Quotation to Sales Order (21 Nov 2026)
+
+The first conversion: creating a document from another with ERPNext's own mapping method. One skill, `convert-quotation-to-sales-order`, one new write tool, `convert_document`, and a new registry operation, `convert`.
+
+What the user gets: "convert quotation SAL-QTN-... to a sales order" asks first, showing the customer, the items with quantities and prices, the total, and any sales orders already made from the same quotation; on Yes it creates a Draft Sales Order; a manager is then offered "Submit it now?" and a Sales User is not. Sales User and Sales Manager (and admins) may convert, the same rights as creating an order directly. Purchasing, stock and accounts roles may not.
+
+Trust model, which is why this is a separate operation and not a create with a long field list: the draft comes from ERPNext's mapper, called as the signed-in user, so its contents are ERPNext's business rule and not something the conversation chose. A typed customer, item list or total is ignored (an end-to-end test types "for Evil Corp with 999 DESK at 1" and the order still comes out as the quotation says). The registry decides which source and target pairs exist, which mapping method each uses (the method name is validated and never taken from a request), which roles may do it, and that it always asks. `convert_document` is chat-only: it is classified in the policy as a chat-only write tool, outside the set the MCP server lists or runs, so an external MCP client cannot use it, and a test pins that.
+
+How it behaves, from the live probe and the live check:
+
+- ERPNext only maps a submitted quotation. A draft is refused ("Cannot map because following condition fails: docstatus=1") and a cancelled one is refused the same way. The assistant checks first and says so in plain words ("Quotation 'X' is Draft. Only a submitted Quotation can be converted into a Sales Order."). A quotation that does not exist is reported as not found, naming the Quotation, not the order.
+- The mapped order does not save as it comes: ERPNext rejects it with "Please enter Delivery Date". The assistant gives it a delivery date a week out, on the header and on every row, the same default a plain create uses. Everything else the mapper filled (customer, company, items, prices, currency, price list) is kept, with the client-side markers and the server-owned fields removed and the document forced to Draft.
+- The link back to the quotation is kept on each order row. The order total matched the quotation exactly, and the quotation itself was not changed.
+- ERPNext lets a quotation be converted again while the first order is still a draft, with the full quantities. So the confirmation looks up orders already made from the quotation (live and draft ones, not cancelled) and mentions them, instead of blocking: "Sales Order records were already made from this Quotation: ... Converting again creates another one."
+- It reuses the shared safeguards: the role gate against the registry, the ERPNext permission check (asked as "may this user create a Sales Order"), the stale-confirmation check (if the quotation changes or is cancelled between the question and the Yes, it is refused and nothing is created), no automatic retry on failure, and the audit trail under the real user.
+
+Live check, 21 of 21 (throwaway quotations and orders, deleted afterwards; the cleanup code was self-tested against a name that does not exist before anything was created): conversion creates a Draft order for the right customer with the quotation's items, quantities, prices and total; each row keeps the quotation link; delivery dates are on the header and every row; the existing-orders lookup finds the order with the exact filters the assistant sends; a second conversion is accepted by ERPNext and is separate; a draft, cancelled or missing quotation creates nothing; an unregistered source or target, and a purchasing role, are refused before any call. No probe record remains.
+
+Tests: 64 at the registry and tool layers (`tests/test_convert.py`) and 33 on the conversation flow and end to end through `/chat` (`agent/tests/test_convert_flow.py`), including a manager offered the submit, a "no" creating nothing, a repeat conversion mentioning the first order, and a quotation changed or cancelled between the question and the Yes. Both suites together: 1017 and 773 passed, plus the 1 known failure.
+
+Bugs found by the tests and fixed in this slice: filling the order dates changed the mapper's own row data in place (now a deep copy); the not-found message named the new document's type instead of the quotation's.
+
+Not covered here, in the order I would do them: converting only part of a quotation (all pending quantities are converted); Sales Order to Delivery Note and Purchase Order to Purchase Receipt (draft creation first, with submit as a separate, manager-only step because it posts to stock); then the two invoices, whose submit posts to accounts and needs a decision on who may submit what (segregation of duties, for the people who own those rules to review). Conversion by a restricted user was not exercised live; the permission check and the registry gate are covered by tests, and ERPNext enforces its own rules on the save.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

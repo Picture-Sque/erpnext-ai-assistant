@@ -25,6 +25,7 @@ from workflow.followup_router import (
 try:
     from agent.tools.adapter import (
         check_permission,
+        convert_document,
         create_document,
         get_list,
         update_document,
@@ -45,6 +46,7 @@ try:
 except ImportError:
     from tools.adapter import (
         check_permission,
+        convert_document,
         create_document,
         get_list,
         update_document,
@@ -68,6 +70,7 @@ from mcp_erpnext.write_registry import (
     check_row_edits,
     get_bulk_max_records,
     get_confirm_fields,
+    get_convert_spec,
     get_date_fields,
     get_draft_only_fields,
     get_duplicate_keys,
@@ -190,6 +193,8 @@ def load_skills() -> List[Dict[str, Any]]:
                                     "chain_exports": data.get("chain_exports", {}),
                                     # Fields restricted to a fixed set of values: {field: [allowed, ...]}
                                     "field_values": data.get("field_values") or {},
+                                    # A convert skill creates `doctype` from a document of this type.
+                                    "source_doctype": data.get("source_doctype") or "",
                                     # Write skills: at least one of these fields must be given
                                     # (an update with nothing to change is not a request).
                                     "require_any_of": data.get("require_any_of") or [],
@@ -220,6 +225,7 @@ loaded_skills = load_skills()
 
 # Tools that represent state-changing (write) operations.
 _WRITE_TOOLS = frozenset({
+    "convert_document",
     "create_document",
     "update_document",
     "delete_document",
@@ -229,6 +235,7 @@ _WRITE_TOOLS = frozenset({
 
 # Map tool name -> canonical operation name used in messages / write_rbac_operation.
 _TOOL_TO_OPERATION = {
+    "convert_document": "convert",
     "create_document": "create",
     "update_document": "update",
     "delete_document": "delete",
@@ -441,6 +448,16 @@ def _row_sync_failure(skill: Dict[str, Any], collected: dict, doc: dict, record_
                     f"The update may not have completed."
                 )
     return None
+
+
+def _record_doctype(skill: Dict[str, Any]) -> str:
+    """
+    The doctype of the existing record an operation acts on. For a conversion that is the source
+    document (a Quotation), not the document being created from it (the skill's own doctype).
+    """
+    if skill.get("tool") == "convert_document" and skill.get("source_doctype"):
+        return skill["source_doctype"]
+    return skill.get("doctype", "")
 
 
 def _target_record_id(collected: dict, resolved_entities: dict, skill: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -1815,7 +1832,7 @@ _DOCSTATUS_SUBMITTED = 1
 _DOCSTATUS_CANCELLED = 2
 
 # Operations that require a pre-existing document (not create)
-_REQUIRES_EXISTING_DOC = {"update", "cancel", "submit", "delete"}
+_REQUIRES_EXISTING_DOC = {"update", "cancel", "submit", "delete", "convert"}
 
 # How far back (seconds) to look for recent create duplicates
 _IDEMPOTENCY_WINDOW_SECONDS = 60
@@ -1850,6 +1867,9 @@ def precondition_validation_node(state: AgentState):
 
     operation = state.get("write_rbac_operation") or _TOOL_TO_OPERATION.get(skill.get("tool", ""), "")
     doctype = skill.get("doctype", "")
+    # The existing record the operation acts on. Same as doctype, except for a conversion, where it is
+    # the source document; the permission check below is about the document being created.
+    record_doctype = _record_doctype(skill)
     collected = dict(state.get("collected_fields", {}) or {})
     resolved_entities = state.get("resolved_entities") or {}
     last_read_snapshot = state.get("last_read_snapshot")  # may be None
@@ -1874,14 +1894,14 @@ def precondition_validation_node(state: AgentState):
             if collected.get("filters"):
                 # This is a bulk request; skip single-target existence checks
                 is_bulk = True
-                logger.info(f"[Step 5.5] Detected bulk request for {operation} on {doctype}. Skipping Check 1.")
+                logger.info(f"[Step 5.5] Detected bulk request for {operation} on {record_doctype}. Skipping Check 1.")
             else:
                 logger.warning("[Step 5.5] Check 1 FAIL: No resolved target entity and no filters.")
                 return {
                     "preconditions_validated": False,
                     "failure_classification": "validation_error",
                     "final_response": (
-                        f"I could not determine the exact {doctype} record to {operation}. "
+                        f"I could not determine the exact {record_doctype} record to {operation}. "
                         f"Please provide a specific name or ID and try again."
                     ),
                 }
@@ -1890,43 +1910,43 @@ def precondition_validation_node(state: AgentState):
 
         # Fetch the current document state fresh
         try:
-            fetch_result = get_document(doctype, record_id)
+            fetch_result = get_document(record_doctype, record_id)
         except Exception as exc:
-            logger.exception(f"[Step 5.5] get_document raised for {doctype} '{record_id}'")
+            logger.exception(f"[Step 5.5] get_document raised for {record_doctype} '{record_id}'")
             fetch_result = {"status": "system_error", "data": None, "error": str(exc)}
 
         fetch_status = fetch_result.get("status")
         if fetch_status != "success" or not fetch_result.get("data"):
             if fetch_status == "permission_denied":
                 logger.warning(
-                    f"[Step 5.5] Check 1 FAIL: Permission denied fetching {doctype} '{record_id}'."
+                    f"[Step 5.5] Check 1 FAIL: Permission denied fetching {record_doctype} '{record_id}'."
                 )
                 return {
                     "preconditions_validated": False,
                     "failure_classification": "permission_denied",
                     "final_response": (
-                        f"Permission Denied: Unable to access {doctype} '{record_id}'. {fetch_result.get('error', '')}"
+                        f"Permission Denied: Unable to access {record_doctype} '{record_id}'. {fetch_result.get('error', '')}"
                     ),
                 }
             elif fetch_status == "system_error":
                 logger.error(
-                    f"[Step 5.5] Check 1 FAIL: System error fetching {doctype} '{record_id}': {fetch_result.get('error')}"
+                    f"[Step 5.5] Check 1 FAIL: System error fetching {record_doctype} '{record_id}': {fetch_result.get('error')}"
                 )
                 return {
                     "preconditions_validated": False,
                     "failure_classification": "tool_system_failure",
                     "final_response": (
-                        f"System Error: Failed to retrieve {doctype} '{record_id}'. {fetch_result.get('error', '')}"
+                        f"System Error: Failed to retrieve {record_doctype} '{record_id}'. {fetch_result.get('error', '')}"
                     ),
                 }
             else:
                 logger.warning(
-                    f"[Step 5.5] Check 1 FAIL: Document '{record_id}' not found ({doctype})."
+                    f"[Step 5.5] Check 1 FAIL: Document '{record_id}' not found ({record_doctype})."
                 )
                 return {
                     "preconditions_validated": False,
                     "failure_classification": "not_found",
-                    "final_response": f"{doctype} '{record_id}' was not found.",
+                    "final_response": f"{record_doctype} '{record_id}' was not found.",
                 }
 
         fresh_snapshot = fetch_result["data"]
@@ -1939,11 +1959,13 @@ def precondition_validation_node(state: AgentState):
     # site's real permissions, including User Permissions, as this user right now. Both must
     # allow. An unknown answer (check unavailable) is not a denial: ERPNext still refuses an
     # unauthorised write itself.
-    permission = check_permission(operation, doctype, None if (is_bulk or operation == "create") else record_id)
+    permission = check_permission(operation, doctype, None if (is_bulk or operation in ("create", "convert")) else record_id)
     if getattr(permission, "outcome", None) == "denied":
-        target_desc = f" {record_id}" if record_id and not is_bulk and operation != "create" else ""
+        target_desc = f" {record_id}" if record_id and not is_bulk and operation not in ("create", "convert") else ""
+        # Converting a quotation into an order is, to ERPNext, creating the order.
+        verb = "create" if operation == "convert" else operation
         message = (
-            f"Permission Denied: your ERPNext account is not allowed to {operation} {doctype}{target_desc}. "
+            f"Permission Denied: your ERPNext account is not allowed to {verb} {doctype}{target_desc}. "
             f"Nothing was executed. If you think you should have access, ask your ERPNext administrator."
         )
         logger.warning(f"[Step 5.5] Check 1b FAIL: ERPNext denies {operation} on {doctype}{target_desc}.")
@@ -1981,27 +2003,27 @@ def precondition_validation_node(state: AgentState):
         if operation == "cancel":
             if docstatus == _DOCSTATUS_CANCELLED:
                 incompatible = True
-                reason = f"{doctype} '{record_id}' is already cancelled — cannot cancel again."
+                reason = f"{record_doctype} '{record_id}' is already cancelled — cannot cancel again."
             elif docstatus == _DOCSTATUS_DRAFT:
                 incompatible = True
                 reason = (
-                    f"{doctype} '{record_id}' is in Draft status — only Submitted documents "
+                    f"{record_doctype} '{record_id}' is in Draft status — only Submitted documents "
                     f"can be cancelled."
                 )
         elif operation == "submit":
             if docstatus == _DOCSTATUS_SUBMITTED:
                 incompatible = True
-                reason = f"{doctype} '{record_id}' is already submitted — cannot submit again."
+                reason = f"{record_doctype} '{record_id}' is already submitted — cannot submit again."
             elif docstatus == _DOCSTATUS_CANCELLED:
                 incompatible = True
                 reason = (
-                    f"{doctype} '{record_id}' is cancelled — cannot submit a cancelled document."
+                    f"{record_doctype} '{record_id}' is cancelled — cannot submit a cancelled document."
                 )
         elif operation == "update":
             if docstatus == _DOCSTATUS_CANCELLED:
                 incompatible = True
                 reason = (
-                    f"{doctype} '{record_id}' is cancelled — cannot update a cancelled document."
+                    f"{record_doctype} '{record_id}' is cancelled — cannot update a cancelled document."
                 )
             # Submitted documents can still have some amendable fields — we skip that
             # level of field-specific ERPNext validation here; it will surface at execution.
@@ -2011,14 +2033,23 @@ def precondition_validation_node(state: AgentState):
             if draft_only and docstatus != _DOCSTATUS_DRAFT:
                 incompatible = True
                 reason = (
-                    f"{doctype} '{record_id}' is {status_name}, so this change cannot be made. "
+                    f"{record_doctype} '{record_id}' is {status_name}, so this change cannot be made. "
                     f"It is only allowed on a Draft ({', '.join(f.replace('_', ' ') for f in draft_only)})."
+                )
+        elif operation == "convert":
+            # ERPNext only maps a submitted document. Say so here, in plain words, rather than let the
+            # mapper's error reach the user.
+            if docstatus != _DOCSTATUS_SUBMITTED:
+                incompatible = True
+                reason = (
+                    f"{record_doctype} '{record_id}' is {status_name}. Only a submitted {record_doctype} "
+                    f"can be converted into a {doctype}."
                 )
         elif operation == "delete":
             if docstatus == _DOCSTATUS_SUBMITTED:
                 incompatible = True
                 reason = (
-                    f"{doctype} '{record_id}' is submitted — cancel it first before deleting."
+                    f"{record_doctype} '{record_id}' is submitted — cancel it first before deleting."
                 )
 
         if incompatible:
@@ -2043,7 +2074,7 @@ def precondition_validation_node(state: AgentState):
         now_modified = fresh_snapshot.get("modified")
         if asked_modified and now_modified and str(asked_modified) != str(now_modified):
             logger.warning(
-                f"[Step 5.5] Check 2b FAIL: {doctype} '{record_id}' changed after the confirmation was requested "
+                f"[Step 5.5] Check 2b FAIL: {record_doctype} '{record_id}' changed after the confirmation was requested "
                 f"({asked_modified} -> {now_modified})."
             )
             return {
@@ -2051,7 +2082,7 @@ def precondition_validation_node(state: AgentState):
                 "last_read_snapshot": fresh_snapshot,
                 "failure_classification": "conflict_stale_data",
                 "final_response": (
-                    f"{doctype} '{record_id}' was changed after you were asked to confirm "
+                    f"{record_doctype} '{record_id}' was changed after you were asked to confirm "
                     f"(last modified {now_modified}). Nothing was executed. "
                     f"Please review the current document and ask again."
                 ),
@@ -2060,7 +2091,7 @@ def precondition_validation_node(state: AgentState):
     # -------------------------------------------------------------------------
     # Check 3: Required fields present (safety net)
     # -------------------------------------------------------------------------
-    if operation in {"create", "update"}:
+    if operation in {"create", "update", "convert"}:
         required_fields = skill.get("required_fields", [])
         missing = [f for f in required_fields if not collected.get(f)]
         any_of = skill.get("require_any_of") or []
@@ -2310,8 +2341,8 @@ def confirmation_node(state: AgentState):
                 )
                 requires_confirmation = True
 
-    # Creating master data always asks, with a note of similar existing records.
-    if operation == "create" and is_confirm_always(doctype, operation):
+    # Creating master data, and converting one document into another, always ask.
+    if operation in ("create", "convert") and is_confirm_always(doctype, operation):
         requires_confirmation = True
 
     # Changes the registry marks as needing a Yes (for example new quantities or rates) always ask.
@@ -2324,7 +2355,7 @@ def confirmation_node(state: AgentState):
         return {}
 
     filters = collected.get("filters")
-    is_bulk = bool(operation != "create" and not record_id and filters)
+    is_bulk = bool(operation not in ("create", "convert") and not record_id and filters)
 
     if operation != "create" and not record_id and not is_bulk:
         logger.error("[Step 6] Missing target record ID and no filters for a confirmation-gated operation.")
@@ -2402,6 +2433,11 @@ def confirmation_node(state: AgentState):
     else:
         if operation == "create":
             scope_desc = _describe_create_scope(doctype, collected) + _describe_create_extras(doctype, collected)
+        elif operation == "convert":
+            snapshot = state.get("last_read_snapshot")
+            if not (isinstance(snapshot, dict) and str(snapshot.get("name")) == str(record_id)):
+                snapshot = None
+            scope_desc = _describe_convert_scope(skill, record_id, snapshot)
         else:
             target_info = next(
                 (v for v in resolved_entities.values() if isinstance(v, dict) and v.get("name") == record_id),
@@ -2536,6 +2572,75 @@ def _describe_create_scope(doctype: str, collected: dict) -> str:
         if total:
             lines.append("")
             lines.append(f"Estimated Total: {total}")
+    return "\n".join(lines)
+
+
+def _existing_conversions(skill: Dict[str, Any], source_name: str) -> List[str]:
+    """
+    Documents already made from this source (orders already created from a quotation), so the user is
+    told before a second one is made. ERPNext allows converting again while the first is still a draft,
+    and maps the full quantities again. Cancelled ones are not counted. Best effort: a failed lookup
+    returns nothing rather than blocking.
+    """
+    spec = get_convert_spec(skill.get("doctype", ""), skill.get("source_doctype", ""))
+    linked = (spec or {}).get("linked_by")
+    if not linked or not source_name:
+        return []
+    try:
+        found = get_list(
+            linked["child_doctype"],
+            filters=[[linked["field"], "=", source_name], [linked["parent_doctype"], "docstatus", "<", "2"]],
+            fields=["parent"],
+            limit=50,
+            parent_doctype=linked["parent_doctype"],
+        )
+    except Exception as exc:
+        logger.warning(f"[Step 6] Could not look for existing documents made from {source_name}: {exc}")
+        return []
+    if found.get("status") not in ("success", "empty"):
+        logger.warning(f"[Step 6] Lookup of existing documents made from {source_name} failed: {found.get('error')}")
+        return []
+    names: List[str] = []
+    for row in found.get("data") or []:
+        parent = row.get("parent") if isinstance(row, dict) else None
+        if parent and parent not in names:
+            names.append(str(parent))
+    return names
+
+
+def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: Optional[dict]) -> str:
+    """
+    The question for a conversion: what will be created, from which document, what it will contain,
+    and any documents already made from the same source. The contents come from the source as it was
+    just read, so the user sees what they are agreeing to.
+    """
+    target = skill.get("doctype", "")
+    source = skill.get("source_doctype", "")
+    article = "an" if target[:1].lower() in "aeiou" else "a"
+    lines = [f"Are you sure you want to create {article} {target} from {source} '{source_name}'?", "It will be saved as a Draft."]
+    doc = snapshot if isinstance(snapshot, dict) else {}
+    party = next((doc.get(k) for k in ("customer_name", "party_name", "customer", "supplier_name", "supplier") if doc.get(k)), None)
+    if party:
+        lines.append(f"For: {party}")
+    rows = doc.get("items")
+    if isinstance(rows, list) and rows:
+        lines.append("")
+        lines.append("Items:")
+        for row in rows:
+            if isinstance(row, dict):
+                rate = row.get("rate")
+                lines.append(f"- {row.get('qty')}x {row.get('item_code', 'Unknown')}" + (f" @ {rate}" if rate is not None else ""))
+    total = doc.get("grand_total") if doc.get("grand_total") is not None else doc.get("total")
+    if total:
+        lines.append("")
+        lines.append(f"Total: {total}")
+    existing = _existing_conversions(skill, source_name)
+    if existing:
+        lines.append("")
+        lines.append(
+            f"Note: {target} records were already made from this {source}: {', '.join(existing[:5])}. "
+            f"Converting again creates another one."
+        )
     return "\n".join(lines)
 
 
@@ -2910,6 +3015,10 @@ def call_generic_tool_node(state: AgentState):
                 tool_res = cancel_document(doctype_name, record_id, **concurrency)
             elif tool == "submit_document":
                 tool_res = submit_document(doctype_name, record_id, **concurrency)
+            elif tool == "convert_document":
+                # ERPNext builds the draft from the source document, as the user. Nothing in it comes
+                # from the conversation except which document to start from.
+                tool_res = convert_document(doctype_name, (skill or {}).get("source_doctype", ""), record_id)
             else:
                 tool_res = {"success": False, "error": f"Unknown tool: {tool}"}
         except Exception as e:
@@ -3030,8 +3139,8 @@ def result_validation_node(state: AgentState):
         # VERIFICATION LOGIC
         is_ambiguous = True
         
-        if operation == "create":
-            # Unambiguous if it returned a dict with 'name'
+        if operation in ("create", "convert"):
+            # Unambiguous if it returned a dict with 'name' (for a conversion, the new document's)
             if isinstance(data, dict) and data.get("name"):
                 is_ambiguous = False
                 write_verified = True
@@ -3090,7 +3199,7 @@ def result_validation_node(state: AgentState):
                             write_verified = False
                             failure_classification = "tool_system_failure"
                             failure_msg = f"Requested to submit {doctype} '{record_id}', but its docstatus is still {doc.get('docstatus')} after verification. The submission may have been blocked."
-                    elif operation == "create":
+                    elif operation in ("create", "convert"):
                         write_verified = True
                 else:
                     write_verified = False
@@ -3138,7 +3247,7 @@ def result_validation_node(state: AgentState):
             outcome="executed"
         )
         updates["retry_count"] = 0
-        if operation in ("create", "submit", "update") and record_id and doctype:
+        if operation in ("create", "convert", "submit", "update") and record_id and doctype:
             updates["last_created_doc"] = {"doctype": doctype, "name": record_id}
     
     # LOOP-BACK LOGIC for multi-step
@@ -3320,7 +3429,7 @@ def format_agent_message_node(state: AgentState):
         # The newest result is this write; an older read is no longer the thing the
         # user is following up on.
         updates["last_turn_context"] = None
-        if (tool_name == "create_document" and not state.get("chain_plan") and isinstance(data, dict)
+        if (tool_name in ("create_document", "convert_document") and not state.get("chain_plan") and isinstance(data, dict)
                 and str(data.get("docstatus")) == "0" and data.get("name")):
             doc_comp = data.get("company") or collected.get("company")
             doc_wh = data.get("set_warehouse")
@@ -3452,6 +3561,9 @@ def _retry_and_escalation_node_impl(state: AgentState):
         
         if doctype == "record" and skill:
             doctype = skill.get("doctype", "record")
+        if skill and skill.get("tool") == "convert_document":
+            # What was not found is the document being converted, not the one that would be created.
+            doctype = _record_doctype(skill)
 
         entity_name = None
         if skill:
@@ -3907,6 +4019,7 @@ def _not_executed_message(pending: dict) -> str:
     if pending.get("is_bulk"):
         return f"The {op} of {pending.get('affected_count')} {dt} records was not executed."
     return {
+        "convert": f"No {dt} was created from '{tgt}'.",
         "submit": f"{dt} '{tgt}' was not submitted and remains a Draft.",
         "cancel": f"{dt} '{tgt}' was not cancelled.",
         "delete": f"{dt} '{tgt}' was not deleted.",

@@ -1,3 +1,4 @@
+import copy
 import os
 import re
 import json
@@ -11,7 +12,14 @@ from mcp_erpnext.aggregation import AGGREGATION_FUNCTIONS, aggregate_rows, group
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.defaults import get_default_company, get_default_warehouse
 from mcp_erpnext.errors import ERPNextError, extract_erpnext_error
-from mcp_erpnext.write_registry import check_write, get_child_fields, get_row_edits, get_row_sync, to_number
+from mcp_erpnext.write_registry import (
+    check_write,
+    get_child_fields,
+    get_convert_spec,
+    get_row_edits,
+    get_row_sync,
+    to_number,
+)
 
 logger = logging.getLogger("mcp_erpnext.crud")
 
@@ -529,6 +537,100 @@ def _update_unchecked(
             return _format_result("permission_denied", error=extract_erpnext_error(response))
         else:
             return _format_result("system_error", error=extract_erpnext_error(response))
+    except Exception as e:
+        return _format_result("system_error", error=str(e))
+
+
+# Top-level fields of a mapped draft that belong to the server, not to the caller. The mapper fills
+# some of them with the session user or empty values; ERPNext sets them itself when the draft is saved.
+_MAPPED_SERVER_FIELDS = frozenset({"name", "owner", "creation", "modified", "modified_by", "idx", "amended_from"})
+
+
+def _prepare_mapped_payload(target_doctype: str, mapped: dict) -> dict:
+    """
+    Turn the draft returned by ERPNext's mapper into a payload to save: drop the client-side markers
+    (keys starting "__") and the server-owned fields, force it to be a Draft, and fill what ERPNext
+    needs but the mapper leaves empty. A draft Sales Order from a Quotation is refused with "Please
+    enter Delivery Date" as mapped (seen live), so a date that ERPNext derives from the item rows
+    gets the same default a plain create uses (a week out), and rows without one take the header's.
+    """
+    payload = copy.deepcopy(
+        {k: v for k, v in mapped.items() if not str(k).startswith("__") and k not in _MAPPED_SERVER_FIELDS}
+    )
+    payload["docstatus"] = 0
+    payload["doctype"] = target_doctype
+    for header, spec in get_row_sync(target_doctype, "update").items():
+        rows = payload.get(spec["table"])
+        if not payload.get(header):
+            payload[header] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and not row.get(spec["field"]):
+                    row[spec["field"]] = payload[header]
+    return payload
+
+
+def convert_document(
+    target_doctype: str,
+    source_doctype: str,
+    source_name: str,
+    client: Optional[ERPNextClient] = None,
+) -> dict:
+    """
+    Create a Draft `target_doctype` from an existing `source_doctype` document with ERPNext's own
+    mapping method (a Sales Order from a Quotation). The mapped draft is produced by ERPNext under
+    the caller's session, so what it contains is ERPNext's business rule and not something a model
+    chose; the registry decides which pairs are allowed and who may do it. The result is saved as a
+    Draft. A source ERPNext will not map (not submitted, nothing left to convert) is reported, not forced.
+    """
+    if not is_doctype_allowed(target_doctype):
+        return _format_result("permission_denied", error=f"DocType '{target_doctype}' is not permitted by whitelist.")
+    if not is_doctype_allowed(source_doctype):
+        return _format_result("permission_denied", error=f"DocType '{source_doctype}' is not permitted by whitelist.")
+
+    denied = _guard_write("convert", target_doctype, {"source_doctype": source_doctype})
+    if denied is not None:
+        return denied
+    spec = get_convert_spec(target_doctype, source_doctype)
+    if spec is None:  # the guard has just allowed it, so this is only a defensive stop
+        return _format_result("permission_denied", error=f"The assistant cannot create a {target_doctype} from {source_doctype}.")
+    if not isinstance(source_name, str) or not source_name.strip():
+        return _format_result("system_error", error="A source document name is required.")
+    source_name = source_name.strip()
+
+    try:
+        c = client or ERPNextClient()
+        response = c.get(f"/api/method/{spec['method']}", params={"source_name": source_name}, timeout=60.0)
+        if not response.is_success:
+            if response.status_code == 404:
+                return _format_result("not_found", error=extract_erpnext_error(response))
+            if response.status_code in (401, 403):
+                return _format_result("permission_denied", error=extract_erpnext_error(response))
+            return _format_result("system_error", error=extract_erpnext_error(response))
+        try:
+            body = response.json()
+        except Exception:
+            return _format_result("system_error", error="Invalid JSON response")
+        mapped = body.get("message") if isinstance(body, dict) else None
+        if not isinstance(mapped, dict) or mapped.get("doctype") != target_doctype:
+            return _format_result("system_error", error=f"ERPNext did not return a {target_doctype} draft for {source_doctype} {source_name}.")
+        rows = mapped.get("items")
+        if isinstance(rows, list) and not rows:
+            return _format_result("system_error", error=f"Nothing is left to convert from {source_doctype} {source_name}.")
+
+        payload = _prepare_mapped_payload(target_doctype, mapped)
+        response = c.post(f"/api/resource/{target_doctype}", json=payload, timeout=60.0)
+        if response.is_success:
+            try:
+                resp_json = response.json()
+                return _format_result("success", data=resp_json.get("data", resp_json))
+            except Exception:
+                return _format_result("system_error", error="Invalid JSON response")
+        if response.status_code == 404:
+            return _format_result("not_found", error=extract_erpnext_error(response))
+        if response.status_code in (401, 403):
+            return _format_result("permission_denied", error=extract_erpnext_error(response))
+        return _format_result("system_error", error=extract_erpnext_error(response))
     except Exception as e:
         return _format_result("system_error", error=str(e))
 

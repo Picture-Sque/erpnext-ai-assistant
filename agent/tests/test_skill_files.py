@@ -23,7 +23,7 @@ SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 SKILL_DIRS = sorted(d for d in os.listdir(SKILLS_DIR) if os.path.isfile(os.path.join(SKILLS_DIR, d, "SKILL.md")))
 
 READ_TOOLS = {"get_list", "get_document", "aggregate"}
-WRITE_TOOLS = {"create_document", "update_document", "cancel_document", "submit_document"}
+WRITE_TOOLS = {"create_document", "update_document", "cancel_document", "submit_document", "convert_document"}
 REQUIRED_KEYS = (
     "name", "intent", "description", "allowed_roles", "tool", "doctype", "required_fields",
     "optional_fields", "defaults", "validation_rules", "keywords", "response_template",
@@ -33,7 +33,7 @@ REQUIRED_KEYS = (
 KNOWN_KEYS = set(REQUIRED_KEYS) | {
     "query_parameters", "payload_structure", "not_found_message", "follow_up_eligible",
     "follow_up_slots", "context_pronouns", "chain_exports", "field_values", "outputs", "instructions",
-    "require_any_of", "field_hints",
+    "require_any_of", "field_hints", "source_doctype",
 }
 
 

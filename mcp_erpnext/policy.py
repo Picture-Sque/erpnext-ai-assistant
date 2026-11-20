@@ -92,6 +92,13 @@ WRITE_TOOLS: FrozenSet[str] = frozenset({
 
 ALL_TOOLS: FrozenSet[str] = READ_TOOLS | WRITE_TOOLS
 
+# Write tools that exist only for the chat assistant. They are deliberately NOT in ALL_TOOLS, so the
+# MCP server neither lists nor runs them and an external MCP client can never use them. convert_document
+# creates one document from another with ERPNext's mapper, as the signed-in user, after a confirmation.
+CHAT_ONLY_WRITE_TOOLS: FrozenSet[str] = frozenset({
+    "convert_document",
+})
+
 RESERVED_IDENTITY_KEYS: FrozenSet[str] = frozenset({
     "user_roles",
     "roles",

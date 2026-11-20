@@ -29,15 +29,18 @@ from mcp_erpnext.client import is_strict_identity
 
 logger = logging.getLogger("mcp_erpnext.write_registry")
 
-WRITE_OPERATIONS: Tuple[str, ...] = ("create", "update", "submit", "cancel", "delete")
+WRITE_OPERATIONS: Tuple[str, ...] = ("create", "update", "submit", "cancel", "delete", "convert")
 
-# Tool name -> operation name. Mirrors the five write tools.
+# Tool name -> operation name. The five document write tools, plus convert_document, which creates
+# a draft of one document type from another with ERPNext's own mapper (a delivery note from a sales
+# order). convert_document is chat-only: it is not an MCP tool, so external MCP clients cannot use it.
 TOOL_TO_OPERATION: Dict[str, str] = {
     "create_document": "create",
     "update_document": "update",
     "submit_document": "submit",
     "cancel_document": "cancel",
     "delete_document": "delete",
+    "convert_document": "convert",
 }
 
 # Fields that are never writable through the chat, whatever a registry entry says.
@@ -89,6 +92,9 @@ def _roles(*names: str) -> List[str]:
 #   identity_slot the slot that names the record an update acts on, when that is not "name"
 #   confirm_always  every use of this operation needs an explicit Yes (create, for master data)
 #   similar_by    {field, slot}: before a create, look for existing records with a similar name
+#   sources       (convert only) {source doctype: {method, source_docstatus, linked_by}}: the document
+#                 types a new document may be made from, ERPNext's mapping method for each, the state
+#                 the source must be in, and how to find documents already made from it
 #   draft_only    fields that may only be changed while the document is a Draft
 #   confirm       fields that always need an explicit Yes before they are written
 # Per doctype:
@@ -123,6 +129,21 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
             },
             "submit": {"roles": _roles("Sales Manager")},
             "cancel": {"roles": _roles("Sales Manager")},
+            "convert": {
+                "roles": _roles("Sales User", "Sales Manager"),
+                "confirm_always": True,
+                "identity_slot": "quotation",
+                "sources": {
+                    "Quotation": {
+                        "method": "erpnext.selling.doctype.quotation.quotation.make_sales_order",
+                        "source_docstatus": 1,
+                        # How to find orders already made from the same quotation: the quotation is
+                        # stored on each order row. ERPNext lets a quotation be converted again while
+                        # an earlier order is still a draft, so the user is told about them.
+                        "linked_by": {"child_doctype": "Sales Order Item", "parent_doctype": "Sales Order", "field": "prevdoc_docname"},
+                    },
+                },
+            },
         },
     },
     "Purchase Order": {
@@ -416,6 +437,42 @@ def get_row_edits(doctype: Any, operation: Any) -> Dict[str, Dict[str, Any]]:
             "non_negative": _names(edit, "non_negative"),
         }
     return clean
+
+
+def get_convert_sources(doctype: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    The document types `doctype` may be created from: {source doctype: {method, source_docstatus,
+    linked_by}}. A source without a mapping method is not usable and is left out.
+    """
+    op_spec = get_operation_spec(doctype, "convert")
+    raw = op_spec.get("sources") if op_spec else None
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, Dict[str, Any]] = {}
+    for source, spec in raw.items():
+        if not (isinstance(source, str) and source and isinstance(spec, dict)):
+            continue
+        method = spec.get("method")
+        if not (isinstance(method, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+", method)):
+            continue
+        linked = spec.get("linked_by")
+        clean[source] = {
+            "method": method,
+            "source_docstatus": spec.get("source_docstatus") if isinstance(spec.get("source_docstatus"), int) else 1,
+            "linked_by": linked if isinstance(linked, dict) and all(isinstance(linked.get(k), str) for k in ("child_doctype", "parent_doctype", "field")) else None,
+        }
+    return clean
+
+
+def get_convert_spec(doctype: Any, source_doctype: Any) -> Optional[Dict[str, Any]]:
+    """The mapping spec for making `doctype` from `source_doctype` (case-insensitive), or None."""
+    if not isinstance(source_doctype, str) or not source_doctype.strip():
+        return None
+    wanted = source_doctype.strip().lower()
+    for source, spec in get_convert_sources(doctype).items():
+        if source.lower() == wanted:
+            return dict(spec, source_doctype=source)
+    return None
 
 
 def get_identity_slot(doctype: Any, operation: Any) -> Optional[str]:
@@ -713,6 +770,17 @@ def check_write(
         if not field_decision:
             return field_decision
 
+    if operation == "convert":
+        # `fields` carries the source: {"source_doctype": "Quotation"}. The converted document itself
+        # is produced by ERPNext's mapper under the user's own session, so no field list applies.
+        source = fields.get("source_doctype") if isinstance(fields, dict) else None
+        if get_convert_spec(doctype, source) is None:
+            label = source if isinstance(source, str) and source.strip() else "that document"
+            return _deny(
+                f"No convert source {source!r} registered for {doctype!r}.",
+                f"The assistant cannot create a {str(doctype).strip()} from {label}.",
+            )
+
     return _allow(f"{operation} on {doctype} permitted.")
 
 
@@ -777,6 +845,17 @@ def validate_write_skill(skill: Dict[str, Any]) -> List[str]:
             problems.append(
                 f"skill '{name}': roles {extra} are not allowed by the registry for {operation} on {doctype}"
             )
+
+    if operation == "convert":
+        # A conversion has no field list; what must hold is that the source is a registered one and
+        # that the skill asks for the slot that names the source document.
+        source = skill.get("source_doctype")
+        if get_convert_spec(doctype, source) is None:
+            problems.append(f"skill '{name}': '{source}' is not a registered source for converting into {doctype}")
+        identity = get_identity_slot(doctype, operation)
+        if identity and identity not in (skill.get("required_fields") or []):
+            problems.append(f"skill '{name}': must require '{identity}', which names the document to convert")
+        return problems
 
     if operation in ("create", "update"):
         allowed = set(get_writable_fields(doctype, operation))

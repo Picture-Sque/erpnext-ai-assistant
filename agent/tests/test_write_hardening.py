@@ -302,6 +302,7 @@ class TestSkillLoading:
             "create-customer", "update-customer",
             "create-supplier", "update-supplier",
             "create-item", "update-item",
+            "convert-quotation-to-sales-order",
         }
 
 

@@ -396,6 +396,15 @@ class ToolAdapter:
         extra = {"expected_modified": expected_modified} if expected_modified else {}
         return generic_tools.update_document(doctype=doctype, name=name, fields=fields, **extra)
 
+    def convert_document(self, target_doctype: str, source_doctype: str, source_name: str) -> dict:
+        """Direct only, like every write: the draft is built by ERPNext under the caller's own session."""
+        blocked = self._check_read_only_write("convert_document")
+        if blocked is not None:
+            return blocked
+        return generic_tools.convert_document(
+            target_doctype=target_doctype, source_doctype=source_doctype, source_name=source_name
+        )
+
     def delete_document(self, doctype: str, name: str) -> dict:
         blocked = self._check_read_only_write("delete_document")
         if blocked is not None:
@@ -483,6 +492,10 @@ def create_document(*args, **kwargs) -> dict:
 
 def update_document(*args, **kwargs) -> dict:
     return adapter.update_document(*args, **kwargs)
+
+
+def convert_document(*args, **kwargs) -> dict:
+    return adapter.convert_document(*args, **kwargs)
 
 
 def delete_document(*args, **kwargs) -> dict:

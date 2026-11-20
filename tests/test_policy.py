@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from mcp_erpnext import crud, reports
 from mcp_erpnext.policy import (
     ALL_TOOLS,
+    CHAT_ONLY_WRITE_TOOLS,
     READ_TOOLS,
     RESERVED_IDENTITY_KEYS,
     WRITE_TOOLS,
@@ -124,6 +125,23 @@ class TestToolClassification(unittest.TestCase):
     def test_tools_are_disjoint(self):
         self.assertTrue(READ_TOOLS.isdisjoint(WRITE_TOOLS))
         self.assertEqual(ALL_TOOLS, READ_TOOLS | WRITE_TOOLS)
+        # Chat-only write tools are a separate category, outside what the MCP server offers.
+        self.assertTrue(CHAT_ONLY_WRITE_TOOLS.isdisjoint(ALL_TOOLS))
+
+    def test_chat_only_write_tools_are_unreachable_over_mcp(self):
+        from mcp_erpnext import server
+
+        self.assertEqual(CHAT_ONLY_WRITE_TOOLS, frozenset({"convert_document"}))
+        for tool in CHAT_ONLY_WRITE_TOOLS:
+            ctx = RequestContext(user_id="u", roles=("System Manager",), read_only=False)
+            decision = check_tool_allowed(ctx, tool)
+            self.assertFalse(decision)
+            self.assertIn("not available", decision.public_message)
+            self.assertFalse(authorize_tool_call(ctx, tool, {"doctype": "Sales Order"}))
+            self.assertNotIn(tool, server.TOOL_METADATA)
+            result = server.dispatch_tool(tool, {"target_doctype": "Sales Order"}, ctx)
+            self.assertFalse(result.get("success", False))
+            self.assertNotEqual(result.get("status"), "success")
 
     def test_all_public_tool_functions_classified(self):
         """Every tool function with a 'client' parameter in crud and reports must be in exactly one set."""
@@ -135,10 +153,11 @@ class TestToolClassification(unittest.TestCase):
                     if "client" in sig.parameters:
                         discovered_tools.add(name)
 
+        classified = ALL_TOOLS | CHAT_ONLY_WRITE_TOOLS
         self.assertEqual(
             discovered_tools,
-            ALL_TOOLS,
-            f"Tool registry mismatch. Unclassified or missing: {discovered_tools ^ ALL_TOOLS}",
+            classified,
+            f"Tool registry mismatch. Unclassified or missing: {discovered_tools ^ classified}",
         )
 
     def test_write_tools_match_graph_ast(self):
@@ -168,7 +187,8 @@ class TestToolClassification(unittest.TestCase):
                                     graph_write_tools = {
                                         elt.value for elt in arg.elts if isinstance(elt, ast.Constant)
                                     }
-            self.assertEqual(WRITE_TOOLS, graph_write_tools)
+            # The graph's write tools are the MCP write tools plus the chat-only ones.
+            self.assertEqual(WRITE_TOOLS | CHAT_ONLY_WRITE_TOOLS, graph_write_tools)
 
 
 class TestCheckToolAllowed(unittest.TestCase):

@@ -41,6 +41,8 @@ logger = logging.getLogger("mcp_erpnext.permissions")
 PERMISSION_TYPE: Dict[str, str] = {
     "create": "create",
     "update": "write",
+    # Making one document from another creates a new one, so ERPNext is asked about "create".
+    "convert": "create",
     "submit": "submit",
     "cancel": "cancel",
     "delete": "delete",
