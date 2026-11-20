@@ -184,7 +184,7 @@ Behaviour worth knowing:
 - A request with nothing to change is asked about, not run. A date that is not a real date is dropped and asked for again, before any confirmation.
 - Item changes on a submitted order are refused by the precondition step with a clear message.
 - The confirmation lists each change, for example `- ITEM-DESK-001: qty from 2 to 12, rate from 100 to 90`, and it records the version of the order it showed. The existing stale-confirmation and `modified` checks apply.
-- The role list is unchanged. Purchase Order is untouched by this phase.
+- The role list is unchanged. Purchase Order got the same treatment in section 6c.
 
 New skill keys (read by the loader, checked by `test_skill_files.py`): `require_any_of` (write skills only) and `field_hints`. New registry keys per operation: `date_fields`, `row_edits`, `draft_only`, `confirm`. A second doctype can reuse all of them by declaring the same keys.
 
@@ -197,6 +197,19 @@ Not verified against a live ERPNext. Check these on a Draft order before relying
 3. The existing delivery-date behaviour (every row gets the new date) is unchanged and was already exercised by the team.
 
 Known limits: the user must give an item code that appears on the order; a product name will be reported as "not on the order". Resolving names against the order's own rows is a possible follow-up.
+
+## 6c. Phase 2 status: Purchase Order widened (21 Nov 2026)
+
+`update-purchase-order` now also changes the quantity and rate of items already on a Draft order, with the same rules as the Sales Order: each change must match exactly one existing row, every row is sent back, quantity above zero, rate zero or more, always confirmed with the old and new values, refused on a submitted order, and sent with the version of the order that was shown. The schedule date and transaction date keep running without a question on a Draft, and both are now checked as real YYYY-MM-DD dates. The existing rule that the schedule date must be after the transaction date still applies. Roles are unchanged (Purchase User and up).
+
+Two differences from the Sales Order:
+
+- There is no PO-reference field. A Purchase Order has no equivalent of the customer's PO number that I am sure of, so none was added rather than guess a field name.
+- A new schedule date is sent as the header field only. It is not copied onto the item rows, because the existing Purchase Order update never did that and how ERPNext syncs the header date for a Purchase Order was not verified.
+
+Adding the doctype needed only a registry entry and the skill: the row-edit, Draft-only, confirmation, preview and verification code is shared. Tests: 33 at the tool layer (`tests/test_purchase_order_edits.py`), plus flow and end-to-end tests in `agent/tests/test_purchase_order_update_flow.py`. Both suites together: 683 and 508 passed, plus the 1 known failure.
+
+The live checks in 6b apply here too (rows kept and recalculated after a PUT with all rows; a rate that sticks when a pricing rule applies).
 
 ## 7. Verification plan
 

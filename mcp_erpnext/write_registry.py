@@ -128,8 +128,19 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
             },
             "update": {
                 "roles": _roles("Purchase User", "Purchase Manager"),
-                "fields": ["schedule_date", "transaction_date"],
-                "child_fields": {},
+                "fields": ["schedule_date", "transaction_date", "item_updates"],
+                "child_fields": {"item_updates": ["item_code", "qty", "rate"]},
+                "date_fields": ["schedule_date", "transaction_date"],
+                "row_edits": {
+                    "item_updates": {
+                        "table": "items",
+                        "match_on": "item_code",
+                        "positive": ["qty"],
+                        "non_negative": ["rate"],
+                    },
+                },
+                "draft_only": ["item_updates"],
+                "confirm": ["item_updates"],
             },
             "submit": {"roles": _roles("Purchase Manager")},
             "cancel": {"roles": _roles("Purchase Manager")},

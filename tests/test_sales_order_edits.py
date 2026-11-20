@@ -226,14 +226,14 @@ class TestRegistryRules:
     def test_registry_reports_what_needs_a_yes_and_what_is_draft_only(self):
         assert wr.get_confirm_fields("Sales Order", "update") == ["item_updates"]
         assert wr.get_draft_only_fields("Sales Order", "update") == ["item_updates"]
-        assert wr.get_confirm_fields("Purchase Order", "update") == []
         assert set(wr.get_row_edits("Sales Order", "update")) == {"item_updates"}
-        assert wr.get_row_edits("Purchase Order", "update") == {}
 
-    def test_purchase_order_update_is_unchanged(self):
+    def test_purchase_order_has_no_sales_order_only_fields(self):
+        # po_no and po_date are Sales Order fields (the customer's PO); a Purchase Order does not take them.
         assert wr.check_write("update", "Purchase Order", {"schedule_date": "2026-12-01"}, ctx=self.admin)
         assert not wr.check_write("update", "Purchase Order", {"po_no": "X"}, ctx=self.admin)
-        assert not wr.check_write("update", "Purchase Order", {"item_updates": [{"item_code": "A", "qty": 1}]}, ctx=self.admin)
+        assert not wr.check_write("update", "Purchase Order", {"po_date": "2026-11-15"}, ctx=self.admin)
+        assert not wr.check_write("update", "Purchase Order", {"delivery_date": "2026-12-01"}, ctx=self.admin)
 
     def test_roles_for_the_widened_update_are_unchanged(self):
         assert wr.check_write("update", "Sales Order", {"po_no": "X"}, ctx=RequestContext(user_id="u", roles=("Sales User",), read_only=False))
