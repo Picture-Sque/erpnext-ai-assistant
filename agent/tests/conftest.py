@@ -1,8 +1,12 @@
 import os
 import json
+import tempfile
 import pytest
 import jwt
 from cryptography.fernet import Fernet
+
+# Tests must never touch the developer's real audit database. Same path as tests/conftest.py.
+os.environ["SQLITE_AUDIT_DB_PATH"] = os.path.join(tempfile.gettempdir(), "erpnext_assistant_test_audit.db")
 
 TEST_CREDENTIAL_ENC_KEY = Fernet.generate_key().decode()
 

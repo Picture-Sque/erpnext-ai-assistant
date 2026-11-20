@@ -47,6 +47,7 @@ logger = logging.getLogger("agent_main")
 # Import compiled graph and states
 from workflow.graph import compiled_graph
 import chat_store
+from audit_logger import init_audit_db
 from tools.adapter import resolve_backend, close_adapter
 
 # Setup FastAPI App
@@ -59,6 +60,7 @@ app = FastAPI(
 @app.on_event("startup")
 def on_startup():
     chat_store.init_db()
+    init_audit_db()
     resolve_backend()
     if os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1"):
         base_url = os.getenv("ERPNEXT_BASE_URL") or os.getenv("ERPNEXT_URL") or "http://localhost:8080"

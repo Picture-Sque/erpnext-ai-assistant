@@ -12,8 +12,15 @@ Tests that check the registry itself must see the real one. Mark them with
 """
 
 import copy
+import os
+import tempfile
 
 import pytest
+
+# Tests must never touch the developer's real audit database: one test deletes and
+# recreates the file at AUDIT_DB_PATH. Set before audit_logger is first imported.
+# Both conftest files use the same path so one test session sees one database.
+os.environ["SQLITE_AUDIT_DB_PATH"] = os.path.join(tempfile.gettempdir(), "erpnext_assistant_test_audit.db")
 
 _ALL_OPS = ("create", "update", "submit", "cancel", "delete")
 _TEST_ROLES = ["System Manager", "Administrator"]
