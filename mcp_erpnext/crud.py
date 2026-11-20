@@ -11,6 +11,7 @@ from mcp_erpnext.aggregation import AGGREGATION_FUNCTIONS, aggregate_rows, group
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.defaults import get_default_company, get_default_warehouse
 from mcp_erpnext.errors import ERPNextError, extract_erpnext_error
+from mcp_erpnext.write_registry import check_write
 
 logger = logging.getLogger("mcp_erpnext.crud")
 
@@ -230,6 +231,21 @@ def get_list(
         return _format_result("system_error", error=str(e))
 
 
+def _guard_write(operation: str, doctype: str, fields: Any = None) -> Optional[dict]:
+    """
+    Registry, role, read-only and field checks for a write. Returns a permission_denied
+    envelope when the write is not allowed, otherwise None. Runs before anything is sent
+    to ERPNext and before any default is applied, so it sees exactly what the caller asked for.
+    """
+    decision = check_write(operation, doctype, fields)
+    if decision:
+        return None
+    logging.getLogger("mcp_erpnext.crud").warning(
+        "Write denied: operation=%s doctype=%s reason=%s", operation, doctype, decision.reason
+    )
+    return _format_result("permission_denied", error=decision.public_message or "Permission denied.")
+
+
 def create_document(
     doctype: str,
     fields: dict,
@@ -245,6 +261,10 @@ def create_document(
 
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+
+    denied = _guard_write("create", doctype, fields)
+    if denied is not None:
+        return denied
 
     payload = dict(fields)
 
@@ -317,6 +337,26 @@ def update_document(
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
+    denied = _guard_write("update", doctype, fields)
+    if denied is not None:
+        return denied
+
+    return _update_unchecked(doctype, name, fields, client=client, document_getter=document_getter, logger=logger)
+
+
+def _update_unchecked(
+    doctype: str,
+    name: str,
+    fields: dict,
+    client: Optional[ERPNextClient] = None,
+    document_getter: Optional[Callable] = None,
+    logger: Optional[logging.Logger] = None,
+) -> dict:
+    """
+    PUT a document. Callers must already have passed the doctype whitelist and the write
+    guard for the operation they represent (update, submit or cancel). submit and cancel
+    send docstatus, which the field check on a plain update rightly refuses.
+    """
     log = logger or logging.getLogger("mcp_erpnext.crud")
     c = client or ERPNextClient()
     doc_getter = document_getter or functools.partial(get_document, client=c)
@@ -370,6 +410,10 @@ def update_document(
 def delete_document(doctype: str, name: str, client: Optional[ERPNextClient] = None) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
+
+    denied = _guard_write("delete", doctype)
+    if denied is not None:
+        return denied
 
     try:
         c = client or ERPNextClient()
@@ -754,11 +798,19 @@ def cancel_document(doctype: str, name: str, client: Optional[ERPNextClient] = N
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-    return update_document(doctype, name, {"docstatus": 2}, client=client)
+    denied = _guard_write("cancel", doctype)
+    if denied is not None:
+        return denied
+
+    return _update_unchecked(doctype, name, {"docstatus": 2}, client=client)
 
 
 def submit_document(doctype: str, name: str, client: Optional[ERPNextClient] = None) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
-    return update_document(doctype, name, {"docstatus": 1}, client=client)
+    denied = _guard_write("submit", doctype)
+    if denied is not None:
+        return denied
+
+    return _update_unchecked(doctype, name, {"docstatus": 1}, client=client)

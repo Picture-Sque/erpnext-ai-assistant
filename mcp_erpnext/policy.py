@@ -15,6 +15,7 @@ from mcp_erpnext.crud import (
     get_allowed_doctypes,
 )
 from mcp_erpnext.reports import get_report_allowlist
+from mcp_erpnext.write_registry import TOOL_TO_OPERATION, check_write
 
 
 @dataclass(frozen=True)
@@ -413,6 +414,20 @@ def authorize_tool_call(
             parent_dec = check_doctype_allowed(args.get("parent_doctype"))
             if not parent_dec:
                 return parent_dec
+
+    # 3b. Write tools must also pass the write registry (operation, role, field checks)
+    if tool_name in WRITE_TOOLS:
+        write_dec = check_write(
+            TOOL_TO_OPERATION[tool_name],
+            args.get("doctype"),
+            args["fields"] if "fields" in args else {},
+            ctx=ctx,
+        )
+        if not write_dec:
+            return PolicyDecision.deny(
+                reason=write_dec.reason,
+                public_message=write_dec.public_message or "Permission denied.",
+            )
 
     # 4. validate_order_by if present
     if "order_by" in args:
