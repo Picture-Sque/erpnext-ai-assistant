@@ -32,11 +32,12 @@ def test_not_found_handling_specific_message(entity_type):
     assert "Did you mean 'BadName1' or 'BadName2'?" in updates["final_response"]
 
 def test_tool_system_failure_for_true_faults():
+    # A read-only request: a true tool fault is retried. Writes are never retried
+    # automatically (see test_write_hardening.py::TestWritesAreNeverRetried).
     state = {
         "failure_classification": "tool_system_failure",
         "retry_count": 0,
         "target_doctype": "Item",
-        "write_rbac_operation": "update"
     }
     
     updates = retry_and_escalation_node(state)

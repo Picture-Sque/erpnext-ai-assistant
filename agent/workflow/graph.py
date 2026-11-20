@@ -3011,6 +3011,16 @@ def format_agent_message_node(state: AgentState):
     return updates
 
 
+def _is_write_flow(state: AgentState) -> bool:
+    """True when the failing request is a write (create, update, submit, cancel, delete)."""
+    if state.get("target_tool") in _WRITE_TOOLS:
+        return True
+    skill = _get_skill_for_intent(state.get("detected_intent", "") or "")
+    if skill and _is_write_intent(skill):
+        return True
+    return state.get("write_rbac_operation") in _TOOL_TO_OPERATION.values()
+
+
 def _retry_and_escalation_node_impl(state: AgentState):
     """
     Central node to evaluate failures and decide whether to retry or escalate.
@@ -3018,16 +3028,45 @@ def _retry_and_escalation_node_impl(state: AgentState):
     classification = state.get("failure_classification")
     if not classification:
         return {}
-        
+
     retry_count = state.get("retry_count", 0)
     doctype = state.get("target_doctype") or "record"
     operation = state.get("write_rbac_operation") or "operation"
-    
+
     updates = {}
-    
+
     # 1. Retry Eligibility
-    eligible_for_retry = classification in ["transient_rate_limit", "tool_system_failure"]
-    
+    # A write is never retried automatically. A retry jumps straight back to the tool step,
+    # which skips the precondition and confirmation steps, and a write that failed on a
+    # timeout or a server error may already have been applied, so repeating it can create
+    # a duplicate or act on a record the user never confirmed.
+    is_write_flow = _is_write_flow(state)
+    eligible_for_retry = classification in ["transient_rate_limit", "tool_system_failure"] and not is_write_flow
+
+    if is_write_flow and classification in ("transient_rate_limit", "tool_system_failure"):
+        tool_raw = state.get("tool_raw_response", {}) or {}
+        erpnext_err = tool_raw.get("error") if isinstance(tool_raw, dict) else None
+        target = (state.get("collected_fields", {}) or {}).get("name") or "unknown"
+        # A failure before the tool ran (preconditions, confirmation) already carries its own
+        # message saying nothing was executed. Only a failure of the write itself needs the caution.
+        message = state.get("final_response") or ""
+        if not message:
+            message = f"Operation failed: {erpnext_err}" if erpnext_err else f"The {operation} on {doctype} failed ({classification})."
+            message += (
+                " It was not retried automatically because the change may already have been applied. "
+                "Please check ERPNext before trying again."
+            )
+        logger.error(f"[Step 8.5] Write {operation} on {doctype} failed ({classification}); not retried: {erpnext_err}")
+        log_audit_event(
+            operation=operation, doctype=doctype, target_name=target, outcome="failed",
+            failure_classification=classification, details=message,
+        )
+        updates["escalated"] = True
+        updates["escalation_reason"] = message
+        updates["is_workflow_complete"] = True
+        updates["final_response"] = message
+        return updates
+
     if eligible_for_retry:
         if retry_count < 2:
             logger.info(f"Retrying operation (attempt {retry_count + 1} of 2) for {classification}")

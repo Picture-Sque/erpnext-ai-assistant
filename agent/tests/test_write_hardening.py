@@ -334,3 +334,76 @@ class TestWriteVerification:
             out = graph.result_validation_node(state)
         assert out["write_verified"] is False
         assert out["failure_classification"] == "conflict_stale_data"
+
+
+class TestWritesAreNeverRetried:
+    """
+    A retry goes straight back to the tool step. For a write that skips the preconditions
+    and the confirmation, and repeats a change that may already have been applied.
+    """
+
+    def _write_state(self, **extra):
+        state = {
+            "detected_intent": "create-sales-order",
+            "write_rbac_operation": "create",
+            "target_doctype": "Sales Order",
+            "failure_classification": "tool_system_failure",
+            "retry_count": 0,
+            "collected_fields": {"customer": "Acme"},
+        }
+        state.update(extra)
+        return state
+
+    def test_failed_write_is_not_retried(self):
+        state = self._write_state(
+            target_tool="create_document",
+            tool_raw_response={"success": False, "status": "system_error", "error": "HTTP 502"},
+        )
+        out = graph._retry_and_escalation_node_impl(state)
+        assert out["is_workflow_complete"] is True
+        assert "retry_count" not in out
+        assert "HTTP 502" in out["final_response"]
+        assert "not retried automatically" in out["final_response"]
+        assert "check ERPNext" in out["final_response"]
+
+    def test_route_after_a_failed_write_never_returns_to_the_tool(self):
+        state = self._write_state(target_tool="create_document", tool_raw_response={"error": "timeout"})
+        merged = {**state, **graph._retry_and_escalation_node_impl(state)}
+        assert graph.route_after_retry_and_escalation(merged) != "call_generic_tool"
+
+    def test_precondition_failure_cannot_fall_through_to_the_write(self):
+        # The duplicate check could not run. The message says nothing was created and the
+        # write must not be reached by a retry.
+        state = self._write_state(
+            preconditions_validated=False,
+            final_response="Could not check for a duplicate Sales Order before creating it: boom. Nothing was created.",
+        )
+        out = graph._retry_and_escalation_node_impl(state)
+        assert out["is_workflow_complete"] is True
+        assert out["final_response"].startswith("Could not check for a duplicate")
+        assert "not retried automatically" not in out["final_response"]
+        merged = {**state, **out}
+        assert graph.route_after_retry_and_escalation(merged) != "call_generic_tool"
+
+    def test_rate_limit_on_a_write_is_not_retried_either(self):
+        state = self._write_state(failure_classification="transient_rate_limit", target_tool="update_document")
+        out = graph._retry_and_escalation_node_impl(state)
+        assert out["is_workflow_complete"] is True
+        assert "retry_count" not in out
+
+    def test_failed_write_is_audited(self):
+        state = self._write_state(target_tool="create_document", tool_raw_response={"error": "HTTP 500"})
+        graph._retry_and_escalation_node_impl(state)
+        assert graph.log_audit_event.call_args.kwargs["outcome"] == "failed"
+
+    def test_reads_are_still_retried(self):
+        state = {
+            "detected_intent": "customer-lookup",
+            "failure_classification": "tool_system_failure",
+            "retry_count": 0,
+            "target_doctype": "Customer",
+            "target_tool": "get_list",
+        }
+        out = graph._retry_and_escalation_node_impl(state)
+        assert out["is_workflow_complete"] is False
+        assert out["retry_count"] == 1
