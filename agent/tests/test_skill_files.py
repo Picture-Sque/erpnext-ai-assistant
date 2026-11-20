@@ -33,6 +33,7 @@ REQUIRED_KEYS = (
 KNOWN_KEYS = set(REQUIRED_KEYS) | {
     "query_parameters", "payload_structure", "not_found_message", "follow_up_eligible",
     "follow_up_slots", "context_pronouns", "chain_exports", "field_values", "outputs", "instructions",
+    "require_any_of", "field_hints",
 }
 
 
@@ -98,6 +99,15 @@ def test_fields_are_declared_where_they_are_used(skill):
     if data.get("follow_up_eligible"):
         assert data["tool"] in READ_TOOLS, f"{folder}: only read skills can be follow-up eligible"
         assert data.get("follow_up_slots"), f"{folder}: follow_up_eligible needs follow_up_slots"
+
+    any_of = data.get("require_any_of") or []
+    assert isinstance(any_of, list), f"{folder}: require_any_of must be a list"
+    assert set(any_of) <= declared, f"{folder}: require_any_of names undeclared fields {set(any_of) - declared}"
+    assert not set(any_of) & required, f"{folder}: require_any_of lists a field that is already required"
+    if any_of:
+        assert data["tool"] in WRITE_TOOLS, f"{folder}: only write skills can use require_any_of"
+    hints = data.get("field_hints") or {}
+    assert isinstance(hints, dict) and set(hints) <= declared, f"{folder}: field_hints must name declared fields"
 
     for field, allowed in (data.get("field_values") or {}).items():
         assert field in declared, f"{folder}: field_values for undeclared field '{field}'"

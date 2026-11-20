@@ -165,6 +165,39 @@ Not verified against a live ERPNext, and the first thing to check before this go
 2. That a PUT carrying the `modified` just read is accepted for update, submit and cancel on both doctypes. If it is wrongly refused, set `ERPNEXT_SEND_MODIFIED=false` and report it. The confirmation-staleness check does not depend on this and keeps working.
 3. The two-user check from section 7, under both `TOOL_BACKEND=direct` and `TOOL_BACKEND=mcp`.
 
+## 6b. Phase 2 status: Sales Order widened (21 Nov 2026)
+
+`update-sales-order` can now change four things, still through the same registry, gate, preconditions and verification:
+
+| Change | Who | Confirmation | Notes |
+|---|---|---|---|
+| `delivery_date` | Sales User and up | none on a Draft (unchanged) | must be a real YYYY-MM-DD date |
+| `po_no`, `po_date` | Sales User and up | none on a Draft | the customer's PO reference |
+| `item_updates`: quantity and/or rate of items already on the order | Sales User and up | always | Draft only; shows old and new values |
+
+Behaviour worth knowing:
+
+- An item change names the item by its code. Each change must match exactly one existing row. An item that is not on the order, or that sits on several rows, stops the whole update with a message and changes nothing.
+- ERPNext replaces a child table with the rows it is sent, so the tool reads the current rows, changes only the named ones and sends every row back with its row name. It never sends a partial row list.
+- Quantity must be above zero and rate zero or more. The same item twice in one request, more than 50 changes, non-numbers, and any other row field (amount, warehouse, docstatus) are refused.
+- Adding items to an order and removing items are not supported. The skill says so.
+- A request with nothing to change is asked about, not run. A date that is not a real date is dropped and asked for again, before any confirmation.
+- Item changes on a submitted order are refused by the precondition step with a clear message.
+- The confirmation lists each change, for example `- ITEM-DESK-001: qty from 2 to 12, rate from 100 to 90`, and it records the version of the order it showed. The existing stale-confirmation and `modified` checks apply.
+- The role list is unchanged. Purchase Order is untouched by this phase.
+
+New skill keys (read by the loader, checked by `test_skill_files.py`): `require_any_of` (write skills only) and `field_hints`. New registry keys per operation: `date_fields`, `row_edits`, `draft_only`, `confirm`. A second doctype can reuse all of them by declaring the same keys.
+
+Tests: 50 at the tool layer (`tests/test_sales_order_edits.py`), 35 on the conversation flow (`agent/tests/test_sales_order_update_flow.py`) and 11 end to end through `/chat` (`agent/tests/test_sales_order_update_e2e.py`). Both suites together: 650 and 486 passed, plus the 1 known failure.
+
+Not verified against a live ERPNext. Check these on a Draft order before relying on it:
+
+1. After a PUT with the full set of item rows, ERPNext keeps the rows (matched by row name) and recalculates each row's amount and the order totals. This is how ERPNext normally behaves, but it was not observed here.
+2. A rate change sticks when the item has a price list rate or a pricing rule. ERPNext can recompute the rate from a pricing rule, in which case verification will report the rate did not land. That fails safe but would need handling.
+3. The existing delivery-date behaviour (every row gets the new date) is unchanged and was already exercised by the team.
+
+Known limits: the user must give an item code that appears on the order; a product name will be reported as "not on the order". Resolving names against the order's own rows is a possible follow-up.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

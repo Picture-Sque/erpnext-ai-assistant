@@ -11,7 +11,7 @@ from mcp_erpnext.aggregation import AGGREGATION_FUNCTIONS, aggregate_rows, group
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.defaults import get_default_company, get_default_warehouse
 from mcp_erpnext.errors import ERPNextError, extract_erpnext_error
-from mcp_erpnext.write_registry import check_write
+from mcp_erpnext.write_registry import check_write, get_child_fields, get_row_edits, to_number
 
 logger = logging.getLogger("mcp_erpnext.crud")
 
@@ -385,6 +385,37 @@ def update_document(
     )
 
 
+def _apply_row_edits(
+    doctype: str, name: str, key: str, spec: dict, edits: list, rows: list
+) -> tuple:
+    """
+    Change the rows named by `edits` (matched on spec["match_on"]) and return (rows, None),
+    or (None, message) when an edit cannot be applied safely. Each edit must match exactly
+    one existing row: no match or several matches is reported, never guessed.
+    """
+    match_on = spec["match_on"]
+    editable = [f for f in get_child_fields(doctype, "update").get(key, []) if f != match_on]
+    if not rows:
+        return None, f"Cannot change items on {doctype} {name}: it has no item rows."
+    for edit in edits:
+        ident = edit.get(match_on)
+        matches = [r for r in rows if str(r.get(match_on)) == str(ident)]
+        if not matches:
+            return None, f"{ident} is not on {doctype} {name}, so nothing was changed."
+        if len(matches) > 1:
+            return None, (
+                f"{ident} appears on {len(matches)} rows of {doctype} {name}, so it is unclear which to change. "
+                f"Nothing was changed. Please change it in ERPNext."
+            )
+        for field in editable:
+            if field in edit:
+                number = to_number(edit[field])
+                if number is None:
+                    return None, f"'{field}' for {ident} is not a number, so nothing was changed."
+                matches[0][field] = number
+    return rows, None
+
+
 def _update_unchecked(
     doctype: str,
     name: str,
@@ -407,30 +438,55 @@ def _update_unchecked(
         return _format_result("system_error", error="Invalid expected_modified: must be the document's modified timestamp.")
 
     payload = dict(fields)
+
+    # Row edits ("change the quantity of X to 5") are not a replacement table. ERPNext replaces
+    # a child table with whatever rows it is sent, so the full current rows are read, the
+    # matching rows are changed, and every row is sent back. Anything less would delete rows.
+    row_edit_specs = {k: v for k, v in get_row_edits(doctype, "update").items() if k in payload}
+    edit_targets = {}
+    for key, spec in row_edit_specs.items():
+        edits = payload.pop(key)
+        edit_targets.setdefault(spec["table"], []).append((key, spec, edits))
+
     # Special handling for Sales Order parent-synced fields:
     # In ERPNext, Sales Order header delivery_date is synced from items[].delivery_date.
     # When updating delivery_date, we must also update delivery_date on every row in items;
     # do not send a partial update when the current document cannot be read.
     # Note: Other parent-synced fields (e.g. warehouse, or rate/qty which recalculate totals)
     # may require similar child table synchronization in future enhancements.
-    if doctype == "Sales Order" and "delivery_date" in payload and "items" not in payload:
+    sync_delivery = doctype == "Sales Order" and "delivery_date" in payload and "items" not in payload
+    if sync_delivery or edit_targets:
+        what = "apply item changes to" if edit_targets else "synchronise item delivery dates for"
         try:
             current_doc_res = doc_getter(doctype, name)
             if current_doc_res.get("status") != "success":
-                err_msg = f"Cannot synchronise item delivery dates for Sales Order {name}: {current_doc_res.get('error')}"
+                err_msg = f"Cannot {what} {doctype} {name}: {current_doc_res.get('error')}"
                 return _format_result(current_doc_res.get("status", "system_error"), error=err_msg)
 
-            current_items = (current_doc_res.get("data") or {}).get("items") or []
-            if current_items:
-                updated_items = []
-                for it in current_items:
-                    it_copy = dict(it)
-                    it_copy["delivery_date"] = payload["delivery_date"]
-                    updated_items.append(it_copy)
-                payload["items"] = updated_items
+            current_doc = current_doc_res.get("data") or {}
+            tables: Dict[str, list] = {}
+            if sync_delivery:
+                tables["items"] = [dict(it) for it in (current_doc.get("items") or [])]
+                for it in tables["items"]:
+                    it["delivery_date"] = payload["delivery_date"]
+            for table, groups in edit_targets.items():
+                rows = tables.get(table)
+                if rows is None:
+                    rows = [dict(it) for it in (current_doc.get(table) or [])]
+                for key, spec, edits in groups:
+                    rows, edit_error = _apply_row_edits(doctype, name, key, spec, edits, rows)
+                    if edit_error:
+                        return _format_result("system_error", error=edit_error)
+                tables[table] = rows
+            for table, rows in tables.items():
+                if rows:
+                    payload[table] = rows
         except RuntimeError as e:
-            log.warning(f"Failed to synchronize items delivery_date for {doctype} {name}: {e}")
-            return _format_result("system_error", error=f"Cannot synchronise item delivery dates for Sales Order {name}: {e}")
+            if edit_targets:
+                log.warning(f"Failed to read {doctype} {name} before applying item changes: {e}")
+            else:
+                log.warning(f"Failed to synchronize items delivery_date for {doctype} {name}: {e}")
+            return _format_result("system_error", error=f"Cannot {what} {doctype} {name}: {e}")
 
     # Send back the `modified` value the caller last read. ERPNext then refuses the write if
     # the document changed in between, instead of silently overwriting the other change.

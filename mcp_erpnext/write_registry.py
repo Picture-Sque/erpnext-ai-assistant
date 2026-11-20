@@ -17,8 +17,11 @@ talked into asking for.
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from mcp_erpnext.auth import RequestContext, get_request_context
@@ -74,6 +77,12 @@ def _roles(*names: str) -> List[str]:
 #   roles         roles allowed to perform it (empty or missing denies everyone)
 #   fields        top-level fields a caller may set (create and update only)
 #   child_fields  {child table field: [fields allowed on each row]} (create and update only)
+#   date_fields   fields that must be a real YYYY-MM-DD date
+#   row_edits     {field: {table, match_on, positive, non_negative}}: the field is a list of edits
+#                 to rows that already exist in `table`, matched on `match_on`. It is not a
+#                 replacement table. Values in `positive` must be > 0, in `non_negative` >= 0.
+#   draft_only    fields that may only be changed while the document is a Draft
+#   confirm       fields that always need an explicit Yes before they are written
 # Per doctype:
 #   duplicate_keys  fields used to look for a likely duplicate before a create
 WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
@@ -89,8 +98,19 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
             },
             "update": {
                 "roles": _roles("Sales User", "Sales Manager"),
-                "fields": ["delivery_date"],
-                "child_fields": {},
+                "fields": ["delivery_date", "po_no", "po_date", "item_updates"],
+                "child_fields": {"item_updates": ["item_code", "qty", "rate"]},
+                "date_fields": ["delivery_date", "po_date"],
+                "row_edits": {
+                    "item_updates": {
+                        "table": "items",
+                        "match_on": "item_code",
+                        "positive": ["qty"],
+                        "non_negative": ["rate"],
+                    },
+                },
+                "draft_only": ["item_updates"],
+                "confirm": ["item_updates"],
             },
             "submit": {"roles": _roles("Sales Manager")},
             "cancel": {"roles": _roles("Sales Manager")},
@@ -208,6 +228,85 @@ def get_child_fields(doctype: Any, operation: Any) -> Dict[str, List[str]]:
     return clean
 
 
+def _names(op_spec: Optional[Dict[str, Any]], key: str) -> List[str]:
+    raw = op_spec.get(key) if op_spec else None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return []
+    return [f for f in raw if isinstance(f, str) and f]
+
+
+def get_date_fields(doctype: Any, operation: Any) -> List[str]:
+    return _names(get_operation_spec(doctype, operation), "date_fields")
+
+
+def get_draft_only_fields(doctype: Any, operation: Any) -> List[str]:
+    return _names(get_operation_spec(doctype, operation), "draft_only")
+
+
+def get_confirm_fields(doctype: Any, operation: Any) -> List[str]:
+    return _names(get_operation_spec(doctype, operation), "confirm")
+
+
+def get_row_edits(doctype: Any, operation: Any) -> Dict[str, Dict[str, Any]]:
+    """Row-edit declarations for an operation: {field: {table, match_on, positive, non_negative}}."""
+    op_spec = get_operation_spec(doctype, operation)
+    raw = op_spec.get("row_edits") if op_spec else None
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, Dict[str, Any]] = {}
+    for field, edit in raw.items():
+        if not (isinstance(field, str) and field and isinstance(edit, dict)):
+            continue
+        table, match_on = edit.get("table"), edit.get("match_on")
+        if not (isinstance(table, str) and table and isinstance(match_on, str) and match_on):
+            continue
+        clean[field] = {
+            "table": table,
+            "match_on": match_on,
+            "positive": _names(edit, "positive"),
+            "non_negative": _names(edit, "non_negative"),
+        }
+    return clean
+
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MAX_ROW_EDITS = 50
+
+
+def is_iso_date(value: Any) -> bool:
+    """A real calendar date written YYYY-MM-DD."""
+    if not isinstance(value, str) or not _ISO_DATE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def to_number(value: Any) -> Optional[float]:
+    """
+    A finite number from an int, a float or a numeric string; None for anything else
+    (booleans, nan, inf, empty or non-numeric text). Whole numbers come back as int.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if isinstance(number, float) and not math.isfinite(number):
+        return None
+    if isinstance(number, float) and number.is_integer():
+        return int(number)
+    return number
+
+
 @dataclass(frozen=True)
 class WriteDecision:
     allowed: bool
@@ -237,6 +336,50 @@ def _role_decision(user_roles: Any, allowed_roles: Iterable[str]) -> bool:
         return False
     have = {r for r in user_roles if isinstance(r, str) and r}
     return bool(have & allowed)
+
+
+def check_row_edits(doctype: Any, operation: Any, key: str, rows: Any) -> WriteDecision:
+    """
+    Validate one row-edit field (for example the changes to existing item rows): a list of
+    1 to MAX_ROW_EDITS objects, each naming an existing row by its `match_on` field once, and
+    changing at least one declared field to a number inside the declared bounds.
+    The message in a denial is safe to show the user.
+    """
+    edit = get_row_edits(doctype, operation).get(key)
+    if edit is None:
+        return _deny(f"'{key}' is not a row-edit field for {operation} on {doctype}.", f"Invalid '{key}' value.")
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_ROW_EDITS:
+        return _deny(f"'{key}' must hold between 1 and {MAX_ROW_EDITS} changes.", f"Invalid '{key}' value.")
+    match_on = edit["match_on"]
+    editable = [f for f in get_child_fields(doctype, operation).get(key, []) if f != match_on]
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return _deny(f"'{key}' changes must be objects.", f"Invalid '{key}' value.")
+        ident = row.get(match_on)
+        if not isinstance(ident, str) or not ident.strip():
+            return _deny(f"Each '{key}' change needs a '{match_on}'.", f"Each change needs a {match_on}.")
+        if ident in seen:
+            return _deny(
+                f"'{match_on}' {ident!r} appears twice in '{key}'.",
+                f"{ident} appears more than once in the changes.",
+            )
+        seen.add(ident)
+        present = [f for f in editable if f in row]
+        if not present:
+            return _deny(
+                f"A '{key}' change for {ident!r} changes nothing.",
+                f"The change for {ident} does not say what to change.",
+            )
+        for f in present:
+            number = to_number(row[f])
+            if number is None:
+                return _deny(f"'{f}' for {ident!r} is not a number.", f"'{f}' for {ident} must be a number.")
+            if f in edit["positive"] and number <= 0:
+                return _deny(f"'{f}' for {ident!r} must be above zero.", f"'{f}' for {ident} must be above zero.")
+            if f in edit["non_negative"] and number < 0:
+                return _deny(f"'{f}' for {ident!r} cannot be negative.", f"'{f}' for {ident} cannot be negative.")
+    return _allow()
 
 
 def _check_fields(doctype: str, operation: str, fields: Any) -> WriteDecision:
@@ -281,6 +424,19 @@ def _check_fields(doctype: str, operation: str, fields: Any) -> WriteDecision:
                         f"Row field '{rkey}' is not declared writable in '{table}' for {doctype}.",
                         f"Field '{rkey}' cannot be set on {doctype} {table} rows.",
                     )
+
+    for key in get_date_fields(doctype, operation):
+        if key in fields and not is_iso_date(fields[key]):
+            return _deny(
+                f"Field '{key}' must be a date written YYYY-MM-DD, got {fields[key]!r}.",
+                f"'{key}' must be a valid date written YYYY-MM-DD.",
+            )
+
+    for key in get_row_edits(doctype, operation):
+        if key in fields:
+            row_decision = check_row_edits(doctype, operation, key, fields[key])
+            if not row_decision:
+                return row_decision
 
     # A scalar value for a table field, or a list for a plain field, is malformed.
     for key, value in fields.items():
@@ -423,6 +579,7 @@ def validate_write_skill(skill: Dict[str, Any]) -> List[str]:
         mappings = (skill.get("payload_structure") or {}).get("field_mappings") or {}
         if operation == "create":
             declared |= {k for k in mappings if isinstance(k, str)}
+        declared |= set(skill.get("require_any_of") or [])
         declared -= {"name", "id", "filters"}
         undeclared = sorted(declared - allowed)
         if undeclared:

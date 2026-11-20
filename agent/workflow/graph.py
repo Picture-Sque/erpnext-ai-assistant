@@ -63,11 +63,18 @@ except ImportError:
 
 from mcp_erpnext.crud import is_conflict_error
 from mcp_erpnext.write_registry import (
+    check_row_edits,
     get_bulk_max_records,
+    get_confirm_fields,
+    get_date_fields,
+    get_draft_only_fields,
     get_duplicate_keys,
     get_operation_roles,
+    get_row_edits,
+    is_iso_date,
     sanitize_payload,
     send_modified_enabled,
+    to_number,
     validate_write_skill,
 )
 
@@ -175,6 +182,11 @@ def load_skills() -> List[Dict[str, Any]]:
                                     "chain_exports": data.get("chain_exports", {}),
                                     # Fields restricted to a fixed set of values: {field: [allowed, ...]}
                                     "field_values": data.get("field_values") or {},
+                                    # Write skills: at least one of these fields must be given
+                                    # (an update with nothing to change is not a request).
+                                    "require_any_of": data.get("require_any_of") or [],
+                                    # Short wording for a field when the user is asked for it.
+                                    "field_hints": data.get("field_hints") or {},
                                     # Result fields later chain steps can reference; defaults to query_parameters.fields
                                     "outputs": data.get("outputs") or [],
                                 }
@@ -282,6 +294,121 @@ def _snapshot_modified(state: AgentState, record_id: Optional[str]) -> Optional[
         return None
     modified = snap.get("modified")
     return str(modified) if modified else None
+
+
+def _has_value(value: Any) -> bool:
+    return value is not None and value != "" and value != [] and str(value).strip() != ""
+
+
+def _check_write_slots(skill: Dict[str, Any], collected: dict) -> Tuple[dict, List[str]]:
+    """
+    Early checks on what a write skill collected, before anything is resolved or confirmed:
+    dates must be real YYYY-MM-DD dates, row-edit slots must be well formed numbers inside
+    their bounds, and a skill that says "at least one of these" must have one.
+    Returns (collected with values tidied, messages to ask the user about). Values that fail
+    are removed so they are asked for again, never sent on.
+    """
+    operation = _TOOL_TO_OPERATION.get(skill.get("tool", ""))
+    if not operation:
+        return collected, []
+    doctype = skill.get("doctype", "")
+    out = dict(collected)
+    problems: List[str] = []
+
+    for field in get_date_fields(doctype, operation):
+        if _has_value(out.get(field)):
+            text = str(out[field]).strip()
+            if is_iso_date(text):
+                out[field] = text
+            else:
+                out.pop(field)
+                problems.append(f"{field.replace('_', ' ')} as a date written YYYY-MM-DD")
+
+    for key, spec in get_row_edits(doctype, operation).items():
+        if not _has_value(out.get(key)):
+            out.pop(key, None)
+            continue
+        rows = out[key]
+        if isinstance(rows, dict):
+            rows = [rows]
+        tidy = []
+        for entry in rows if isinstance(rows, list) else []:
+            if isinstance(entry, dict):
+                row = {k: v for k, v in entry.items() if _has_value(v)}
+                if isinstance(row.get(spec["match_on"]), str):
+                    row[spec["match_on"]] = row[spec["match_on"]].strip()
+                for field in list(row):
+                    if field != spec["match_on"] and to_number(row[field]) is not None:
+                        row[field] = to_number(row[field])
+                tidy.append(row)
+            else:
+                tidy.append(entry)
+        decision = check_row_edits(doctype, operation, key, tidy)
+        if decision:
+            out[key] = tidy
+        else:
+            out.pop(key)
+            problems.append(decision.public_message or key.replace("_", " "))
+
+    any_of = skill.get("require_any_of") or []
+    if any_of and not any(_has_value(out.get(f)) for f in any_of):
+        wanted = ", ".join(f.replace("_", " ") for f in any_of)
+        if not problems:
+            problems.append(f"at least one thing to change ({wanted})")
+    return out, problems
+
+
+def _format_value(value: Any) -> str:
+    return "(empty)" if value is None or value == "" else str(value)
+
+
+def _describe_update_changes(skill: Dict[str, Any], collected: dict, snapshot: Optional[dict]) -> str:
+    """
+    One line per change an update will make, with the current value when it is known:
+    '- delivery_date: from 2026-11-01 to 2026-12-01'. Empty when there is nothing to show.
+    """
+    doctype = skill.get("doctype", "")
+    payload = _update_payload(skill, collected)
+    doc = snapshot if isinstance(snapshot, dict) else {}
+    row_edits = get_row_edits(doctype, "update")
+    lines: List[str] = []
+    for field, value in payload.items():
+        if field in row_edits:
+            spec = row_edits[field]
+            rows = doc.get(spec["table"]) or []
+            for edit in value:
+                ident = edit.get(spec["match_on"])
+                current = next((r for r in rows if str(r.get(spec["match_on"])) == str(ident)), None)
+                parts = []
+                for changed in (k for k in edit if k != spec["match_on"]):
+                    before = current.get(changed) if current else None
+                    parts.append(f"{changed} from {_format_value(before)} to {_format_value(edit[changed])}" if current else f"{changed} to {_format_value(edit[changed])}")
+                lines.append(f"- {ident}: " + ", ".join(parts))
+        else:
+            lines.append(f"- {field}: from {_format_value(doc.get(field))} to {_format_value(value)}" if field in doc else f"- {field}: to {_format_value(value)}")
+    return "\n".join(lines)
+
+
+def _row_edit_failure(skill: Dict[str, Any], collected: dict, doc: dict) -> Optional[str]:
+    """
+    After an update, check that every row change landed. Returns a message for the first one
+    that did not, or None. Quantities and rates are compared as numbers.
+    """
+    doctype = skill.get("doctype", "")
+    payload = _update_payload(skill, collected)
+    for field, spec in get_row_edits(doctype, "update").items():
+        for edit in payload.get(field) or []:
+            ident = edit.get(spec["match_on"])
+            row = next((r for r in (doc.get(spec["table"]) or []) if str(r.get(spec["match_on"])) == str(ident)), None)
+            if row is None:
+                return f"{ident} was not found on the document after the update."
+            for changed, wanted in edit.items():
+                if changed == spec["match_on"]:
+                    continue
+                actual, expected = to_number(row.get(changed)), to_number(wanted)
+                if actual is None or expected is None or abs(actual - expected) > 1e-6:
+                    return f"Requested {changed} of {wanted} for {ident}, but the document still shows {row.get(changed)} after the update."
+    return None
 
 
 def _target_record_id(collected: dict, resolved_entities: dict) -> Optional[str]:
@@ -844,6 +971,15 @@ def validate_parameters_node(state: AgentState):
         else:
             collected[field] = normalized
 
+    # 4. Write skills: dates, row edits and "at least one change" are checked here, so a bad
+    #    value is asked about now instead of failing at ERPNext after a confirmation.
+    collected, slot_problems = _check_write_slots(skill, collected)
+    if slot_problems:
+        all_required_filled = False
+        for message in slot_problems:
+            if message not in missing_parameters:
+                missing_parameters.append(message)
+
     updates = {
         "all_required_filled": all_required_filled,
         "missing_parameters": missing_parameters,
@@ -874,6 +1010,9 @@ def _describe_field(skill: Dict[str, Any], field: str) -> str:
     """'supplier' -> 'supplier'; a fixed-value field also lists its options."""
     name = field.replace("_", " ")
     options = (skill.get("field_values") or {}).get(field)
+    hint = (skill.get("field_hints") or {}).get(field)
+    if hint:
+        return f"{name} ({hint})"
     return f"{name} (one of: {', '.join(options)})" if options else name
 
 
@@ -1794,6 +1933,15 @@ def precondition_validation_node(state: AgentState):
                 )
             # Submitted documents can still have some amendable fields — we skip that
             # level of field-specific ERPNext validation here; it will surface at execution.
+            # Fields the registry marks draft-only (such as changes to item rows) are the
+            # exception: ERPNext does not accept them on a submitted document.
+            draft_only = [f for f in get_draft_only_fields(doctype, "update") if _has_value(collected.get(f))]
+            if draft_only and docstatus != _DOCSTATUS_DRAFT:
+                incompatible = True
+                reason = (
+                    f"{doctype} '{record_id}' is {status_name}, so this change cannot be made. "
+                    f"It is only allowed on a Draft ({', '.join(f.replace('_', ' ') for f in draft_only)})."
+                )
         elif operation == "delete":
             if docstatus == _DOCSTATUS_SUBMITTED:
                 incompatible = True
@@ -1843,6 +1991,9 @@ def precondition_validation_node(state: AgentState):
     if operation in {"create", "update"}:
         required_fields = skill.get("required_fields", [])
         missing = [f for f in required_fields if not collected.get(f)]
+        any_of = skill.get("require_any_of") or []
+        if any_of and not any(_has_value(collected.get(f)) for f in any_of):
+            missing.append("at least one of: " + ", ".join(any_of))
         if missing:
             logger.warning(f"[Step 5.5] Check 3 FAIL: missing required fields: {missing}")
             missing_str = ", ".join(f"'{f}'" for f in missing)
@@ -2058,6 +2209,11 @@ def confirmation_node(state: AgentState):
                 )
                 requires_confirmation = True
 
+    # Changes the registry marks as needing a Yes (for example new quantities or rates) always ask.
+    if operation == "update" and not requires_confirmation:
+        if any(_has_value(collected.get(f)) for f in get_confirm_fields(doctype, operation)):
+            requires_confirmation = True
+
     if not requires_confirmation:
         logger.info(f"[Step 6] Confirmation skipped: operation '{operation}' does not require explicit confirmation.")
         return {}
@@ -2152,6 +2308,14 @@ def confirmation_node(state: AgentState):
                 scope_desc = f"{operation.capitalize()} {doctype} {record_id} for '{display_name}' (closest match to '{matched_on}')?"
             else:
                 scope_desc = f"Are you sure you want to {operation} {doctype} '{record_id}'?"
+            if operation == "update":
+                # Show exactly what will change, with the current values when they are known.
+                snapshot = state.get("last_read_snapshot")
+                if not (isinstance(snapshot, dict) and str(snapshot.get("name")) == str(record_id)):
+                    snapshot = None
+                changes = _describe_update_changes(skill, collected, snapshot)
+                if changes:
+                    scope_desc += f"\nChanges:\n{changes}"
 
         pending = {
             "operation": operation,
@@ -2770,6 +2934,13 @@ def result_validation_node(state: AgentState):
                                 failure_classification = "conflict_stale_data"
                                 failure_msg = f"Requested update to '{k}' to '{expected_val}' on {doctype} '{record_id}', but the document still shows '{doc[k]}' after verification. The update may not have completed."
                                 break
+                        # Row changes (quantities and rates on existing item rows) must have landed.
+                        if write_verified and skill:
+                            row_failure = _row_edit_failure(skill, collected, doc)
+                            if row_failure:
+                                write_verified = False
+                                failure_classification = "conflict_stale_data"
+                                failure_msg = f"{row_failure} The update may not have completed."
                         # Issue 2: Verify child rows for Sales Order delivery_date
                         if write_verified and doctype == "Sales Order" and "delivery_date" in collected:
                             exp_date = str(collected["delivery_date"])
