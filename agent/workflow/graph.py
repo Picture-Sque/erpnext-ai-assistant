@@ -72,9 +72,13 @@ from mcp_erpnext.write_registry import (
     get_draft_only_fields,
     get_duplicate_keys,
     get_duplicate_slot,
+    get_identity_slot,
     get_operation_roles,
     get_row_edits,
     get_row_sync,
+    get_similar_by,
+    get_writable_fields,
+    is_confirm_always,
     is_iso_date,
     sanitize_payload,
     send_modified_enabled,
@@ -281,6 +285,9 @@ def _update_payload(skill: Dict[str, Any], collected: dict) -> Dict[str, Any]:
     """
     doctype = skill.get("doctype", "")
     declared = _declared_slots(skill) - set(_WRITE_SLOT_EXTRAS)
+    identity = get_identity_slot(doctype, "update")
+    if identity:
+        declared.discard(identity)  # it names the record; it is not something the update changes
     picked = {k: v for k, v in (collected or {}).items() if k in declared}
     clean, dropped = sanitize_payload(doctype, "update", picked)
     if dropped:
@@ -436,15 +443,20 @@ def _row_sync_failure(skill: Dict[str, Any], collected: dict, doc: dict, record_
     return None
 
 
-def _target_record_id(collected: dict, resolved_entities: dict) -> Optional[str]:
+def _target_record_id(collected: dict, resolved_entities: dict, skill: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    The record an update/submit/cancel/delete acts on. An explicit id/name slot wins;
-    resolved_entities is only a fallback, because it can also hold related records
-    (e.g. a resolved supplier) that are not the target document.
+    The record an update/submit/cancel/delete acts on. An explicit id/name slot wins, then the
+    slot the registry names as the identity of the record (a customer is asked for by name and
+    resolved with the user); resolved_entities is only a fallback, because it can also hold
+    related records (e.g. a resolved supplier) that are not the target document.
     """
     explicit = (collected or {}).get("id") or (collected or {}).get("name")
     if explicit:
         return explicit
+    if skill:
+        slot = get_identity_slot(skill.get("doctype", ""), _TOOL_TO_OPERATION.get(skill.get("tool", "")))
+        if slot and (collected or {}).get(slot):
+            return collected[slot]
     for resolved in (resolved_entities or {}).values():
         if isinstance(resolved, dict) and resolved.get("name"):
             return resolved.get("name")
@@ -1245,6 +1257,12 @@ def entity_resolution_and_read_rbac_node(state: AgentState):
         search_key = cfg["collected_key"]
         raw_value = collected.get(search_key)
 
+        # A create names a NEW record of its own doctype. Resolving that name against existing
+        # records would swap in a similar one ("Acme" becoming "Acme Corp") or ask which existing
+        # record the user means. The duplicate and similar-name checks look after it instead.
+        if skill.get("tool") == "create_document" and res_doctype == doctype:
+            continue
+
         if raw_value and not resolved_entities.get(search_key):
             logger.info(f"[Step 3] Attempting entity resolution: {res_doctype}.{search_key} = '{raw_value}'")
             res = search_document(res_doctype, str(raw_value))
@@ -1850,7 +1868,7 @@ def precondition_validation_node(state: AgentState):
 
     is_bulk = False
     if operation in _REQUIRES_EXISTING_DOC:
-        record_id = _target_record_id(collected, resolved_entities)
+        record_id = _target_record_id(collected, resolved_entities, skill)
 
         if not record_id:
             if collected.get("filters"):
@@ -2095,6 +2113,30 @@ def precondition_validation_node(state: AgentState):
         logger.info("[Step 5.5] Check 4 SKIP: no prior snapshot to compare against.")
 
     # -------------------------------------------------------------------------
+    # Check 4b: a record with this exact name must not already exist (master data)
+    # -------------------------------------------------------------------------
+    similar = get_similar_by(doctype, operation) if operation == "create" else None
+    if similar and _has_value(collected.get(similar["slot"])):
+        wanted = str(collected[similar["slot"]]).strip()
+        found = search_document(doctype, wanted)
+        if found.get("status") not in ("success", "empty"):
+            logger.error(f"[Step 5.5] Check 4b FAIL: could not look for an existing {doctype}: {found.get('error')}")
+            return {
+                "preconditions_validated": False,
+                "failure_classification": "permission_denied" if found.get("status") == "permission_denied" else "tool_system_failure",
+                "final_response": f"Could not check whether a {doctype} named '{wanted}' already exists: {found.get('error') or found.get('status')}. Nothing was created.",
+            }
+        for row in found.get("data") or []:
+            existing = str(row.get(similar["field"]) or row.get("name") or "").strip()
+            if existing.lower() == wanted.lower():
+                logger.warning(f"[Step 5.5] Check 4b FAIL: {doctype} '{existing}' already exists.")
+                return {
+                    "preconditions_validated": False,
+                    "failure_classification": "validation_error",
+                    "final_response": f"{doctype} '{existing}' already exists, so nothing was created. To change it, ask me to update it.",
+                }
+
+    # -------------------------------------------------------------------------
     # Check 5: Idempotency (create operations)
     # -------------------------------------------------------------------------
     idempotency_check_performed = False
@@ -2249,7 +2291,7 @@ def confirmation_node(state: AgentState):
     collected = state.get("collected_fields") or {}
     messages = state.get("messages", [])
 
-    record_id = None if operation == "create" else _target_record_id(collected, resolved_entities)
+    record_id = None if operation == "create" else _target_record_id(collected, resolved_entities, skill)
 
     # Confirm-before-write for updates on submitted documents (docstatus == 1)
     if operation == "update" and not requires_confirmation:
@@ -2267,6 +2309,10 @@ def confirmation_node(state: AgentState):
                     f"({cur_doc.get('status')}: {cur_doc.get('error')}); requiring confirmation."
                 )
                 requires_confirmation = True
+
+    # Creating master data always asks, with a note of similar existing records.
+    if operation == "create" and is_confirm_always(doctype, operation):
+        requires_confirmation = True
 
     # Changes the registry marks as needing a Yes (for example new quantities or rates) always ask.
     if operation == "update" and not requires_confirmation:
@@ -2355,7 +2401,7 @@ def confirmation_node(state: AgentState):
         logger.info(f"[Step 6] Generating confirmation ask for BULK {operation} on {doctype}.")
     else:
         if operation == "create":
-            scope_desc = _describe_create_scope(doctype, collected)
+            scope_desc = _describe_create_scope(doctype, collected) + _describe_create_extras(doctype, collected)
         else:
             target_info = next(
                 (v for v in resolved_entities.values() if isinstance(v, dict) and v.get("name") == record_id),
@@ -2492,6 +2538,26 @@ def _describe_create_scope(doctype: str, collected: dict) -> str:
     return "\n".join(lines)
 
 
+def _describe_create_extras(doctype: str, collected: dict) -> str:
+    """
+    For a create that always asks (master data): the details about to be saved, and any existing
+    records with a similar name, so the user is not creating a look-alike by accident.
+    Empty for creates that do not always ask.
+    """
+    if not is_confirm_always(doctype, "create"):
+        return ""
+    similar = get_similar_by(doctype, "create")
+    shown = [f for f in get_writable_fields(doctype, "create") if _has_value(collected.get(f)) and not isinstance(collected.get(f), (list, dict))]
+    lines = [f"- {f.replace('_', ' ')}: {collected[f]}" for f in shown if not (similar and f == similar["field"])]
+    text = ("\nDetails:\n" + "\n".join(lines)) if lines else ""
+    if similar and _has_value(collected.get(similar["slot"])):
+        found = search_document(doctype, str(collected[similar["slot"]]).strip())
+        names = [str(r.get(similar["field"]) or r.get("name")) for r in (found.get("data") or []) if isinstance(r, dict)][:5]
+        if names:
+            text += f"\nNote: {doctype} records with a similar name already exist: {', '.join(names)}."
+    return text
+
+
 # =========================================================================
 # Step 7: Skill Execution (call_generic_tool)
 # =========================================================================
@@ -2520,7 +2586,8 @@ def call_generic_tool_node(state: AgentState):
     else:
         tool = skill.get("tool", "get_list")
         doctype_name = skill.get("doctype", "")
-    record_id = collected.get("id") or collected.get("name")
+    # The record an update acts on: the id or name slot, or the slot the registry names for it.
+    record_id = _target_record_id(collected, {}, skill) if skill else (collected.get("id") or collected.get("name"))
 
     # Whitelist check
     if not is_doctype_allowed(doctype_name):

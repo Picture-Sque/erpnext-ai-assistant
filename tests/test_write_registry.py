@@ -79,7 +79,7 @@ class TestCheckWrite:
         assert c.read_only is True
         assert not wr.check_write("submit", "Sales Order", ctx=c)
 
-    @pytest.mark.parametrize("doctype", ["Customer", "Item", "Bin", "Stock Ledger Entry", "Company", "Warehouse", "User", "", None])
+    @pytest.mark.parametrize("doctype", ["Supplier", "Item", "Bin", "Stock Ledger Entry", "Company", "Warehouse", "User", "", None])
     def test_doctypes_without_an_entry_cannot_be_written(self, doctype):
         for op in ("create", "update", "submit", "cancel", "delete"):
             assert not wr.check_write(op, doctype, {}, ctx=ctx("System Manager")), (doctype, op)
@@ -145,7 +145,7 @@ class TestContextHandling:
     def test_no_context_allowed_when_not_strict_but_registry_still_applies(self, monkeypatch):
         monkeypatch.setenv("ERPNEXT_STRICT_IDENTITY", "false")
         assert wr.check_write("create", "Sales Order", {"customer": "A", "items": SO_ITEMS})
-        assert not wr.check_write("create", "Customer", {"customer_name": "A"})
+        assert not wr.check_write("create", "Supplier", {"supplier_name": "A"})
         assert not wr.check_write("update", "Sales Order", {"grand_total": 1})
 
     def test_ambient_context_is_used(self):
@@ -223,7 +223,7 @@ class TestSanitizePayload:
         assert set(dropped) == {"docstatus", "filters"}
 
     def test_unregistered_doctype_yields_nothing(self):
-        assert wr.sanitize_payload("Customer", "create", {"customer_name": "A"}) == ({}, ["customer_name"])
+        assert wr.sanitize_payload("Supplier", "create", {"supplier_name": "A"}) == ({}, ["supplier_name"])
 
     def test_non_dict_input(self):
         assert wr.sanitize_payload("Sales Order", "create", None) == ({}, [])
@@ -331,7 +331,7 @@ class TestPolicyEnforcement:
 
     def test_write_tool_denied_for_unregistered_doctype(self):
         dec = authorize_tool_call(
-            ctx("System Manager"), "create_document", {"doctype": "Customer", "fields": {"customer_name": "A"}}
+            ctx("System Manager"), "create_document", {"doctype": "Supplier", "fields": {"supplier_name": "A"}}
         )
         assert not dec
 
@@ -382,7 +382,7 @@ class TestSkillValidation:
         assert wr.validate_write_skill({"name": "x", "tool": "get_list", "doctype": "Customer"}) == []
 
     def test_unregistered_doctype_reported(self):
-        assert wr.validate_write_skill(self.base_skill(doctype="Customer"))
+        assert wr.validate_write_skill(self.base_skill(doctype="Supplier"))
 
     def test_extra_role_reported(self):
         problems = wr.validate_write_skill(self.base_skill(allowed_roles=["Sales User", "Accounts User"]))

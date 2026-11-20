@@ -280,6 +280,37 @@ Tests: 51 at the registry and tool layers (`tests/test_quotation.py`), and 16 on
 
 Not covered: turning a Quotation into a Sales Order (a mapped-document operation, Tier 2), listing quotations, and the checks listed as not verified in section 6e (pricing rules, company-level User Permissions, product names instead of codes).
 
+## 6g. Customer (21 Nov 2026)
+
+Master data, so the rules are stricter than for documents. Two skills: `create-customer` and `update-customer`. Finding and listing customers is the existing `customer-lookup`.
+
+| Operation | Who | Notes |
+|---|---|---|
+| create | Sales User and up | always asks first; shows the details and any existing customers with a similar name; an exact existing name is refused |
+| update | Sales User and up | customer group, territory, customer type, website; always asks first, with old and new values |
+| submit, cancel, delete | nobody | a customer is not a submitted document; delete is not registered |
+
+Writable fields are the customer name (create only), customer type (Company, Individual or Partnership), customer group, territory and website. Everything else is refused before any call to ERPNext: credit limits, accounts, price list, payment terms, tax ID and category, the disabled and frozen flags, account manager, sales team, addresses and contacts, and renaming. Credit limits are in a separate table in ERPNext, so leaving that table out of the registry keeps them off limits entirely.
+
+Live finding that shaped this: ERPNext does not refuse an exact duplicate customer name over REST. Creating "X" twice produced a second customer with the same customer name and the record name "X - 1". That is why the assistant checks for an exact existing name itself (case-insensitive, against the same search the confirmation uses) and stops with "Customer 'X' already exists, so nothing was created". If the existing names cannot be looked up, nothing is created.
+
+How it works, using the shared machinery plus four small registry options (each usable by any doctype):
+
+- `confirm_always` on create: the confirmation always appears.
+- `similar_by`: names to search for before a create, shown in the confirmation as "similar records already exist" and used for the exact-name check.
+- `identity_slot` on update: the user names the customer rather than giving a record id, so the customer is resolved against existing customers (and the user is asked to pick when several match, for example "Acme" matches three) and used as the record to change. The slot names the record; it is never something the update changes.
+- `choices`: the allowed customer types, checked at the tool layer and normalised from the user's wording (for example "individual" becomes "Individual").
+
+One behaviour change in entity resolution: when a skill creates a record, resolving its name against existing records of the same doctype is skipped. Without that, "create customer Acme" would have silently become "Acme Corp" or asked which existing customer was meant. Resolving the customer named by a quotation, an update or an order is unchanged.
+
+Keywords were kept specific on purpose. Generic phrases such as "update the customer" also match Sales Order requests like "update the customer PO number on ...", so only phrases naming the group, territory or website route by keyword, and everything else is left to the classifier.
+
+Live check (throwaway customers, deleted afterwards): create with type, group and territory works and the customer is named by its customer name; a name-only customer is accepted by ERPNext with group and territory empty; an update saves group, territory and website; a stale update is refused as a Conflict; the credit limit, price list, payment terms, tax ID, disabled flag, a rename and an invalid type are each refused with nothing changed; delete is refused. One probe duplicate was created on purpose to see ERPNext's behaviour and was initially missed by my cleanup script. It was found by name straight away and deleted, and no probe customer remains.
+
+Tests: 53 at the registry and tool layers (`tests/test_customer.py`), 30 on the conversation flow and end to end through `/chat` (`agent/tests/test_customer_flow.py`), including the ambiguous "Acme" question, an exact duplicate refused without asking, a "no" creating nothing, off-limits fields ignored, and a colleague's edit between the question and the Yes. Both suites together: 845 and 639 passed, plus the 1 known failure.
+
+Not covered: disabling or deleting a customer, addresses and contacts, credit limits (by design), and changing a customer's name.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

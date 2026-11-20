@@ -66,8 +66,11 @@ def _legacy_write_doctypes(request, monkeypatch):
     import mcp_erpnext.write_registry as write_registry
 
     extended = copy.deepcopy(write_registry.WRITE_REGISTRY)
+    # These stand-ins REPLACE a real entry of the same name (Customer is now registered for real,
+    # with a narrower field list and no delete) so the old tests of crud mechanics keep running.
+    # A test of the real entry is marked real_write_registry and does not get this fixture.
     for name, spec in _LEGACY_TEST_DOCTYPES.items():
-        extended.setdefault(name, copy.deepcopy(spec))
+        extended[name] = copy.deepcopy(spec)
     monkeypatch.setattr(write_registry, "WRITE_REGISTRY", extended)
     yield
 

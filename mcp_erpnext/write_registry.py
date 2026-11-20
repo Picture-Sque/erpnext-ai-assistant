@@ -85,6 +85,10 @@ def _roles(*names: str) -> List[str]:
 #                 `table`, so changing it means setting `field` on every row (verified live for
 #                 the Sales Order delivery date and the Purchase Order schedule date: a
 #                 header-only change is accepted and silently has no effect)
+#   choices       {field: [allowed values]}
+#   identity_slot the slot that names the record an update acts on, when that is not "name"
+#   confirm_always  every use of this operation needs an explicit Yes (create, for master data)
+#   similar_by    {field, slot}: before a create, look for existing records with a similar name
 #   draft_only    fields that may only be changed while the document is a Draft
 #   confirm       fields that always need an explicit Yes before they are written
 # Per doctype:
@@ -185,6 +189,34 @@ WRITE_REGISTRY["Quotation"] = {
         },
         "submit": {"roles": _roles("Sales Manager")},
         "cancel": {"roles": _roles("Sales Manager")},
+    },
+}
+
+
+WRITE_REGISTRY["Customer"] = {
+    # Master data: not submittable, so every change lands on live records. A create always asks
+    # (with a note of similar existing names) and an update always asks, with a before and after.
+    # Credit limits, accounts, tax, payment terms and the like are not listed: not writable.
+    "duplicate_keys": ["customer_name"],
+    "operations": {
+        "create": {
+            "roles": _roles("Sales User", "Sales Manager"),
+            "fields": ["customer_name", "customer_type", "customer_group", "territory", "website"],
+            "child_fields": {},
+            "choices": {"customer_type": ["Company", "Individual", "Partnership"]},
+            "confirm_always": True,
+            "similar_by": {"field": "customer_name", "slot": "customer_name"},
+        },
+        "update": {
+            "roles": _roles("Sales User", "Sales Manager"),
+            "fields": ["customer_type", "customer_group", "territory", "website"],
+            "child_fields": {},
+            "choices": {"customer_type": ["Company", "Individual", "Partnership"]},
+            # The user names the customer (and ambiguity is resolved with them), so the record is
+            # identified by this slot, which is not itself something an update may change.
+            "identity_slot": "customer_name",
+            "confirm": ["customer_type", "customer_group", "territory", "website"],
+        },
     },
 }
 
@@ -330,6 +362,39 @@ def get_row_edits(doctype: Any, operation: Any) -> Dict[str, Dict[str, Any]]:
             "non_negative": _names(edit, "non_negative"),
         }
     return clean
+
+
+def get_identity_slot(doctype: Any, operation: Any) -> Optional[str]:
+    """The slot that names the target record of an operation, or None when it is "name"."""
+    op_spec = get_operation_spec(doctype, operation)
+    slot = op_spec.get("identity_slot") if op_spec else None
+    return slot if isinstance(slot, str) and slot else None
+
+
+def is_confirm_always(doctype: Any, operation: Any) -> bool:
+    op_spec = get_operation_spec(doctype, operation)
+    return bool(op_spec and op_spec.get("confirm_always") is True)
+
+
+def get_similar_by(doctype: Any, operation: Any) -> Optional[Dict[str, str]]:
+    """{field, slot} to look for similar existing records before a create, or None."""
+    op_spec = get_operation_spec(doctype, operation)
+    spec = op_spec.get("similar_by") if op_spec else None
+    if isinstance(spec, dict) and isinstance(spec.get("field"), str) and isinstance(spec.get("slot"), str):
+        return {"field": spec["field"], "slot": spec["slot"]}
+    return None
+
+
+def get_choices(doctype: Any, operation: Any) -> Dict[str, List[str]]:
+    op_spec = get_operation_spec(doctype, operation)
+    raw = op_spec.get("choices") if op_spec else None
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: [v for v in vals if isinstance(v, str)]
+        for k, vals in raw.items()
+        if isinstance(k, str) and isinstance(vals, (list, tuple))
+    }
 
 
 def get_row_sync(doctype: Any, operation: Any) -> Dict[str, Dict[str, str]]:
@@ -511,6 +576,13 @@ def _check_fields(doctype: str, operation: str, fields: Any) -> WriteDecision:
                 f"'{key}' must be a valid date written YYYY-MM-DD.",
             )
 
+    for key, allowed_values in get_choices(doctype, operation).items():
+        if key in fields and fields[key] not in allowed_values:
+            return _deny(
+                f"Field '{key}' must be one of {allowed_values}, got {fields[key]!r}.",
+                f"'{key}' must be one of: {', '.join(allowed_values)}.",
+            )
+
     for key in get_row_edits(doctype, operation):
         if key in fields:
             row_decision = check_row_edits(doctype, operation, key, fields[key])
@@ -659,6 +731,13 @@ def validate_write_skill(skill: Dict[str, Any]) -> List[str]:
         mappings = payload_structure.get("field_mappings") or {}
         declared |= set(skill.get("require_any_of") or [])
         declared -= {"name", "id", "filters"}
+        identity = get_identity_slot(doctype, operation)
+        if identity:
+            # The slot that names the record is not a field the operation changes, but the skill
+            # must ask for it, or an update would have no target.
+            declared.discard(identity)
+            if identity not in (skill.get("required_fields") or []):
+                problems.append(f"skill '{name}': must require '{identity}', which names the record to {operation}")
         if operation == "create":
             # A create builds its payload from `fixed` and `field_mappings` ({document field: slot}),
             # so the slot a user is asked for may have another name than the field it fills

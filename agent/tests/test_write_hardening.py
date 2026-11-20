@@ -299,6 +299,7 @@ class TestSkillLoading:
             "create-sales-order", "update-sales-order", "submit-sales-order", "cancel-sales-order",
             "create-purchase-order", "update-purchase-order", "submit-purchase-order", "cancel-purchase-order",
             "create-quotation", "update-quotation", "submit-quotation", "cancel-quotation",
+            "create-customer", "update-customer",
         }
 
 
