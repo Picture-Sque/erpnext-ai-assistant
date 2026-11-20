@@ -407,3 +407,130 @@ class TestWritesAreNeverRetried:
         out = graph._retry_and_escalation_node_impl(state)
         assert out["is_workflow_complete"] is False
         assert out["retry_count"] == 1
+
+
+MODIFIED = "2026-11-20 10:15:30.123456"
+NEWER = "2026-11-20 10:20:00.000001"
+
+
+class TestConcurrencyInTheGraph:
+    def _confirm_state(self, **extra):
+        state = {
+            "detected_intent": "submit-sales-order",
+            "preconditions_validated": True,
+            "write_rbac_operation": "submit",
+            "collected_fields": {"name": "SO-1"},
+            "resolved_entities": {},
+            "messages": [],
+            "user_sub": "u@example.com",
+            "user_roles": ["Sales Manager"],
+            "last_read_snapshot": {"name": "SO-1", "docstatus": 0, "modified": MODIFIED},
+        }
+        state.update(extra)
+        return state
+
+    def test_confirmation_records_the_version_the_user_is_asked_about(self):
+        out = graph.confirmation_node(self._confirm_state())
+        assert out["pending_confirmation"]["target_modified"] == MODIFIED
+
+    def test_confirmation_ignores_a_snapshot_of_another_record(self):
+        state = self._confirm_state(last_read_snapshot={"name": "SO-2", "docstatus": 0, "modified": MODIFIED})
+        out = graph.confirmation_node(state)
+        assert out["pending_confirmation"]["target_modified"] is None
+
+    def _precondition_state(self, asked):
+        return {
+            "detected_intent": "submit-sales-order",
+            "write_rbac_operation": "submit",
+            "collected_fields": {"name": "SO-1"},
+            "resolved_entities": {},
+            "confirmation_result": "confirmed",
+            "confirmed_action": {"skill": "submit-sales-order", "operation": "submit", "target_modified": asked},
+        }
+
+    def test_edit_between_ask_and_yes_is_refused(self):
+        fresh = {"name": "SO-1", "docstatus": 0, "modified": NEWER}
+        with patch.object(graph, "get_document", return_value=ok(fresh)):
+            out = graph.precondition_validation_node(self._precondition_state(MODIFIED))
+        assert out["preconditions_validated"] is False
+        assert out["failure_classification"] == "conflict_stale_data"
+        assert "was changed after you were asked to confirm" in out["final_response"]
+        assert "Nothing was executed" in out["final_response"]
+
+    def test_unchanged_document_passes(self):
+        fresh = {"name": "SO-1", "docstatus": 0, "modified": MODIFIED}
+        with patch.object(graph, "get_document", return_value=ok(fresh)):
+            out = graph.precondition_validation_node(self._precondition_state(MODIFIED))
+        assert out["preconditions_validated"] is True
+
+    def test_confirmation_without_a_recorded_version_still_works(self):
+        fresh = {"name": "SO-1", "docstatus": 0, "modified": NEWER}
+        with patch.object(graph, "get_document", return_value=ok(fresh)):
+            out = graph.precondition_validation_node(self._precondition_state(None))
+        assert out["preconditions_validated"] is True
+
+    def _tool_state(self, intent, collected, snapshot_name="SO-1"):
+        return {
+            "detected_intent": intent,
+            "collected_fields": collected,
+            "last_read_snapshot": {"name": snapshot_name, "modified": MODIFIED},
+        }
+
+    def test_submit_and_cancel_carry_the_version(self):
+        with patch.object(graph, "submit_document", return_value=ok()) as sub:
+            graph.call_generic_tool_node(self._tool_state("submit-sales-order", {"name": "SO-1"}))
+        sub.assert_called_once_with("Sales Order", "SO-1", expected_modified=MODIFIED)
+        with patch.object(graph, "cancel_document", return_value=ok()) as can:
+            graph.call_generic_tool_node(self._tool_state("cancel-sales-order", {"name": "SO-1"}))
+        can.assert_called_once_with("Sales Order", "SO-1", expected_modified=MODIFIED)
+
+    def test_update_carries_the_version(self):
+        with patch.object(graph, "update_document", return_value=ok()) as upd:
+            graph.call_generic_tool_node(
+                self._tool_state("update-sales-order", {"name": "SO-1", "delivery_date": "2026-12-01"})
+            )
+        upd.assert_called_once_with("Sales Order", "SO-1", {"delivery_date": "2026-12-01"}, expected_modified=MODIFIED)
+
+    def test_version_of_another_record_is_not_sent(self):
+        with patch.object(graph, "submit_document", return_value=ok()) as sub:
+            graph.call_generic_tool_node(self._tool_state("submit-sales-order", {"name": "SO-1"}, snapshot_name="SO-9"))
+        sub.assert_called_once_with("Sales Order", "SO-1")
+
+    def test_switch_turns_sending_off(self, monkeypatch):
+        monkeypatch.setenv("ERPNEXT_SEND_MODIFIED", "false")
+        with patch.object(graph, "submit_document", return_value=ok()) as sub:
+            graph.call_generic_tool_node(self._tool_state("submit-sales-order", {"name": "SO-1"}))
+        sub.assert_called_once_with("Sales Order", "SO-1")
+
+    def test_create_never_sends_a_version(self):
+        state = {
+            "detected_intent": "create-sales-order",
+            "collected_fields": {"customer": "Acme", "items": [{"item_code": "A", "qty": 1}], "delivery_date": "2026-12-01"},
+            "last_read_snapshot": {"name": "SO-1", "modified": MODIFIED},
+        }
+        with patch.object(graph, "create_document", return_value=ok()) as create:
+            graph.call_generic_tool_node(state)
+        assert "expected_modified" not in create.call_args.kwargs
+
+    def test_a_refused_write_is_a_conflict_that_is_not_retried(self):
+        conflict = {
+            "status": "system_error", "success": False, "data": None, "has_more": False,
+            "error": "Conflict: Sales Order SO-1 was changed by someone else after it was last read, so nothing was changed.",
+        }
+        with patch.object(graph, "submit_document", return_value=conflict):
+            out = graph.call_generic_tool_node(self._tool_state("submit-sales-order", {"name": "SO-1"}))
+        assert out["failure_classification"] == "conflict_stale_data"
+        assert "changed by someone else" in out["final_response"]
+        assert "review the current document" in out["final_response"]
+
+        merged = {**self._tool_state("submit-sales-order", {"name": "SO-1"}), **out, "retry_count": 0}
+        retry = graph._retry_and_escalation_node_impl(merged)
+        assert retry["is_workflow_complete"] is True
+        assert "retry_count" not in retry
+        assert graph.route_after_retry_and_escalation({**merged, **retry}) == "format_response"
+
+    def test_an_ordinary_failure_is_still_not_a_conflict(self):
+        failure = {"status": "system_error", "success": False, "data": None, "has_more": False, "error": "HTTP 500"}
+        with patch.object(graph, "submit_document", return_value=failure):
+            out = graph.call_generic_tool_node(self._tool_state("submit-sales-order", {"name": "SO-1"}))
+        assert out["failure_classification"] == "tool_system_failure"

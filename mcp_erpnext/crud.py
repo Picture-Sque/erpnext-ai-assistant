@@ -246,6 +246,43 @@ def _guard_write(operation: str, doctype: str, fields: Any = None) -> Optional[d
     return _format_result("permission_denied", error=decision.public_message or "Permission denied.")
 
 
+# Prefix of the error text for a write ERPNext refused because the document changed after it
+# was last read. The envelope keeps its five keys and existing statuses; callers recognise
+# the prefix to tell a conflict from an ordinary failure.
+CONFLICT_PREFIX = "Conflict:"
+
+
+def is_conflict_error(error: Any) -> bool:
+    return isinstance(error, str) and error.startswith(CONFLICT_PREFIX)
+
+
+def _is_conflict_response(response: Any) -> bool:
+    """
+    True when ERPNext refused a write because the `modified` we sent is older than the
+    stored one (Frappe raises TimestampMismatchError). Detection is deliberately lenient:
+    it looks at the exception type and at the standard message wording.
+    """
+    if getattr(response, "is_success", False):
+        return False
+    texts = []
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            texts.extend(str(body.get(k, "")) for k in ("exc_type", "exception", "_server_messages", "message"))
+    except Exception:
+        pass
+    try:
+        texts.append(str(response.text))
+    except Exception:
+        pass
+    blob = " ".join(texts).lower()
+    return "timestampmismatcherror" in blob or "has been modified after you have opened it" in blob
+
+
+def _valid_expected_modified(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and bool(value.strip()))
+
+
 def create_document(
     doctype: str,
     fields: dict,
@@ -333,6 +370,7 @@ def update_document(
     client: Optional[ERPNextClient] = None,
     document_getter: Optional[Callable] = None,
     logger: Optional[logging.Logger] = None,
+    expected_modified: Optional[str] = None,
 ) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
@@ -341,7 +379,10 @@ def update_document(
     if denied is not None:
         return denied
 
-    return _update_unchecked(doctype, name, fields, client=client, document_getter=document_getter, logger=logger)
+    return _update_unchecked(
+        doctype, name, fields, client=client, document_getter=document_getter, logger=logger,
+        expected_modified=expected_modified,
+    )
 
 
 def _update_unchecked(
@@ -351,6 +392,7 @@ def _update_unchecked(
     client: Optional[ERPNextClient] = None,
     document_getter: Optional[Callable] = None,
     logger: Optional[logging.Logger] = None,
+    expected_modified: Optional[str] = None,
 ) -> dict:
     """
     PUT a document. Callers must already have passed the doctype whitelist and the write
@@ -360,6 +402,9 @@ def _update_unchecked(
     log = logger or logging.getLogger("mcp_erpnext.crud")
     c = client or ERPNextClient()
     doc_getter = document_getter or functools.partial(get_document, client=c)
+
+    if not _valid_expected_modified(expected_modified):
+        return _format_result("system_error", error="Invalid expected_modified: must be the document's modified timestamp.")
 
     payload = dict(fields)
     # Special handling for Sales Order parent-synced fields:
@@ -387,6 +432,11 @@ def _update_unchecked(
             log.warning(f"Failed to synchronize items delivery_date for {doctype} {name}: {e}")
             return _format_result("system_error", error=f"Cannot synchronise item delivery dates for Sales Order {name}: {e}")
 
+    # Send back the `modified` value the caller last read. ERPNext then refuses the write if
+    # the document changed in between, instead of silently overwriting the other change.
+    if expected_modified:
+        payload["modified"] = expected_modified.strip()
+
     try:
         c = client or ERPNextClient()
         response = c.put(f"/api/resource/{doctype}/{name}", json=payload, timeout=60.0)
@@ -397,6 +447,14 @@ def _update_unchecked(
                 return _format_result("success", data=data)
             except Exception:
                 return _format_result("system_error", error="Invalid JSON response")
+        elif expected_modified and _is_conflict_response(response):
+            return _format_result(
+                "system_error",
+                error=(
+                    f"{CONFLICT_PREFIX} {doctype} {name} was changed by someone else after it was last read, "
+                    f"so nothing was changed."
+                ),
+            )
         elif response.status_code == 404:
             return _format_result("not_found", error=extract_erpnext_error(response))
         elif response.status_code in (401, 403):
@@ -794,7 +852,12 @@ def aggregate(
     )
 
 
-def cancel_document(doctype: str, name: str, client: Optional[ERPNextClient] = None) -> dict:
+def cancel_document(
+    doctype: str,
+    name: str,
+    client: Optional[ERPNextClient] = None,
+    expected_modified: Optional[str] = None,
+) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
@@ -802,10 +865,15 @@ def cancel_document(doctype: str, name: str, client: Optional[ERPNextClient] = N
     if denied is not None:
         return denied
 
-    return _update_unchecked(doctype, name, {"docstatus": 2}, client=client)
+    return _update_unchecked(doctype, name, {"docstatus": 2}, client=client, expected_modified=expected_modified)
 
 
-def submit_document(doctype: str, name: str, client: Optional[ERPNextClient] = None) -> dict:
+def submit_document(
+    doctype: str,
+    name: str,
+    client: Optional[ERPNextClient] = None,
+    expected_modified: Optional[str] = None,
+) -> dict:
     if not is_doctype_allowed(doctype):
         return _format_result("permission_denied", error=f"DocType '{doctype}' is not permitted by whitelist.")
 
@@ -813,4 +881,4 @@ def submit_document(doctype: str, name: str, client: Optional[ERPNextClient] = N
     if denied is not None:
         return denied
 
-    return _update_unchecked(doctype, name, {"docstatus": 1}, client=client)
+    return _update_unchecked(doctype, name, {"docstatus": 1}, client=client, expected_modified=expected_modified)

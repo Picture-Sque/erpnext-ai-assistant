@@ -381,11 +381,12 @@ class ToolAdapter:
             return blocked
         return generic_tools.create_document(doctype=doctype, fields=fields)
 
-    def update_document(self, doctype: str, name: str, fields: dict) -> dict:
+    def update_document(self, doctype: str, name: str, fields: dict, expected_modified: Optional[str] = None) -> dict:
         blocked = self._check_read_only_write("update_document")
         if blocked is not None:
             return blocked
-        return generic_tools.update_document(doctype=doctype, name=name, fields=fields)
+        extra = {"expected_modified": expected_modified} if expected_modified else {}
+        return generic_tools.update_document(doctype=doctype, name=name, fields=fields, **extra)
 
     def delete_document(self, doctype: str, name: str) -> dict:
         blocked = self._check_read_only_write("delete_document")
@@ -393,17 +394,19 @@ class ToolAdapter:
             return blocked
         return generic_tools.delete_document(doctype=doctype, name=name)
 
-    def cancel_document(self, doctype: str, name: str) -> dict:
+    def cancel_document(self, doctype: str, name: str, expected_modified: Optional[str] = None) -> dict:
         blocked = self._check_read_only_write("cancel_document")
         if blocked is not None:
             return blocked
-        return generic_tools.cancel_document(doctype=doctype, name=name)
+        extra = {"expected_modified": expected_modified} if expected_modified else {}
+        return generic_tools.cancel_document(doctype=doctype, name=name, **extra)
 
-    def submit_document(self, doctype: str, name: str) -> dict:
+    def submit_document(self, doctype: str, name: str, expected_modified: Optional[str] = None) -> dict:
         blocked = self._check_read_only_write("submit_document")
         if blocked is not None:
             return blocked
-        return generic_tools.submit_document(doctype=doctype, name=name)
+        extra = {"expected_modified": expected_modified} if expected_modified else {}
+        return generic_tools.submit_document(doctype=doctype, name=name, **extra)
 
 
 # Default global adapter instance

@@ -128,6 +128,15 @@ def writes_disabled() -> bool:
     return os.getenv("ERPNEXT_WRITES_DISABLED", "").strip().lower() in ("true", "1", "yes")
 
 
+def send_modified_enabled() -> bool:
+    """
+    Whether writes carry the `modified` value the caller last read, so ERPNext rejects the
+    write when the document changed in between. On by default. ERPNEXT_SEND_MODIFIED=false
+    turns it off without a code change, for a site where ERPNext reports it differently.
+    """
+    return os.getenv("ERPNEXT_SEND_MODIFIED", "true").strip().lower() not in ("false", "0", "no")
+
+
 def get_bulk_max_records() -> int:
     """Maximum documents one confirmed bulk action may touch (WRITE_BULK_MAX, default 25)."""
     raw = os.getenv("WRITE_BULK_MAX", "").strip()

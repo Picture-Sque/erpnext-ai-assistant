@@ -61,11 +61,13 @@ except ImportError:
         get_default_warehouse,
     )
 
+from mcp_erpnext.crud import is_conflict_error
 from mcp_erpnext.write_registry import (
     get_bulk_max_records,
     get_duplicate_keys,
     get_operation_roles,
     sanitize_payload,
+    send_modified_enabled,
     validate_write_skill,
 )
 
@@ -268,6 +270,18 @@ def _update_payload(skill: Dict[str, Any], collected: dict) -> Dict[str, Any]:
     if dropped:
         logger.warning(f"[Write] Dropped undeclared update fields for {doctype}: {sorted(dropped)}")
     return clean
+
+
+def _snapshot_modified(state: AgentState, record_id: Optional[str]) -> Optional[str]:
+    """
+    The `modified` value of the document the user's decision is based on: the snapshot the
+    precondition step just read, if it is for this record. None when there is no such snapshot.
+    """
+    snap = state.get("last_read_snapshot") or {}
+    if not record_id or not isinstance(snap, dict) or str(snap.get("name")) != str(record_id):
+        return None
+    modified = snap.get("modified")
+    return str(modified) if modified else None
 
 
 def _target_record_id(collected: dict, resolved_entities: dict) -> Optional[str]:
@@ -1801,6 +1815,29 @@ def precondition_validation_node(state: AgentState):
         )
 
     # -------------------------------------------------------------------------
+    # Check 2b: the document must not have changed since the user was asked to confirm
+    # -------------------------------------------------------------------------
+    confirmed_pending = state.get("confirmed_action") if state.get("confirmation_result") == "confirmed" else None
+    if confirmed_pending and fresh_snapshot is not None and not is_bulk:
+        asked_modified = confirmed_pending.get("target_modified")
+        now_modified = fresh_snapshot.get("modified")
+        if asked_modified and now_modified and str(asked_modified) != str(now_modified):
+            logger.warning(
+                f"[Step 5.5] Check 2b FAIL: {doctype} '{record_id}' changed after the confirmation was requested "
+                f"({asked_modified} -> {now_modified})."
+            )
+            return {
+                "preconditions_validated": False,
+                "last_read_snapshot": fresh_snapshot,
+                "failure_classification": "conflict_stale_data",
+                "final_response": (
+                    f"{doctype} '{record_id}' was changed after you were asked to confirm "
+                    f"(last modified {now_modified}). Nothing was executed. "
+                    f"Please review the current document and ask again."
+                ),
+            }
+
+    # -------------------------------------------------------------------------
     # Check 3: Required fields present (safety net)
     # -------------------------------------------------------------------------
     if operation in {"create", "update"}:
@@ -2122,6 +2159,9 @@ def confirmation_node(state: AgentState):
             "target_name": record_id if operation != "create" else "(new)",
             "is_bulk": False,
             "scope_description": scope_desc,
+            # The version of the document the user is being asked about. If it has changed by
+            # the time they answer Yes, the action is refused (precondition Check 2b).
+            "target_modified": _snapshot_modified(state, record_id) if operation != "create" else None,
         }
         logger.info(f"[Step 6] Generating confirmation ask for {operation} on {doctype} '{pending['target_name']}'.")
 
@@ -2511,6 +2551,13 @@ def call_generic_tool_node(state: AgentState):
         }
     else:
         logger.info(f"Calling generic tool: {tool} on DocType: {doctype_name} with params: {parameters}")
+        # The write carries the `modified` value the preconditions just read, so ERPNext refuses
+        # it if someone else changed the document in between instead of overwriting their change.
+        concurrency = {}
+        if tool in ("update_document", "cancel_document", "submit_document") and send_modified_enabled():
+            expected_modified = _snapshot_modified(state, record_id)
+            if expected_modified:
+                concurrency["expected_modified"] = expected_modified
         try:
             if tool == "create_document":
                 tool_res = create_document(doctype_name, parameters)
@@ -2565,13 +2612,13 @@ def call_generic_tool_node(state: AgentState):
                         limit=parameters.get("limit"),
                     )
             elif tool == "update_document":
-                tool_res = update_document(doctype_name, record_id, parameters)
+                tool_res = update_document(doctype_name, record_id, parameters, **concurrency)
             elif tool == "delete_document":
                 tool_res = delete_document(doctype_name, record_id)
             elif tool == "cancel_document":
-                tool_res = cancel_document(doctype_name, record_id)
+                tool_res = cancel_document(doctype_name, record_id, **concurrency)
             elif tool == "submit_document":
-                tool_res = submit_document(doctype_name, record_id)
+                tool_res = submit_document(doctype_name, record_id, **concurrency)
             else:
                 tool_res = {"success": False, "error": f"Unknown tool: {tool}"}
         except Exception as e:
@@ -2595,6 +2642,12 @@ def call_generic_tool_node(state: AgentState):
         failure_classification = "not_found"
     elif tool_status == "permission_denied":
         failure_classification = "permission_denied"
+    elif tool_status == "system_error" and is_conflict_error(tool_res.get("error")):
+        # Someone else changed the document after it was read. Not a fault, and never retried.
+        failure_classification = "conflict_stale_data"
+        updates["final_response"] = (
+            f"{tool_res['error']} Please review the current document and ask again."
+        )
     elif tool_status == "system_error":
         failure_classification = "tool_system_failure"
     elif not tool_res.get("success", False):

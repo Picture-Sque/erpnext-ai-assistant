@@ -67,13 +67,15 @@ def create_document(doctype: str, fields: dict) -> dict:
     )
 
 
-def update_document(doctype: str, name: str, fields: dict) -> dict:
+def update_document(doctype: str, name: str, fields: dict, expected_modified: Optional[str] = None) -> dict:
+    extra = {"expected_modified": expected_modified} if expected_modified else {}
     return crud.update_document(
         doctype=doctype,
         name=name,
         fields=fields,
         document_getter=get_document,
         logger=logger,
+        **extra,
     )
 
 
@@ -128,15 +130,19 @@ def aggregate(
     )
 
 
-def cancel_document(doctype: str, name: str) -> dict:
+def cancel_document(doctype: str, name: str, expected_modified: Optional[str] = None) -> dict:
+    extra = {"expected_modified": expected_modified} if expected_modified else {}
     return crud.cancel_document(
         doctype=doctype,
         name=name,
+        **extra,
     )
 
 
-def submit_document(doctype: str, name: str) -> dict:
+def submit_document(doctype: str, name: str, expected_modified: Optional[str] = None) -> dict:
+    extra = {"expected_modified": expected_modified} if expected_modified else {}
     return crud.submit_document(
         doctype=doctype,
         name=name,
+        **extra,
     )
