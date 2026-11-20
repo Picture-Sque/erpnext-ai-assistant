@@ -311,6 +311,28 @@ Tests: 53 at the registry and tool layers (`tests/test_customer.py`), 30 on the 
 
 Not covered: disabling or deleting a customer, addresses and contacts, credit limits (by design), and changing a customer's name.
 
+## 6h. Supplier (21 Nov 2026)
+
+The mirror of Customer for the purchasing side. Three skills: `create-supplier`, `update-supplier` and a new read-only `supplier-lookup` (there was no plain supplier lookup, only purchase analysis).
+
+| Operation | Who | Notes |
+|---|---|---|
+| create | Purchase User and up | always asks first; shows the details and any existing suppliers with a similar name; an exact existing name is refused |
+| update | Purchase User and up | supplier group, country, supplier type, website; always asks first, with old and new values |
+| submit, cancel, delete | nobody | a supplier is not a submitted document; delete is not registered |
+
+Sales and Accounts roles cannot write a Supplier, and Purchase roles cannot write a Customer; tests pin that neither entry leaks into the other.
+
+Writable fields: supplier name (create only), supplier type (Company, Individual or Partnership), supplier group, country and website. Not writable, each refused before any call to ERPNext: payment hold and its type and release date, payment terms, tax ID, category and withholding, default bank account and price list, currency, the disabled, frozen, transporter and internal-supplier flags, the two switches that allow purchase invoices without a purchase order or receipt, accounts, allowed companies, portal users, addresses and contacts, and renaming.
+
+It reuses the Customer machinery unchanged (`confirm_always`, `similar_by`, `identity_slot`, `choices`, `duplicate_slots`), so adding it needed only a registry entry and skills. Entity resolution already had a Supplier entry keyed on the `supplier` slot, so that slot is both the create's name and the update's identity, which also makes the question read "for supplier 'X'". The existing resolution of the supplier named by a purchase order is unaffected, and resolving the name of a supplier being created is skipped, as for customers.
+
+Live check, 29 of 29 passed (throwaway suppliers): create with type, group, country and website; a name-only supplier is accepted; update saves group, country, website and type; a stale update is refused as a Conflict; fourteen off-limits fields (payment hold, hold type and release date, payment terms, tax ID, tax withholding, bank account, disabled, frozen, transporter, the invoice switch, accounts, renaming, a bad type) are each refused with nothing changed; delete is refused. Difference from Customer: ERPNext does refuse a duplicate supplier name ("already exists"), unlike customers where it creates "X - 1", so for suppliers the assistant's exact-name check mainly gives an earlier and clearer message. Cleanup this time tracked every record and finished with a sweep by probe name; no probe supplier remains.
+
+Tests: 57 at the registry and tool layers (`tests/test_supplier.py`) and 22 on the conversation flow and end to end through `/chat` (`agent/tests/test_supplier_flow.py`). Both suites together: 901 and 690 passed, plus the 1 known failure. Earlier registry tests that used Supplier as their example of an unregistered doctype now use Bin, which is read-only by design and will not be registered.
+
+Not covered: disabling or deleting a supplier, putting a supplier on payment hold (by design), addresses and contacts, bank details.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

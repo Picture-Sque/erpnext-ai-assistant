@@ -300,6 +300,7 @@ class TestSkillLoading:
             "create-purchase-order", "update-purchase-order", "submit-purchase-order", "cancel-purchase-order",
             "create-quotation", "update-quotation", "submit-quotation", "cancel-quotation",
             "create-customer", "update-customer",
+            "create-supplier", "update-supplier",
         }
 
 

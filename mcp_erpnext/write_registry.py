@@ -221,6 +221,34 @@ WRITE_REGISTRY["Customer"] = {
 }
 
 
+WRITE_REGISTRY["Supplier"] = {
+    # Master data, like Customer. The supplier is asked for as "the supplier", so the create slot
+    # and the update's identity slot are both `supplier`, which is also what entity resolution
+    # already resolves against existing suppliers. Payment holds, tax, payment terms, accounts,
+    # the disabled and frozen flags and the purchasing switches are not listed: not writable.
+    "duplicate_keys": ["supplier_name"],
+    "duplicate_slots": {"supplier_name": "supplier"},
+    "operations": {
+        "create": {
+            "roles": _roles("Purchase User", "Purchase Manager"),
+            "fields": ["supplier_name", "supplier_type", "supplier_group", "country", "website"],
+            "child_fields": {},
+            "choices": {"supplier_type": ["Company", "Individual", "Partnership"]},
+            "confirm_always": True,
+            "similar_by": {"field": "supplier_name", "slot": "supplier"},
+        },
+        "update": {
+            "roles": _roles("Purchase User", "Purchase Manager"),
+            "fields": ["supplier_type", "supplier_group", "country", "website"],
+            "child_fields": {},
+            "choices": {"supplier_type": ["Company", "Individual", "Partnership"]},
+            "identity_slot": "supplier",
+            "confirm": ["supplier_type", "supplier_group", "country", "website"],
+        },
+    },
+}
+
+
 def get_write_registry() -> Dict[str, Dict[str, Any]]:
     """The active registry. Read through this function so tests can substitute it."""
     return WRITE_REGISTRY
