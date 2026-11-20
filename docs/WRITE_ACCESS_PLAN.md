@@ -242,9 +242,13 @@ Confirmed:
 
 Found and fixed: the Purchase Order schedule date no-op described in section 6c.
 
+A second run (same day, with the user's go-ahead) took one throwaway Sales Order and one Purchase Order through draft, submit, cancel and delete:
+
+- `submit` and `cancel` carrying `modified` behave like update. With a stale value ERPNext refuses, nothing changes (the document stays Draft after a refused submit and Submitted after a refused cancel) and the project reports a Conflict. With the fresh value both succeed.
+- Submitting moved the item's stock bin figures as expected (Sales Order: reserved quantity up by 1; Purchase Order: ordered quantity up by 1), and cancelling put them back exactly, so the test left no stock or ledger residue. Both cancelled documents were then deleted.
+
 Still not verified live:
 
-- `submit` and `cancel` carrying `modified` (only update was exercised; submitting a draft needs a decision about test data, because it posts to stock and ledgers).
 - A rate change on an item where a pricing rule applies. ERPNext can recompute the rate from the rule; write verification would report that, but it was not exercised.
 - User Permissions that restrict by company, territory or similar. A create is only checked at doctype level, so such a restriction would be enforced by ERPNext at write time.
 - Item changes where the user names the product rather than its code.
