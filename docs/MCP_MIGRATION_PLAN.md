@@ -456,7 +456,7 @@ Live testing revealed that with `TOOL_BACKEND=mcp`, chat reads by a restricted u
 
 ### Open Items & Technical Debt
 1. **`ERPNEXT_STRICT_IDENTITY` default & single helper**: Align on whether the unified helper should default to strict mode across all modules once legacy test dependencies are reviewed.
-2. **`require_writable()` in `crud.py`**: Explicitly enforce write-context barriers in `crud.py` for direct and MCP write operations.
+2. **`require_writable()` in `crud.py`**: Resolved (Nov 2026). `crud.py` write functions now call the write registry check, which refuses read-only sessions with `permission_denied` before any HTTP call. See `docs/WRITE_ACCESS_PLAN.md` section 6a.
 3. **HTTP Server Forwarding Option**: Investigate future architectural option for the chatbot to call the MCP HTTP server directly and forward the user's JWT/session token over the wire rather than in-process dispatch.
 4. **Dev-mock fallback in adapter**: Clean up or deprecate the `ALLOW_DEV_MOCK_AUTH` fallback in `ToolAdapter._get_mcp_client()` for stricter production invariants.
 5. **Concurrency Test Duration**: Optimize the 50-iteration concurrent test in `tests/test_adapter_mcp_identity.py` (currently ~19s) to reduce total CI/test suite runtime.

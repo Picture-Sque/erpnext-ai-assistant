@@ -130,6 +130,41 @@ Phase 5, hardening. Intent-collision tests for the new skills (the keyword route
 
 Working agreements stay as in plan section 2: small commits, tests green each time, stage by explicit path, `git pull --rebase` before push, user pushes through GitHub Desktop.
 
+## 6a. Phase 0 status (21 Nov 2026)
+
+Phase 0 is implemented on `mcp-integration` in five local commits (`34041cc`, `777ee9d`, `5702669`, `a0e8f49`, `5c69e10`), not pushed. Test result with the local `.env` overrides neutralised: `tests` 600 passed and 1 failed, `agent/tests` 437 passed; run together, 1037 passed and 1 failed. The one failure is the known genericity scan, unchanged.
+
+| Finding | State |
+|---|---|
+| 1 Update sends every collected key | Fixed. Update and create payloads come from the skill's declared fields intersected with the registry. Slot extraction for a write skill ignores undeclared model output. Verification checks what was sent. |
+| 2 No write allowlist in the tool layer | Fixed. `mcp_erpnext/write_registry.py`, enforced in `crud.py` and `policy.py`. Only Sales Order and Purchase Order are registered. Delete is registered nowhere. |
+| 3 `require_writable()` not in `crud.py` | Fixed. Read-only sessions get `permission_denied` from the registry check before any HTTP call. |
+| 4 Audit events lose the user | Fixed. User and request id come from the request context. `request_id` column added with an in-place migration. |
+| 5 No `modified` on writes | Implemented, not verified live (see below). |
+| 6 Hard-coded `customer` duplicate check | Fixed. Keys come from the registry. Purchase Orders were not duplicate-checked at all before; now they are, by supplier. |
+| 7 Unbounded bulk | Fixed. Cap of `WRITE_BULK_MAX` (default 25), bulk delete refused, the 999,999 read is gone. |
+| 8 Static role names | Partly. The registry is now the single source of truth, a write skill that exceeds it is not loaded, and the write gate checks both. The ERPNext permission preflight (Layer 3) is Phase 1 and is not done. |
+| 9 Unconfirmed create and draft update | Unchanged. Product decision (section 8). |
+
+Found during the work and also fixed:
+
+- A failed write could be retried by the graph. A retry jumps straight back to the tool step, skipping the precondition and confirmation steps. A transient error reading the target, or a duplicate check that failed with "Nothing was created", led to the write running anyway, and a create that timed out but had landed could be created twice. Writes are no longer retried automatically. Reads still are. `test_tool_system_failure_for_true_faults` used an update as its example of a retried fault and now uses a read.
+- The audit table was never created at startup, so on a fresh deployment every audit write failed silently. Startup now creates it, and an event that finds no table creates it and retries.
+- One genericity test deletes the file at `AUDIT_DB_PATH`, which was the developer's real `agent/audit_log.db`. Both test suites now use a temporary audit database.
+
+Behaviour changes to know about:
+
+- The System Manager only `/api/tools/add`, `/update` and `/delete` endpoints now go through the same registry. They can no longer write Customer, Item or any doctype that is not registered, and delete is unavailable there too. Say if the admin endpoint should keep a wider reach.
+- A write skill with no `allowed_roles` is denied. Before, an empty list meant open to everyone.
+- New settings, all optional: `ERPNEXT_WRITES_DISABLED`, `WRITE_BULK_MAX`, `ERPNEXT_SEND_MODIFIED`, `SQLITE_AUDIT_DB_PATH` (documented in `agent/.env.example`).
+- To add a doctype or operation, add it to `WRITE_REGISTRY` first, then the skill. The loader refuses a skill that goes beyond the registry.
+
+Not verified against a live ERPNext, and the first thing to check before this goes anywhere near users:
+
+1. That a PUT carrying a stale `modified` is refused, and what it returns. The code treats a response with exception type `TimestampMismatchError`, or the standard "has been modified after you have opened it" wording, as a conflict. If ERPNext words it differently the write still fails safely as an ordinary error, but the message will be less clear.
+2. That a PUT carrying the `modified` just read is accepted for update, submit and cancel on both doctypes. If it is wrongly refused, set `ERPNEXT_SEND_MODIFIED=false` and report it. The confirmation-staleness check does not depend on this and keeps working.
+3. The two-user check from section 7, under both `TOOL_BACKEND=direct` and `TOOL_BACKEND=mcp`.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.
