@@ -173,10 +173,34 @@ class TestFlow:
             return graph.result_validation_node(state)
 
     def test_changes_that_landed_are_verified_and_ones_that_did_not_are_caught(self):
-        doc = {"name": "PO-1", "schedule_date": "2026-12-01", "items": [{"item_code": "ALUM", "qty": 150, "rate": 300}]}
+        doc = {
+            "name": "PO-1", "schedule_date": "2026-12-01",
+            "items": [{"item_code": "ALUM", "qty": 150, "rate": 300, "schedule_date": "2026-12-01"}],
+        }
         assert self._verify({"name": "PO-1", "schedule_date": "2026-12-01", "item_updates": [{"item_code": "ALUM", "qty": 150}]}, doc)["write_verified"] is True
         out = self._verify({"name": "PO-1", "item_updates": [{"item_code": "ALUM", "rate": 310}]}, doc)
         assert out["write_verified"] is False and "rate of 310 for ALUM" in out["final_response"]
+
+    def test_a_schedule_date_must_be_on_every_row_not_only_the_header(self):
+        # ERPNext derives the header date from the rows; a header that looks right with stale
+        # rows is not a completed update.
+        doc = {
+            "name": "PO-1", "schedule_date": "2026-12-01",
+            "items": [
+                {"item_code": "ALUM", "qty": 1, "rate": 1, "schedule_date": "2026-12-01"},
+                {"item_code": "STEEL", "qty": 1, "rate": 1, "schedule_date": "2026-11-12"},
+            ],
+        }
+        out = self._verify({"name": "PO-1", "schedule_date": "2026-12-01"}, doc)
+        assert out["write_verified"] is False
+        assert out["failure_classification"] == "conflict_stale_data"
+        assert "item row 'STEEL' shows '2026-11-12'" in out["final_response"]
+
+    def test_a_header_that_did_not_change_is_caught(self):
+        doc = {"name": "PO-1", "schedule_date": "2026-11-10", "items": [{"item_code": "ALUM", "schedule_date": "2026-11-10"}]}
+        out = self._verify({"name": "PO-1", "schedule_date": "2026-12-01"}, doc)
+        assert out["write_verified"] is False
+        assert "still shows '2026-11-10'" in out["final_response"]
 
 
 # ---------------------------------------------------------------------------------------
@@ -223,6 +247,10 @@ class PurchaseERP(FakeERP):
                     row.update({k: v for k, v in edit.items() if k != "item_code"})
             else:
                 doc[key] = value
+        if "schedule_date" in fields:
+            # ERPNext derives the header date from the rows, and crud.update_document sets it on each.
+            for row in doc["items"]:
+                row["schedule_date"] = fields["schedule_date"]
         self.version += 1
         doc["modified"] = f"2026-11-20 12:00:00.{self.version:06d}"
         return _res("success", copy.deepcopy(doc))

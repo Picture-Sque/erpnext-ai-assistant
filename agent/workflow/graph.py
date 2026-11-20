@@ -73,6 +73,7 @@ from mcp_erpnext.write_registry import (
     get_duplicate_keys,
     get_operation_roles,
     get_row_edits,
+    get_row_sync,
     is_iso_date,
     sanitize_payload,
     send_modified_enabled,
@@ -410,6 +411,27 @@ def _row_edit_failure(skill: Dict[str, Any], collected: dict, doc: dict) -> Opti
                 actual, expected = to_number(row.get(changed)), to_number(wanted)
                 if actual is None or expected is None or abs(actual - expected) > 1e-6:
                     return f"Requested {changed} of {wanted} for {ident}, but the document still shows {row.get(changed)} after the update."
+    return None
+
+
+def _row_sync_failure(skill: Dict[str, Any], collected: dict, doc: dict, record_id: Optional[str]) -> Optional[str]:
+    """
+    After an update that changes a header date ERPNext derives from the item rows, check that
+    every row carries it. Returns a message for the first row that does not, or None.
+    """
+    doctype = skill.get("doctype", "")
+    payload = _update_payload(skill, collected)
+    for header, spec in get_row_sync(doctype, "update").items():
+        if header not in payload:
+            continue
+        expected = str(payload[header])
+        for row in doc.get(spec["table"]) or []:
+            if str(row.get(spec["field"])) != expected:
+                return (
+                    f"Requested update to '{header}' to '{expected}' on {doctype} '{record_id}', but item row "
+                    f"'{row.get('item_code')}' shows '{row.get(spec['field'])}' after verification. "
+                    f"The update may not have completed."
+                )
     return None
 
 
@@ -2972,15 +2994,14 @@ def result_validation_node(state: AgentState):
                                 write_verified = False
                                 failure_classification = "conflict_stale_data"
                                 failure_msg = f"{row_failure} The update may not have completed."
-                        # Issue 2: Verify child rows for Sales Order delivery_date
-                        if write_verified and doctype == "Sales Order" and "delivery_date" in collected:
-                            exp_date = str(collected["delivery_date"])
-                            for it in doc.get("items", []):
-                                if str(it.get("delivery_date")) != exp_date:
-                                    write_verified = False
-                                    failure_classification = "conflict_stale_data"
-                                    failure_msg = f"Requested update to 'delivery_date' to '{exp_date}' on {doctype} '{record_id}', but item row '{it.get('item_code')}' shows '{it.get('delivery_date')}' after verification. The update may not have completed."
-                                    break
+                        # A header date ERPNext derives from the item rows (the Sales Order delivery
+                        # date, the Purchase Order schedule date) must also be right on every row.
+                        if write_verified and skill:
+                            sync_failure = _row_sync_failure(skill, collected, doc, record_id)
+                            if sync_failure:
+                                write_verified = False
+                                failure_classification = "conflict_stale_data"
+                                failure_msg = sync_failure
                     elif operation == "cancel":
                         if str(doc.get("docstatus")) == "2":
                             write_verified = True

@@ -11,7 +11,7 @@ from mcp_erpnext.aggregation import AGGREGATION_FUNCTIONS, aggregate_rows, group
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.defaults import get_default_company, get_default_warehouse
 from mcp_erpnext.errors import ERPNextError, extract_erpnext_error
-from mcp_erpnext.write_registry import check_write, get_child_fields, get_row_edits, to_number
+from mcp_erpnext.write_registry import check_write, get_child_fields, get_row_edits, get_row_sync, to_number
 
 logger = logging.getLogger("mcp_erpnext.crud")
 
@@ -448,15 +448,23 @@ def _update_unchecked(
         edits = payload.pop(key)
         edit_targets.setdefault(spec["table"], []).append((key, spec, edits))
 
-    # Special handling for Sales Order parent-synced fields:
-    # In ERPNext, Sales Order header delivery_date is synced from items[].delivery_date.
-    # When updating delivery_date, we must also update delivery_date on every row in items;
-    # do not send a partial update when the current document cannot be read.
-    # Note: Other parent-synced fields (e.g. warehouse, or rate/qty which recalculate totals)
-    # may require similar child table synchronization in future enhancements.
-    sync_delivery = doctype == "Sales Order" and "delivery_date" in payload and "items" not in payload
-    if sync_delivery or edit_targets:
-        what = "apply item changes to" if edit_targets else "synchronise item delivery dates for"
+    # Parent-synced fields. ERPNext derives some header dates from the item rows: the Sales Order
+    # delivery_date and the Purchase Order schedule_date. A header-only change is accepted and
+    # silently has no effect (verified against a live instance), so the new value is also set on
+    # every row. The registry declares which fields behave this way. A partial update is never
+    # sent when the current document cannot be read.
+    sync_specs = {
+        field: spec
+        for field, spec in get_row_sync(doctype, "update").items()
+        if field in payload and spec["table"] not in payload
+    }
+    first_synced = next(iter(sync_specs), "delivery_date")
+    if sync_specs or edit_targets:
+        what = (
+            "apply item changes to"
+            if edit_targets
+            else f"synchronise item {first_synced.replace('_', ' ')}s for"
+        )
         try:
             current_doc_res = doc_getter(doctype, name)
             if current_doc_res.get("status") != "success":
@@ -465,10 +473,13 @@ def _update_unchecked(
 
             current_doc = current_doc_res.get("data") or {}
             tables: Dict[str, list] = {}
-            if sync_delivery:
-                tables["items"] = [dict(it) for it in (current_doc.get("items") or [])]
-                for it in tables["items"]:
-                    it["delivery_date"] = payload["delivery_date"]
+            for header, spec in sync_specs.items():
+                rows = tables.get(spec["table"])
+                if rows is None:
+                    rows = [dict(it) for it in (current_doc.get(spec["table"]) or [])]
+                for it in rows:
+                    it[spec["field"]] = payload[header]
+                tables[spec["table"]] = rows
             for table, groups in edit_targets.items():
                 rows = tables.get(table)
                 if rows is None:
@@ -485,7 +496,7 @@ def _update_unchecked(
             if edit_targets:
                 log.warning(f"Failed to read {doctype} {name} before applying item changes: {e}")
             else:
-                log.warning(f"Failed to synchronize items delivery_date for {doctype} {name}: {e}")
+                log.warning(f"Failed to synchronize items {first_synced} for {doctype} {name}: {e}")
             return _format_result("system_error", error=f"Cannot {what} {doctype} {name}: {e}")
 
     # Send back the `modified` value the caller last read. ERPNext then refuses the write if

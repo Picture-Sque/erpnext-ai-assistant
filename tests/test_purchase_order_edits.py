@@ -3,7 +3,9 @@ Purchase Order edits beyond the dates: the quantity and rate of items already on
 
 Same mechanism as the Sales Order edits (see test_sales_order_edits.py): read the current rows,
 change only the named ones, send every row back. These tests pin the Purchase Order specifics:
-its own fields and dates, its roles, and that a new schedule date is not copied onto item rows.
+its own fields and dates, its roles, and that a new schedule date is set on every item row:
+ERPNext derives the header schedule date from the rows, and a header-only change is accepted
+but has no effect (verified against a live Frappe 16.24 instance).
 """
 
 from unittest.mock import MagicMock
@@ -72,18 +74,43 @@ class TestPurchaseOrderRowEdits:
         assert items["ALUM"]["rate"] == 310.5 and items["ALUM"]["qty"] == 100
         assert (items["STEEL"]["qty"], items["STEEL"]["rate"]) == (45, 85)
 
-    def test_a_new_schedule_date_is_not_copied_onto_item_rows(self):
-        # Unlike a Sales Order delivery date, the Purchase Order schedule date is sent as it is.
+    def test_a_new_schedule_date_is_set_on_every_item_row(self):
+        # ERPNext derives the header schedule date from the rows. A header-only change is
+        # accepted and does nothing (seen live), so the rows carry the new date too.
         _, client = update({"schedule_date": "2026-12-01", "item_updates": [{"item_code": "ALUM", "qty": 150}]})
         body = sent(client)
         assert body["schedule_date"] == "2026-12-01"
-        assert [r["schedule_date"] for r in body["items"]] == ["2026-11-10", "2026-11-12"]
+        assert [r["schedule_date"] for r in body["items"]] == ["2026-12-01", "2026-12-01"]
+        assert body["items"][0]["qty"] == 150, "the item change still applies on the same rows"
+        assert [r["name"] for r in body["items"]] == ["po-row-a", "po-row-b"]
 
-    def test_dates_alone_do_not_read_or_send_rows(self):
-        res, client = update({"schedule_date": "2026-12-01", "transaction_date": "2026-11-20"})
+    def test_a_schedule_date_alone_reads_the_rows_and_sets_it_on_each(self):
+        res, client = update({"schedule_date": "2026-12-01"})
         assert res["status"] == "success"
-        assert sent(client) == {"schedule_date": "2026-12-01", "transaction_date": "2026-11-20"}
+        body = sent(client)
+        assert body["schedule_date"] == "2026-12-01"
+        assert [r["schedule_date"] for r in body["items"]] == ["2026-12-01", "2026-12-01"]
+        assert [r["qty"] for r in body["items"]] == [100, 40], "no other row field changes"
+        client.get.assert_called_once()
+
+    def test_a_transaction_date_alone_does_not_read_or_send_rows(self):
+        res, client = update({"transaction_date": "2026-11-20"})
+        assert res["status"] == "success"
+        assert sent(client) == {"transaction_date": "2026-11-20"}
         client.get.assert_not_called()
+
+    def test_an_unreadable_order_stops_the_schedule_date_update_with_the_usual_wording(self):
+        client = make_client()
+        client.get.return_value = MagicMock(is_success=False, status_code=500, json=MagicMock(return_value={"message": "boom"}), text="boom")
+        res, client = update({"schedule_date": "2026-12-01"}, client=client)
+        assert res["status"] == "system_error"
+        assert "Cannot synchronise item schedule dates for Purchase Order PO-1" in res["error"]
+        client.put.assert_not_called()
+
+    def test_an_order_with_no_rows_sends_the_header_alone(self):
+        res, client = update({"schedule_date": "2026-12-01"}, client=make_client({"name": "PO-1", "items": []}))
+        assert res["status"] == "success"
+        assert sent(client) == {"schedule_date": "2026-12-01"}
 
     def test_item_not_on_the_order_changes_nothing(self):
         res, client = update({"item_updates": [{"item_code": "COPPER", "qty": 5}]})
@@ -146,6 +173,12 @@ class TestPurchaseOrderRegistry:
     @pytest.mark.parametrize("field", ["po_no", "po_date", "delivery_date", "supplier", "docstatus", "grand_total"])
     def test_other_fields_denied(self, field):
         assert not self.check({field: "2026-12-01" if "date" in field else "x"})
+
+    def test_the_row_synced_header_dates_are_declared(self):
+        assert wr.get_row_sync("Purchase Order", "update") == {"schedule_date": {"table": "items", "field": "schedule_date"}}
+        assert wr.get_row_sync("Sales Order", "update") == {"delivery_date": {"table": "items", "field": "delivery_date"}}
+        assert wr.get_row_sync("Purchase Order", "create") == {}
+        assert wr.get_row_sync("Customer", "update") == {}
 
     def test_registry_facts(self):
         assert wr.get_confirm_fields("Purchase Order", "update") == ["item_updates"]

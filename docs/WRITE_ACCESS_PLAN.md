@@ -190,7 +190,7 @@ New skill keys (read by the loader, checked by `test_skill_files.py`): `require_
 
 Tests: 50 at the tool layer (`tests/test_sales_order_edits.py`), 35 on the conversation flow (`agent/tests/test_sales_order_update_flow.py`) and 11 end to end through `/chat` (`agent/tests/test_sales_order_update_e2e.py`). Both suites together: 650 and 486 passed, plus the 1 known failure.
 
-Not verified against a live ERPNext. Check these on a Draft order before relying on it:
+These were not verified when this was written. They were checked live later the same day; the results are in section 6e. The original list:
 
 1. After a PUT with the full set of item rows, ERPNext keeps the rows (matched by row name) and recalculates each row's amount and the order totals. This is how ERPNext normally behaves, but it was not observed here.
 2. A rate change sticks when the item has a price list rate or a pricing rule. ERPNext can recompute the rate from a pricing rule, in which case verification will report the rate did not land. That fails safe but would need handling.
@@ -205,11 +205,11 @@ Known limits: the user must give an item code that appears on the order; a produ
 Two differences from the Sales Order:
 
 - There is no PO-reference field. A Purchase Order has no equivalent of the customer's PO number that I am sure of, so none was added rather than guess a field name.
-- A new schedule date is sent as the header field only. It is not copied onto the item rows, because the existing Purchase Order update never did that and how ERPNext syncs the header date for a Purchase Order was not verified.
+- A new schedule date is set on every item row as well as the header. This was first written as header-only, and the live check (section 6e) showed ERPNext accepts a header-only change and silently ignores it, because it derives the header date from the rows, exactly as it does for the Sales Order delivery date. The existing Purchase Order date update had always had this problem; write verification caught it as a failure rather than a false success. The row-date sync is now declared per doctype in the registry (`row_sync`) and used for both orders.
 
 Adding the doctype needed only a registry entry and the skill: the row-edit, Draft-only, confirmation, preview and verification code is shared. Tests: 33 at the tool layer (`tests/test_purchase_order_edits.py`), plus flow and end-to-end tests in `agent/tests/test_purchase_order_update_flow.py`. Both suites together: 683 and 508 passed, plus the 1 known failure.
 
-The live checks in 6b apply here too (rows kept and recalculated after a PUT with all rows; a rate that sticks when a pricing rule applies).
+The live checks in 6b were run for both orders; see section 6e for the results.
 
 ## 6d. Phase 1 status: ERPNext permission preflight (21 Nov 2026)
 
@@ -223,9 +223,31 @@ Where: `mcp_erpnext/permissions.py`, called from the precondition step after the
 
 Verified against the local Frappe 16.24 instance, read only: the endpoint exists, its answer has the shape `{"message": {"has_permission": <bool>}}`, `docname` is required and an empty string asks at doctype level, and the new code parses the real response (Administrator: allowed for update, submit, create and delete).
 
-Not observed: a `false` answer. The service account is Administrator, for whom ERPNext answers true to everything, including a doctype that does not exist and an invalid permission type. The denial path is covered by tests with a stand-in only. Before relying on it, run the check once as a restricted user (for example the Sales User from the earlier two-user test) against a document that user cannot edit, and confirm ERPNext answers false. Also note the check is document-level for update, submit and cancel, which includes User Permissions, but only doctype-level for a create, so a create that ERPNext refuses for a specific company is still refused by ERPNext at write time rather than earlier.
+The `false` answer was first not observable, because the service account is Administrator, for whom ERPNext answers true to everything. It was then observed with a temporary Sales User (section 6e). Note the check is document-level for update, submit and cancel, which includes User Permissions, but only doctype-level for a create, so a create that ERPNext refuses for a specific company is still refused by ERPNext at write time rather than earlier.
 
 Tests: 54 for the check itself (`tests/test_permissions.py`), 14 for the precondition integration (`agent/tests/test_permission_preflight.py`) and 4 end to end through `/chat`, including access revoked between the question and the Yes. Both suites together: 737 and 526 passed, plus the 1 known failure. Both conftest files stub the check as "allowed" by default so no test goes to the network.
+
+## 6e. Live verification against a local Frappe 16.24 instance (21 Nov 2026)
+
+Run with the user's agreement, through the project's own `crud` and permission code, using one throwaway Draft Sales Order, one throwaway Draft Purchase Order and one temporary Sales User (no welcome email). Nothing was submitted or cancelled. All three records were deleted and their deletion confirmed. Deleting the newest draft also rolled its naming-series number back, so the same numbers were reused on the second run.
+
+Confirmed:
+
+- An item edit sent as the full set of rows keeps every row, updated in place by row name, for both orders. Row amounts and the order total were recalculated by ERPNext (`amount = qty x rate`; total matched the sum).
+- A rate change stuck on the item tested (it has a price list rate and no pricing rule: `price_list_rate` 250, rate set to 65, no discount, no pricing rules on the row).
+- ERPNext accepts the write when it carries the `modified` value just read, and refuses a stale one with HTTP 417 `TimestampMismatchError` ("has been modified after you have opened it"). The refused write changed nothing, and the project reports it as a Conflict. This is the exception type and wording the detection already looked for.
+- A header-only change to the Sales Order delivery date or the Purchase Order schedule date is accepted and has no effect. It is now set on every row, and after the fix both orders showed the new date on the header and on every row, including when combined with an item edit in one write.
+- A Sales User gets a real `false` from the preflight for create, write, submit and delete on a Purchase Order, and `true` for create and write on a Sales Order. ERPNext itself refuses that user's direct write with HTTP 403, and the project's own path returns `permission_denied` before any call.
+- For a restricted user, an unknown doctype returns HTTP 403 and an invalid permission type returns `false`. The assistant only ever sends valid permission types, and an HTTP error is treated as unknown, so neither case blocks or misleads.
+
+Found and fixed: the Purchase Order schedule date no-op described in section 6c.
+
+Still not verified live:
+
+- `submit` and `cancel` carrying `modified` (only update was exercised; submitting a draft needs a decision about test data, because it posts to stock and ledgers).
+- A rate change on an item where a pricing rule applies. ERPNext can recompute the rate from the rule; write verification would report that, but it was not exercised.
+- User Permissions that restrict by company, territory or similar. A create is only checked at doctype level, so such a restriction would be enforced by ERPNext at write time.
+- Item changes where the user names the product rather than its code.
 
 ## 7. Verification plan
 

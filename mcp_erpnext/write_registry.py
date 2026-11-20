@@ -81,6 +81,10 @@ def _roles(*names: str) -> List[str]:
 #   row_edits     {field: {table, match_on, positive, non_negative}}: the field is a list of edits
 #                 to rows that already exist in `table`, matched on `match_on`. It is not a
 #                 replacement table. Values in `positive` must be > 0, in `non_negative` >= 0.
+#   row_sync      {header field: {table, field}}: ERPNext derives this header field from the rows of
+#                 `table`, so changing it means setting `field` on every row (verified live for
+#                 the Sales Order delivery date and the Purchase Order schedule date: a
+#                 header-only change is accepted and silently has no effect)
 #   draft_only    fields that may only be changed while the document is a Draft
 #   confirm       fields that always need an explicit Yes before they are written
 # Per doctype:
@@ -101,6 +105,7 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
                 "fields": ["delivery_date", "po_no", "po_date", "item_updates"],
                 "child_fields": {"item_updates": ["item_code", "qty", "rate"]},
                 "date_fields": ["delivery_date", "po_date"],
+                "row_sync": {"delivery_date": {"table": "items", "field": "delivery_date"}},
                 "row_edits": {
                     "item_updates": {
                         "table": "items",
@@ -131,6 +136,7 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
                 "fields": ["schedule_date", "transaction_date", "item_updates"],
                 "child_fields": {"item_updates": ["item_code", "qty", "rate"]},
                 "date_fields": ["schedule_date", "transaction_date"],
+                "row_sync": {"schedule_date": {"table": "items", "field": "schedule_date"}},
                 "row_edits": {
                     "item_updates": {
                         "table": "items",
@@ -277,6 +283,22 @@ def get_row_edits(doctype: Any, operation: Any) -> Dict[str, Dict[str, Any]]:
             "positive": _names(edit, "positive"),
             "non_negative": _names(edit, "non_negative"),
         }
+    return clean
+
+
+def get_row_sync(doctype: Any, operation: Any) -> Dict[str, Dict[str, str]]:
+    """Header fields ERPNext derives from child rows: {header field: {table, field}}."""
+    op_spec = get_operation_spec(doctype, operation)
+    raw = op_spec.get("row_sync") if op_spec else None
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, Dict[str, str]] = {}
+    for header, spec in raw.items():
+        if not (isinstance(header, str) and header and isinstance(spec, dict)):
+            continue
+        table, field = spec.get("table"), spec.get("field")
+        if isinstance(table, str) and table and isinstance(field, str) and field:
+            clean[header] = {"table": table, "field": field}
     return clean
 
 
