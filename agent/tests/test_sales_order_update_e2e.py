@@ -24,6 +24,7 @@ import main
 import workflow.followup_router as followup_router
 import workflow.graph as graph
 from test_mixed_chains import SECRET, FakeERP, ScriptedLLM, Driver, _res
+from mcp_erpnext.permissions import ALLOWED, DENIED, PermissionCheck
 
 SALES_USER = ["Sales User"]
 DRAFT, SUBMITTED = "SAL-ORD-2026-00040", "SAL-ORD-2026-00041"
@@ -35,6 +36,7 @@ class SalesERP(FakeERP):
     def __init__(self):
         super().__init__()
         self.version = 0
+        self.denied = set()
         self.db["Sales Order"] = [self._order(DRAFT, 0), self._order(SUBMITTED, 1)]
 
     def _order(self, name, docstatus):
@@ -78,6 +80,13 @@ class SalesERP(FakeERP):
     def updates(self):
         return [c for c in self.calls if c[0] == "update_document"]
 
+    def check_permission(self, operation, doctype, name=None):
+        """What ERPNext says about the signed-in user. Add an operation to `denied` to revoke it."""
+        self.calls.append(("check_permission", operation, doctype, name))
+        return PermissionCheck(DENIED if operation in self.denied else ALLOWED)
+
+    denied: set = set()
+
 
 class CapturingLLM(ScriptedLLM):
     def __init__(self):
@@ -100,6 +109,7 @@ def env(tmp_path, monkeypatch):
     for name in ("get_list", "search_document", "get_document", "create_document", "update_document",
                  "submit_document", "cancel_document", "get_count", "aggregate"):
         monkeypatch.setattr(graph, name, getattr(erp, name))
+    monkeypatch.setattr(graph, "check_permission", erp.check_permission)
     llm = CapturingLLM()
     monkeypatch.setattr(graph, "invoke_structured_llm", llm.structured)
     monkeypatch.setattr(graph, "invoke_llm", llm.text)
@@ -253,4 +263,55 @@ def test_fields_the_model_makes_up_are_not_sent(env):
     env.text(msg, roles=SALES_USER)
     (call,) = env.erp.updates()
     assert call[3] == {"delivery_date": "2026-12-01"}
+    assert env.erp.order(DRAFT)["docstatus"] == 0
+
+
+def test_erpnext_refusing_the_user_stops_a_write_the_role_list_allows(env):
+    # The user holds a role the assistant accepts, but ERPNext (User Permissions, a customised
+    # role, ownership) says no. Nothing is asked and nothing is written.
+    env.erp.denied = {"update"}
+    msg = f"move the delivery of {DRAFT} to 2026-12-01"
+    script(env, msg, {"name": DRAFT, "delivery_date": "2026-12-01"})
+
+    out = env.text(msg, roles=SALES_USER)
+    assert "Permission Denied" in out
+    assert f"not allowed to update Sales Order {DRAFT}" in out
+    assert env.erp.updates() == []
+    assert env.persisted()["pending_confirmation"] is None
+    assert ("check_permission", "update", "Sales Order", DRAFT) in env.erp.calls
+
+
+def test_access_revoked_between_the_question_and_the_yes_is_honoured(env):
+    msg = QTY_MSG.format(DRAFT)
+    script(env, msg, {"name": DRAFT, "item_updates": [{"item_code": "ITEM-DESK-001", "qty": 12}]})
+    out = env.text(msg, roles=SALES_USER)
+    assert "Reply **Yes**" in out
+
+    env.erp.denied = {"update"}  # the administrator removes the permission while the question is open
+    out = env.text("yes", roles=SALES_USER)
+    assert "Permission Denied" in out
+    assert env.erp.updates() == []
+    assert env.erp.order(DRAFT)["items"][0]["qty"] == 2
+    assert env.persisted()["pending_confirmation"] is None
+
+
+def test_the_question_is_asked_again_when_the_yes_arrives(env):
+    msg = QTY_MSG.format(DRAFT)
+    script(env, msg, {"name": DRAFT, "item_updates": [{"item_code": "ITEM-DESK-001", "qty": 12}]})
+    env.text(msg, roles=SALES_USER)
+    env.text("yes", roles=SALES_USER)
+    asked = [c for c in env.erp.calls if c[0] == "check_permission"]
+    assert len(asked) == 2, "once before the confirmation and once again before the write"
+    assert {c[1:] for c in asked} == {("update", "Sales Order", DRAFT)}
+
+
+def test_a_denied_submit_is_refused_even_for_a_manager_role(env):
+    env.erp.denied = {"submit"}
+    msg = f"submit {DRAFT}"
+    env.llm.classify[msg] = {"intent": "submit-sales-order", "is_compound": False}
+    env.llm.extract[msg] = {"name": DRAFT}
+
+    out = env.text(msg, roles=["Sales Manager"])
+    assert "not allowed to submit Sales Order" in out
+    assert [c for c in env.erp.calls if c[0] == "submit_document"] == []
     assert env.erp.order(DRAFT)["docstatus"] == 0

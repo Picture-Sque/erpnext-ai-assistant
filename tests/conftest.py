@@ -70,3 +70,18 @@ def _legacy_write_doctypes(request, monkeypatch):
         extended.setdefault(name, copy.deepcopy(spec))
     monkeypatch.setattr(write_registry, "WRITE_REGISTRY", extended)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _stub_erpnext_permission_check(monkeypatch):
+    """Answer the graph's ERPNext permission question with "allowed" so no test goes to the network.
+    Tests of the check itself patch graph.check_permission (or call mcp_erpnext.permissions directly)."""
+    import sys
+
+    from mcp_erpnext.permissions import ALLOWED, PermissionCheck
+
+    for module_name in ("workflow.graph", "agent.workflow.graph"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "check_permission"):
+            monkeypatch.setattr(module, "check_permission", lambda *a, **k: PermissionCheck(ALLOWED))
+    yield

@@ -211,6 +211,22 @@ Adding the doctype needed only a registry entry and the skill: the row-edit, Dra
 
 The live checks in 6b apply here too (rows kept and recalculated after a PUT with all rows; a rate that sticks when a pricing rule applies).
 
+## 6d. Phase 1 status: ERPNext permission preflight (21 Nov 2026)
+
+Before a write is confirmed, and again when the Yes arrives, the assistant asks ERPNext whether the signed-in user may do it. The question is `frappe.client.has_permission` with the doctype, the document name (empty for a create) and the permission type (`create`, `write`, `submit`, `cancel`, `delete`). It runs as the user, with their own session, so the answer reflects their access now, including User Permissions and customised roles, not the roles captured in the token an hour ago.
+
+How it combines with the existing checks: the registry and the skill's roles stay the upper bound. ERPNext can only add a refusal; it never grants anything the registry does not already allow. This settles decision 3 in section 8 in the cautious direction, with no extra configuration: the assistant can be stricter than ERPNext, never looser.
+
+Outcomes: a literal true allows, a literal false denies with "Permission Denied: your ERPNext account is not allowed to ... Nothing was executed", and anything else (no request context, the switch off, an HTTP error, a body that is not a plain boolean, a failed call) is unknown. Unknown never blocks, because ERPNext still refuses an unauthorised write itself. A denial is audited as `permission_denied_erpnext` under the real user and ends the turn through the normal permission-denied route.
+
+Where: `mcp_erpnext/permissions.py`, called from the precondition step after the target is read and before any confirmation. A bulk request is checked at doctype level. It is a GET, so it works in a read-only session. `ERPNEXT_PERMISSION_PREFLIGHT=false` turns it off.
+
+Verified against the local Frappe 16.24 instance, read only: the endpoint exists, its answer has the shape `{"message": {"has_permission": <bool>}}`, `docname` is required and an empty string asks at doctype level, and the new code parses the real response (Administrator: allowed for update, submit, create and delete).
+
+Not observed: a `false` answer. The service account is Administrator, for whom ERPNext answers true to everything, including a doctype that does not exist and an invalid permission type. The denial path is covered by tests with a stand-in only. Before relying on it, run the check once as a restricted user (for example the Sales User from the earlier two-user test) against a document that user cannot edit, and confirm ERPNext answers false. Also note the check is document-level for update, submit and cancel, which includes User Permissions, but only doctype-level for a create, so a create that ERPNext refuses for a specific company is still refused by ERPNext at write time rather than earlier.
+
+Tests: 54 for the check itself (`tests/test_permissions.py`), 14 for the precondition integration (`agent/tests/test_permission_preflight.py`) and 4 end to end through `/chat`, including access revoked between the question and the Yes. Both suites together: 737 and 526 passed, plus the 1 known failure. Both conftest files stub the check as "allowed" by default so no test goes to the network.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

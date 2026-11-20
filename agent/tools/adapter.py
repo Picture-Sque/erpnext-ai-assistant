@@ -223,6 +223,14 @@ class ToolAdapter:
         """Preserves existing RuntimeError exception semantics for call sites."""
         return generic_tools.get_default_warehouse(company=company, reload=reload)
 
+    def check_permission(self, operation: str, doctype: str, name: Optional[str] = None):
+        """
+        Ask ERPNext whether the signed-in user may perform a write (see mcp_erpnext.permissions).
+        Always direct: it is not a document read, and it must use the caller's own session,
+        which the request context supplies on either backend.
+        """
+        return generic_tools.check_permission(operation, doctype, name)
+
     # -------------------------------------------------------------------------
     # Read operations (MCP-eligible when backend=mcp, direct fallback disallowed)
     # -------------------------------------------------------------------------
@@ -439,6 +447,10 @@ def get_default_company(reload: bool = False) -> str:
 
 def get_default_warehouse(company: Optional[str] = None, reload: bool = False) -> str:
     return adapter.get_default_warehouse(company=company, reload=reload)
+
+
+def check_permission(operation: str, doctype: str, name: Optional[str] = None):
+    return adapter.check_permission(operation, doctype, name)
 
 
 def get_list(*args, **kwargs) -> dict:

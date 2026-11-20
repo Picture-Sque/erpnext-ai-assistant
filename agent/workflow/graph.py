@@ -24,6 +24,7 @@ from workflow.followup_router import (
 )
 try:
     from agent.tools.adapter import (
+        check_permission,
         create_document,
         get_list,
         update_document,
@@ -43,6 +44,7 @@ try:
     )
 except ImportError:
     from tools.adapter import (
+        check_permission,
         create_document,
         get_list,
         update_document,
@@ -1888,6 +1890,35 @@ def precondition_validation_node(state: AgentState):
 
         fresh_snapshot = fetch_result["data"]
         logger.info(f"[Step 5.5] Check 1 PASS: Document '{record_id}' exists.")
+
+    # -------------------------------------------------------------------------
+    # Check 1b: ERPNext must allow this user to do this
+    # -------------------------------------------------------------------------
+    # The registry and the skill say what the assistant may do for a role. ERPNext knows the
+    # site's real permissions, including User Permissions, as this user right now. Both must
+    # allow. An unknown answer (check unavailable) is not a denial: ERPNext still refuses an
+    # unauthorised write itself.
+    permission = check_permission(operation, doctype, None if (is_bulk or operation == "create") else record_id)
+    if getattr(permission, "outcome", None) == "denied":
+        target_desc = f" {record_id}" if record_id and not is_bulk and operation != "create" else ""
+        message = (
+            f"Permission Denied: your ERPNext account is not allowed to {operation} {doctype}{target_desc}. "
+            f"Nothing was executed. If you think you should have access, ask your ERPNext administrator."
+        )
+        logger.warning(f"[Step 5.5] Check 1b FAIL: ERPNext denies {operation} on {doctype}{target_desc}.")
+        log_audit_event(
+            operation=operation, doctype=doctype, target_name=record_id or "(new)", outcome="denied",
+            failure_classification="permission_denied_erpnext", details=getattr(permission, "detail", ""),
+        )
+        return {
+            "preconditions_validated": False,
+            "failure_classification": "permission_denied",
+            "final_response": message,
+        }
+    if getattr(permission, "outcome", None) == "unknown":
+        logger.info(f"[Step 5.5] Check 1b SKIP: ERPNext permission not checked ({getattr(permission, 'detail', '')}).")
+    else:
+        logger.info("[Step 5.5] Check 1b PASS: ERPNext allows this operation.")
 
     # -------------------------------------------------------------------------
     # Check 2: Document state compatibility

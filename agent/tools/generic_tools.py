@@ -13,6 +13,7 @@ from mcp_erpnext.crud import (
     is_doctype_allowed,
 )
 from mcp_erpnext.errors import extract_erpnext_error
+from mcp_erpnext.permissions import check_erpnext_permission
 
 load_dotenv()
 
@@ -84,6 +85,11 @@ def delete_document(doctype: str, name: str) -> dict:
         doctype=doctype,
         name=name,
     )
+
+
+def check_permission(operation: str, doctype: str, name: Optional[str] = None):
+    """Ask ERPNext whether the current user may perform `operation`. See mcp_erpnext.permissions."""
+    return check_erpnext_permission(operation, doctype, name)
 
 
 def get_document(doctype: str, name: str) -> dict:

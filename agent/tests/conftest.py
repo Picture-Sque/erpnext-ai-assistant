@@ -52,3 +52,22 @@ def setup_auth_environment(monkeypatch):
     monkeypatch.setattr(ERPNextClient, "_send", no_live_calls)
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def stub_erpnext_permission_check(monkeypatch):
+    """
+    The graph asks ERPNext whether the user may perform a write (mcp_erpnext.permissions).
+    Tests run without a real ERPNext, so by default that question is answered "allowed" and
+    nothing is sent over the network. A test that exercises the check patches
+    graph.check_permission itself, which replaces this stand-in.
+    """
+    import sys
+
+    from mcp_erpnext.permissions import ALLOWED, PermissionCheck
+
+    for module_name in ("workflow.graph", "agent.workflow.graph"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "check_permission"):
+            monkeypatch.setattr(module, "check_permission", lambda *a, **k: PermissionCheck(ALLOWED))
+    yield
