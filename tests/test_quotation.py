@@ -224,3 +224,15 @@ class TestCrud:
             assert client.put.call_args.kwargs["json"] == {"docstatus": 2, "modified": "v2"}
         with set_request_context(user("Sales User")):
             assert crud.submit_document("Quotation", "QTN-1", client=client)["status"] == "permission_denied"
+
+
+class TestSearch:
+    def test_a_quotation_search_asks_only_for_fields_a_quotation_has(self):
+        # A Quotation has no "customer" field (it has party_name and customer_name). Asking for one
+        # made ERPNext refuse the whole query ("Field not permitted in query: customer"), seen live.
+        assert "customer" not in crud.DISPLAY_FIELDS_MAP["Quotation"]
+        assert {"name", "party_name", "customer_name", "status"} <= set(crud.DISPLAY_FIELDS_MAP["Quotation"])
+
+    def test_the_other_display_fields_are_unchanged(self):
+        assert crud.DISPLAY_FIELDS_MAP["Sales Order"] == ["name", "customer", "status"]
+        assert crud.DISPLAY_FIELDS_MAP["Purchase Order"] == ["name", "supplier", "status"]

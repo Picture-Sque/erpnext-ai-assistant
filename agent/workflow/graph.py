@@ -2489,9 +2489,10 @@ def confirmation_node(state: AgentState):
 
 def _describe_create_scope(doctype: str, collected: dict) -> str:
     """Human-readable summary of a create that is awaiting confirmation."""
-    party_key = next((k for k in ("supplier", "customer", "customer_name") if collected.get(k)), None)
+    party_key = next((k for k in ("supplier", "customer", "customer_name", "item_code") if collected.get(k)), None)
     party = f" for {party_key.replace('_', ' ')} '{collected[party_key]}'" if party_key else ""
-    lines = [f"Are you sure you want to create a {doctype}{party}?"]
+    article = "an" if doctype[:1].lower() in "aeiou" else "a"
+    lines = [f"Are you sure you want to create {article} {doctype}{party}?"]
 
     if doctype in ("Sales Order", "Purchase Order"):
         comp = collected.get("company")

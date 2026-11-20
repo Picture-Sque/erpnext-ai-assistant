@@ -333,6 +333,35 @@ Tests: 57 at the registry and tool layers (`tests/test_supplier.py`) and 22 on t
 
 Not covered: disabling or deleting a supplier, putting a supplier on payment hold (by design), addresses and contacts, bank details.
 
+## 6i. Item, and Tier 1 complete (21 Nov 2026)
+
+Master data with the shortest write list of the three. Two skills: `create-item` and `update-item`. Finding items is the existing `item-lookup`.
+
+| Operation | Who | Notes |
+|---|---|---|
+| create | Stock Manager, Item Manager and up | needs an item code and an item group; always asks first; shows the details and any existing items with a similar code; an exact existing code is refused |
+| update | Stock Manager, Item Manager and up | item name, item group, description, brand; always asks first, with old and new values |
+| submit, cancel, delete | nobody | not registered |
+
+Sales, purchasing, Stock User and Accounts roles cannot write an Item. This is the narrowest role list so far, because the item master feeds every order, invoice and stock figure.
+
+Writable on create: item code, item name, item group, unit of measure, description, brand. Writable on update: item name, item group, description, brand. The code is the item's ID and cannot be renamed here, and the unit of measure is fixed at creation because stock already counted in it would stop adding up. Not writable, each refused before any call to ERPNext: standard and valuation rates, opening stock, the stock, sales and purchase switches, the disabled flag, variants, batch and serial tracking, reorder levels, barcodes, unit conversions, per-company defaults, tax, weight, origin and image.
+
+Live findings that shaped the skills: an Item is named by its code (and the code is unique, and ERPNext itself refuses a duplicate); ERPNext fills the unit from Stock Settings (Nos) and the name from the code when they are left out, so only the code and the item group are required from the user; an item created through the assistant comes out enabled with no price set.
+
+Live check, 30 of 30 on the Item itself (throwaway items, cleanup tracked every record and swept by prefix, no probe item remains): create with code, name, group, unit and description; fields saved; update saves name, group and description; the code and unit are unchanged by an update; a stale update is refused as a Conflict; sixteen off-limits fields (prices, valuation, the stock, sales, purchase, variant, batch and serial switches, disabled, opening stock, unit, code, and the barcode, conversion, default and tax tables) are each refused with nothing changed; delete is refused.
+
+Two small fixes made along the way:
+
+- The create question did not name the item and read "create a Item". It now reads "Are you sure you want to create an Item for item code 'X'?", and uses "an" before a vowel for any doctype.
+- A live search on a Quotation failed ("Field not permitted in query: customer") because the display fields listed `customer`, which a Quotation does not have. They are now `party_name` and `customer_name`. No current flow searched quotations, so nothing was broken, but any future search would have been. Confirmed fixed against the live instance.
+
+Tier 1 is now complete: Quotation (6f), Customer (6g), Supplier (6h) and Item (6i), on top of Sales Order and Purchase Order. All are live-checked. The registry options added for the master-data doctypes (`confirm_always`, `similar_by`, `identity_slot`, `choices`, `duplicate_slots`) are shared, so each of the three needed only a registry entry and skills.
+
+Tests: 50 at the registry and tool layers (`tests/test_item.py`) and 22 on the conversation flow and end to end through `/chat` (`agent/tests/test_item_flow.py`), plus 2 for the Quotation search fix. Both suites together: 952 and 731 passed, plus the 1 known failure.
+
+Not covered: prices (a price-list change is a different, more sensitive operation), stock adjustments, disabling or deleting an item, variants, barcodes.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

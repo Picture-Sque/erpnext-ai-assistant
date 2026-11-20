@@ -79,7 +79,7 @@ class TestCheckWrite:
         assert c.read_only is True
         assert not wr.check_write("submit", "Sales Order", ctx=c)
 
-    @pytest.mark.parametrize("doctype", ["Item", "Bin", "Stock Ledger Entry", "Company", "Warehouse", "User", "", None])
+    @pytest.mark.parametrize("doctype", ["Bin", "Stock Ledger Entry", "Company", "Warehouse", "User", "", None])
     def test_doctypes_without_an_entry_cannot_be_written(self, doctype):
         for op in ("create", "update", "submit", "cancel", "delete"):
             assert not wr.check_write(op, doctype, {}, ctx=ctx("System Manager")), (doctype, op)

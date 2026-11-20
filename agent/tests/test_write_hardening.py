@@ -301,6 +301,7 @@ class TestSkillLoading:
             "create-quotation", "update-quotation", "submit-quotation", "cancel-quotation",
             "create-customer", "update-customer",
             "create-supplier", "update-supplier",
+            "create-item", "update-item",
         }
 
 

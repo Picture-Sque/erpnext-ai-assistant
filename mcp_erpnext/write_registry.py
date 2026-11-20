@@ -249,6 +249,32 @@ WRITE_REGISTRY["Supplier"] = {
 }
 
 
+WRITE_REGISTRY["Item"] = {
+    # Master data with a deliberately short write list. An item code is its name and cannot be
+    # renamed here; the stock unit is set when the item is created and not changed afterwards,
+    # because stock already counted in it would no longer add up. Prices, valuation, the stock,
+    # sales and purchase switches, the disabled flag, variants, barcodes, unit conversions, tax
+    # and per-company defaults are not listed: not writable.
+    "duplicate_keys": ["item_code"],
+    "operations": {
+        "create": {
+            "roles": _roles("Stock Manager", "Item Manager"),
+            "fields": ["item_code", "item_name", "item_group", "stock_uom", "description", "brand"],
+            "child_fields": {},
+            "confirm_always": True,
+            "similar_by": {"field": "item_code", "slot": "item_code"},
+        },
+        "update": {
+            "roles": _roles("Stock Manager", "Item Manager"),
+            "fields": ["item_name", "item_group", "description", "brand"],
+            "child_fields": {},
+            "identity_slot": "item_code",
+            "confirm": ["item_name", "item_group", "description", "brand"],
+        },
+    },
+}
+
+
 def get_write_registry() -> Dict[str, Dict[str, Any]]:
     """The active registry. Read through this function so tests can substitute it."""
     return WRITE_REGISTRY

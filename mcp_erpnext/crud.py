@@ -602,7 +602,9 @@ DISPLAY_FIELDS_MAP = {
     "Item": ["name", "item_code", "item_name", "item_group"],
     "Sales Order": ["name", "customer", "status"],
     "Bin": ["name", "item_code", "warehouse", "actual_qty"],
-    "Quotation": ["name", "customer", "status"],
+    # A Quotation keeps its customer in party_name (customer_name is the fetched display name);
+    # it has no "customer" field, and asking for one makes ERPNext refuse the whole query.
+    "Quotation": ["name", "party_name", "customer_name", "status"],
     "Sales Invoice": ["name", "customer", "status"],
     "Purchase Order": ["name", "supplier", "status"],
     "Supplier": ["name", "supplier_name", "supplier_group"],
