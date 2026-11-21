@@ -447,6 +447,16 @@ Not enforced: a manager who creates a draft can also submit it. A rule that the 
 
 Not verified live: a real submit of any of the four, which posts stock or ledger entries in ERPNext (needs Stock/Accounts set up on the instance, and cancelling afterwards to restore the figures).
 
+## 6o. Live pass for 6l, 6m and 6n (21 Nov 2026)
+
+Run against the local Frappe 16.24 instance with a throwaway Sales Order and Purchase Order (two stock items each), the drafts made from them, and real submits. 30 of 31 checks passed; the one failure was the cleanup, described below. This closes the "not verified live" items in 6l, 6m and 6n except those listed at the end.
+
+Confirmed: lowering a mapped row's quantity before the draft is created gives correct amounts, stock quantity and totals (a 2 of 5 delivery note at 120 shows amount 240, stock_qty 2, total 240), and the row keeps its link to the order row. A quantity above the order's and an item not on the order are refused with nothing created. The invoice mapper output saves without any extra field (due date and the debit/credit account are filled by ERPNext). The invoice link fields are `sales_order` and `purchase_order` with `so_detail` on the Sales Invoice rows, and `per_billed` exists on both orders. The existing-invoices lookup works for both invoice child doctypes. Submit: a Stock User and an Accounts User are refused, a Stock Manager submitted a Purchase Receipt (stock rose by 2) and a Delivery Note, an Accounts Manager submitted a Sales Invoice and a Purchase Invoice, and cancel is refused from chat even for a manager.
+
+Cleanup finding, and a lesson for any future live run that submits stock or accounting documents: a submitted document that is then cancelled cannot be deleted, because ERPNext keeps its reversing General Ledger and Payment Ledger entries (LinkExistsError). The sweep cancelled all six, which restored the stock figures, but these six documents remain in the instance in the Cancelled state: Delivery Note MAT-DN-2026-00003, Purchase Receipt MAT-PRE-2026-00002, Sales Invoice ACC-SINV-2026-00006, Purchase Invoice ACC-PINV-2026-00007, Sales Order SAL-ORD-2026-00096 and Purchase Order PUR-ORD-2026-00030. They are harmless test data and can be left; removing them means deleting ledger rows, which should be a deliberate decision. All draft records were deleted.
+
+Still not verified live: an order that has been partly delivered, received or billed (this instance has none, and making one means more submitted documents that cannot be removed), conversion by a restricted user, and items that need batch or serial numbers.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.
