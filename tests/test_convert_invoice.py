@@ -64,7 +64,7 @@ class TestInvoiceConversions:
         assert wr.get_partial_rows(target)["slot"] == "items"
 
     def test_the_invoice_can_only_be_made_this_way_and_never_submitted_from_chat(self, target, source, name, method, child, link_field, detail_field, allowed, denied):
-        for op, fields in (("create", {"customer": "A"}), ("update", {"posting_date": "2026-11-21"}), ("submit", None), ("cancel", None), ("delete", None)):
+        for op, fields in (("create", {"customer": "A"}), ("update", {"posting_date": "2026-11-21"}), ("cancel", None), ("delete", None)):
             assert not wr.check_write(op, target, fields, ctx=user("System Manager", "Accounts Manager")), op
 
     def test_it_is_a_draft_made_by_the_registered_mapper_with_the_link_kept(self, target, source, name, method, child, link_field, detail_field, allowed, denied):
@@ -111,3 +111,15 @@ class TestInvoiceConversions:
 
     def test_the_child_and_parent_doctypes_may_be_read_for_the_existing_documents_note(self, target, source, name, method, child, link_field, detail_field, allowed, denied):
         assert crud.is_doctype_allowed(child) and crud.is_doctype_allowed(target)
+
+
+@pytest.mark.parametrize("doctype,others", [
+    ("Sales Invoice", ("Accounts User", "Sales User", "Sales Manager", "Stock Manager")),
+    ("Purchase Invoice", ("Accounts User", "Purchase User", "Purchase Manager", "Stock Manager")),
+])
+def test_only_the_accounts_manager_may_submit_and_nobody_may_cancel_from_chat(doctype, others):
+    assert wr.check_write("submit", doctype, None, ctx=user("Accounts Manager"))
+    assert wr.check_write("submit", doctype, None, ctx=user("System Manager"))
+    for role in others:
+        assert not wr.check_write("submit", doctype, None, ctx=user(role)), role
+    assert not wr.check_write("cancel", doctype, None, ctx=user("Accounts Manager", "System Manager"))

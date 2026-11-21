@@ -305,6 +305,7 @@ class TestSkillLoading:
             "convert-quotation-to-sales-order",
             "convert-sales-order-to-delivery-note", "convert-purchase-order-to-purchase-receipt",
             "convert-sales-order-to-sales-invoice", "convert-purchase-order-to-purchase-invoice",
+            "submit-delivery-note", "submit-purchase-receipt", "submit-sales-invoice", "submit-purchase-invoice",
         }
 
 

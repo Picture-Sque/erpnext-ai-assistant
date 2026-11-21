@@ -437,6 +437,16 @@ Tests: `tests/test_convert_invoice.py` (registry, tool layer, partial rows, empt
 
 NOT verified live, and the most likely place for a surprise: the mapped invoice may be refused when saved for a field the mapper leaves empty (for example due date, or the debit/credit account), the way a Sales Order from a Quotation was refused for its delivery date; the link field names on the invoice rows (`sales_order`, `purchase_order`) and `per_billed` are from memory of ERPNext, not read from the instance; and an invoice from an order that has already been delivered or received. No end-to-end chat test was written for these two; the flow is the same registry-driven path as the delivery note and receipt.
 
+## 6n. Submit for Delivery Note, Purchase Receipt and the two invoices (21 Nov 2026)
+
+The open question in 6k and 6m was who may submit these from chat. The project owner asked me to choose a sensible default. I chose the most conservative arrangement that is still useful, and it is a DEFAULT FOR HUMAN REVIEW, not a compliance ruling. Segregation of duties and the approval rules for stock and accounting postings are for the finance and compliance owners to confirm or change.
+
+The default: submit is registered for these four documents, limited to the manager role that owns the posting. Delivery Note and Purchase Receipt: Stock Manager. Sales Invoice and Purchase Invoice: Accounts Manager. System Manager and Administrator can also submit, as everywhere else. The User roles that create the drafts (Stock User, Sales User, Purchase User, Accounts User) cannot submit, so the person who prepares a draft is not the person who posts it, unless they hold both roles. Every submit asks for confirmation naming the exact document, refuses a stale version, and goes through the ERPNext permission check as the user. Cancel is not registered for any of the four: cancelling reverses a stock or accounts posting, and stays in ERPNext. The submit offer after a conversion now appears for the manager roles only.
+
+Not enforced: a manager who creates a draft can also submit it. A rule that the submitter must differ from the creator would need an owner check in the agent and is not built. Skills: `submit-delivery-note`, `submit-purchase-receipt`, `submit-sales-invoice`, `submit-purchase-invoice`. Changing who may submit is one line per document in `write_registry.py` plus the skill's `allowed_roles`.
+
+Not verified live: a real submit of any of the four, which posts stock or ledger entries in ERPNext (needs Stock/Accounts set up on the instance, and cancelling afterwards to restore the figures).
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

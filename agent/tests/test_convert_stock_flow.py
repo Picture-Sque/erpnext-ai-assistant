@@ -163,15 +163,19 @@ class TestNodes:
         conv.assert_called_once_with(target, source, name)
         create.assert_not_called()
 
-    def test_submitting_what_was_made_is_never_offered(self):
-        for roles in (["Stock Manager"], ["Sales Manager"], ["Purchase Manager"], ["System Manager"], ["Accounts Manager"]):
-            for doctype in ("Delivery Note", "Purchase Receipt"):
+    def test_submitting_what_was_made_is_offered_to_the_stock_manager_only(self):
+        for doctype in ("Delivery Note", "Purchase Receipt"):
+            for roles in (["Stock Manager"], ["System Manager"]):
+                state = {"user_roles": roles, "user_sub": "u", "messages": []}
+                assert graph._submit_offer(state, doctype, "MAT-1") is not None, (roles, doctype)
+            for roles in (["Stock User"], ["Sales User"], ["Sales Manager"], ["Purchase User"], ["Purchase Manager"], ["Accounts Manager"]):
                 state = {"user_roles": roles, "user_sub": "u", "messages": []}
                 assert graph._submit_offer(state, doctype, "MAT-1") is None, (roles, doctype)
 
-    def test_no_submit_skill_exists_for_these_documents(self):
-        assert not [s for s in graph.loaded_skills if s["tool"] == "submit_document" and s["doctype"] in ("Delivery Note", "Purchase Receipt")]
-        assert not [s for s in graph.loaded_skills if s["doctype"] in ("Delivery Note", "Purchase Receipt") and s["tool"] in ("create_document", "update_document", "cancel_document", "delete_document")]
+    def test_these_documents_have_a_submit_skill_and_nothing_else(self):
+        docs = ("Delivery Note", "Purchase Receipt")
+        assert {s["doctype"] for s in graph.loaded_skills if s["tool"] == "submit_document" and s["doctype"] in docs} == set(docs)
+        assert not [s for s in graph.loaded_skills if s["doctype"] in docs and s["tool"] in ("create_document", "update_document", "cancel_document", "delete_document")]
 
 
 # ---------------------------------------------------------------------------------------

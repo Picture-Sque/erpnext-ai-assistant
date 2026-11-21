@@ -189,6 +189,10 @@ WRITE_REGISTRY["Delivery Note"] = {
     # Delivery Note directly are not registered, and submitting one posts to stock, so that is a
     # separate decision. ERPNext's own mapper includes only what is still pending on the order.
     "operations": {
+        # Submit only, never cancel: submitting is limited to the manager role that owns the posting, so the people who
+        # create the draft (the User roles) cannot also post it. Cancel reverses the posting and stays in ERPNext.
+        # This is a default chosen for review, not a compliance ruling (see WRITE_ACCESS_PLAN 6n).
+        "submit": {"roles": _roles("Stock Manager")},
         "convert": {
             "roles": _roles("Stock User", "Stock Manager", "Sales User"),
             "confirm_always": True,
@@ -216,6 +220,10 @@ WRITE_REGISTRY["Delivery Note"] = {
 WRITE_REGISTRY["Purchase Receipt"] = {
     # Only created from a Purchase Order, as a Draft; see Delivery Note for the reasoning.
     "operations": {
+        # Submit only, never cancel: submitting is limited to the manager role that owns the posting, so the people who
+        # create the draft (the User roles) cannot also post it. Cancel reverses the posting and stays in ERPNext.
+        # This is a default chosen for review, not a compliance ruling (see WRITE_ACCESS_PLAN 6n).
+        "submit": {"roles": _roles("Stock Manager")},
         "convert": {
             "roles": _roles("Stock User", "Stock Manager", "Purchase User"),
             "confirm_always": True,
@@ -245,6 +253,10 @@ WRITE_REGISTRY["Sales Invoice"] = {
     # cancel are NOT registered: who may do that from chat is a segregation-of-duties decision for the
     # owners of that control (compliance review). Amounts come from the order through ERPNext's mapper.
     "operations": {
+        # Submit only, never cancel: submitting is limited to the manager role that owns the posting, so the people who
+        # create the draft (the User roles) cannot also post it. Cancel reverses the posting and stays in ERPNext.
+        # This is a default chosen for review, not a compliance ruling (see WRITE_ACCESS_PLAN 6n).
+        "submit": {"roles": _roles("Accounts Manager")},
         "convert": {
             "roles": _roles("Accounts User", "Accounts Manager", "Sales User"),
             "confirm_always": True,
@@ -271,6 +283,10 @@ WRITE_REGISTRY["Sales Invoice"] = {
 WRITE_REGISTRY["Purchase Invoice"] = {
     # Only created from a Purchase Order, as a Draft; see Sales Invoice for the reasoning.
     "operations": {
+        # Submit only, never cancel: submitting is limited to the manager role that owns the posting, so the people who
+        # create the draft (the User roles) cannot also post it. Cancel reverses the posting and stays in ERPNext.
+        # This is a default chosen for review, not a compliance ruling (see WRITE_ACCESS_PLAN 6n).
+        "submit": {"roles": _roles("Accounts Manager")},
         "convert": {
             "roles": _roles("Accounts User", "Accounts Manager", "Purchase User"),
             "confirm_always": True,

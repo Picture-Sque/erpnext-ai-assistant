@@ -69,7 +69,7 @@ class TestStockDocumentConversions:
 
     def test_the_document_can_only_be_made_this_way(self, target, source, name, method, child, link_field, detail_field, allowed, denied):
         # Creating, updating, submitting, cancelling and deleting these directly are not registered.
-        for op, fields in (("create", {"customer": "A"}), ("update", {"posting_date": "2026-11-21"}), ("submit", None), ("cancel", None), ("delete", None)):
+        for op, fields in (("create", {"customer": "A"}), ("update", {"posting_date": "2026-11-21"}), ("cancel", None), ("delete", None)):
             assert not wr.check_write(op, target, fields, ctx=user("System Manager", "Stock Manager")), op
 
     def test_it_is_a_draft_made_by_the_registered_mapper_with_the_link_kept(self, target, source, name, method, child, link_field, detail_field, allowed, denied):
@@ -115,3 +115,15 @@ class TestStockDocumentConversions:
                                post=resp(417, {"exc_type": "ValidationError", "exception": "frappe.exceptions.ValidationError: Warehouse is required"}))
         assert res["status"] == "system_error" and "Warehouse is required" in res["error"]
         assert client.post.call_count == 1
+
+
+@pytest.mark.parametrize("doctype,manager,others", [
+    ("Delivery Note", "Stock Manager", ("Stock User", "Sales User", "Sales Manager", "Accounts Manager")),
+    ("Purchase Receipt", "Stock Manager", ("Stock User", "Purchase User", "Purchase Manager", "Accounts Manager")),
+])
+def test_only_the_stock_manager_may_submit_and_nobody_may_cancel_from_chat(doctype, manager, others):
+    assert wr.check_write("submit", doctype, None, ctx=user(manager))
+    assert wr.check_write("submit", doctype, None, ctx=user("System Manager"))
+    for role in others:
+        assert not wr.check_write("submit", doctype, None, ctx=user(role)), role
+    assert not wr.check_write("cancel", doctype, None, ctx=user(manager, "System Manager"))
