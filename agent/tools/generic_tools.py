@@ -80,12 +80,14 @@ def update_document(doctype: str, name: str, fields: dict, expected_modified: Op
     )
 
 
-def convert_document(target_doctype: str, source_doctype: str, source_name: str) -> dict:
+def convert_document(target_doctype: str, source_doctype: str, source_name: str, items: Optional[list] = None) -> dict:
     """Create a Draft of `target_doctype` from a `source_doctype` document. See crud.convert_document."""
+    extra = {"items": items} if items is not None else {}
     return crud.convert_document(
         target_doctype=target_doctype,
         source_doctype=source_doctype,
         source_name=source_name,
+        **extra,
     )
 
 

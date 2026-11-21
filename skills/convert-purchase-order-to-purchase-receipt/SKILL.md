@@ -14,11 +14,15 @@ doctype: Purchase Receipt
 source_doctype: Purchase Order
 required_fields:
   - purchase_order
-optional_fields: []
+optional_fields:
+  - items
+field_hints:
+  items: "only if the user wants some of the items or fewer units: a list of the item code and the quantity wanted of each. Leave it out to convert everything that is left"
 payload_structure:
   fixed: {}
   field_mappings:
     purchase_order: purchase_order
+    items: items
   child_defaults: {}
 defaults: []
 validation_rules: []
@@ -46,6 +50,7 @@ keywords:
 response_template: "Successfully created Purchase Receipt: {name} from Purchase Order '{purchase_order}'!"
 error_template: "Failed to create a purchase receipt from the purchase order: {error}"
 examples:
+  - "Receive only 4 of ITEM-A against purchase order PUR-ORD-2026-00045"
   - "Create a purchase receipt from purchase order PUR-ORD-2026-00028"
   - "Convert purchase order PUR-ORD-2026-00027 to a purchase receipt"
   - "Make a purchase receipt for purchase order PUR-ORD-2026-00023"
@@ -64,6 +69,9 @@ Trigger this skill when the user wants to record the receipt of goods against an
 
 ## Required information
 - **purchase_order**: the ID of the Purchase Order the goods arrived against, as the user gave it (for example PUR-ORD-2026-00028). Never guess one.
+
+## Optional: only some of the items
+- **items**: when the user wants only some of the items, or fewer units than are left, collect a list of the item code and the quantity wanted of each. It can only reduce: a quantity above what is left, or an item that is not on the purchase order, is refused. Leave it out to convert everything that is left.
 
 ## What happens
 - The Purchase Order must be submitted, and must still have something left to receive.

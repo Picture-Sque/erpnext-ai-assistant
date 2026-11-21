@@ -16,6 +16,7 @@ from mcp_erpnext.write_registry import (
     check_write,
     get_child_fields,
     get_convert_spec,
+    get_partial_rows,
     get_row_edits,
     get_row_sync,
     to_number,
@@ -570,11 +571,43 @@ def _prepare_mapped_payload(target_doctype: str, mapped: dict) -> dict:
     return payload
 
 
+def _select_mapped_rows(target_doctype: str, mapped: dict, items: list) -> "tuple[Optional[list], Optional[str]]":
+    """
+    Limit the mapped draft to the rows the user named, with the quantities they asked for. This only ever
+    reduces what ERPNext mapped: every named item must match exactly one mapped row, and a quantity
+    above what ERPNext mapped (the pending quantity) is refused. Returns (rows, None) or (None, reason).
+    """
+    spec = get_partial_rows(target_doctype)
+    if spec is None:
+        return None, f"A {target_doctype} cannot be created from only some of the items."
+    table, match_on, qty_field = spec["table"], spec["match_on"], spec["qty_field"]
+    mapped_rows = [r for r in (mapped.get(table) or []) if isinstance(r, dict)]
+    chosen = []
+    for want in items:
+        code = want[match_on].strip()
+        hits = [r for r in mapped_rows if str(r.get(match_on) or "").strip() == code]
+        if not hits:
+            return None, f"{code} is not among the items left to convert."
+        if len(hits) > 1:
+            return None, f"{code} is on more than one row, so the quantity is ambiguous. Convert the whole document instead."
+        row = copy.deepcopy(hits[0])
+        pending = to_number(row.get(qty_field))
+        quantity = to_number(want.get(qty_field))
+        if quantity is None or quantity <= 0:
+            return None, f"The quantity for {code} must be above zero."
+        if pending is not None and quantity > pending:
+            return None, f"{code}: {quantity:g} requested but only {pending:g} is left to convert."
+        row[qty_field] = quantity
+        chosen.append(row)
+    return chosen, None
+
+
 def convert_document(
     target_doctype: str,
     source_doctype: str,
     source_name: str,
     client: Optional[ERPNextClient] = None,
+    items: Optional[list] = None,
 ) -> dict:
     """
     Create a Draft `target_doctype` from an existing `source_doctype` document with ERPNext's own
@@ -588,7 +621,10 @@ def convert_document(
     if not is_doctype_allowed(source_doctype):
         return _format_result("permission_denied", error=f"DocType '{source_doctype}' is not permitted by whitelist.")
 
-    denied = _guard_write("convert", target_doctype, {"source_doctype": source_doctype})
+    guard_fields: dict = {"source_doctype": source_doctype}
+    if items is not None:
+        guard_fields["items"] = items
+    denied = _guard_write("convert", target_doctype, guard_fields)
     if denied is not None:
         return denied
     spec = get_convert_spec(target_doctype, source_doctype)
@@ -617,6 +653,11 @@ def convert_document(
         rows = mapped.get("items")
         if isinstance(rows, list) and not rows:
             return _format_result("system_error", error=f"Nothing is left to convert from {source_doctype} {source_name}.")
+        if items is not None:
+            chosen, problem = _select_mapped_rows(target_doctype, mapped, items)
+            if chosen is None:
+                return _format_result("system_error", error=problem)
+            mapped = {**mapped, get_partial_rows(target_doctype)["table"]: chosen}
 
         payload = _prepare_mapped_payload(target_doctype, mapped)
         response = c.post(f"/api/resource/{target_doctype}", json=payload, timeout=60.0)

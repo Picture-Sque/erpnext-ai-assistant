@@ -14,11 +14,15 @@ doctype: Delivery Note
 source_doctype: Sales Order
 required_fields:
   - sales_order
-optional_fields: []
+optional_fields:
+  - items
+field_hints:
+  items: "only if the user wants some of the items or fewer units: a list of the item code and the quantity wanted of each. Leave it out to convert everything that is left"
 payload_structure:
   fixed: {}
   field_mappings:
     sales_order: sales_order
+    items: items
   child_defaults: {}
 defaults: []
 validation_rules: []
@@ -45,6 +49,7 @@ keywords:
 response_template: "Successfully created Delivery Note: {name} from Sales Order '{sales_order}'!"
 error_template: "Failed to create a delivery note from the sales order: {error}"
 examples:
+  - "Deliver only 3 of ITEM-A from sales order SAL-ORD-2026-00088"
   - "Create a delivery note from sales order SAL-ORD-2026-00088"
   - "Convert sales order SAL-ORD-2026-00086 to a delivery note"
   - "Make a delivery note for sales order SAL-ORD-2026-00084"
@@ -62,6 +67,9 @@ Trigger this skill when the user wants to prepare the delivery of an existing Sa
 
 ## Required information
 - **sales_order**: the ID of the Sales Order to deliver, as the user gave it (for example SAL-ORD-2026-00088). Never guess one.
+
+## Optional: only some of the items
+- **items**: when the user wants only some of the items, or fewer units than are left, collect a list of the item code and the quantity wanted of each. It can only reduce: a quantity above what is left, or an item that is not on the sales order, is refused. Leave it out to convert everything that is left.
 
 ## What happens
 - The Sales Order must be submitted, and must still have something left to deliver.

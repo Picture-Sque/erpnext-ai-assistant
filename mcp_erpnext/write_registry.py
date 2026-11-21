@@ -92,6 +92,9 @@ def _roles(*names: str) -> List[str]:
 #   identity_slot the slot that names the record an update acts on, when that is not "name"
 #   confirm_always  every use of this operation needs an explicit Yes (create, for master data)
 #   similar_by    {field, slot}: before a create, look for existing records with a similar name
+#   partial_rows  (convert only) {table, match_on, qty_field, slot}: the conversation may name some of the
+#                 rows of the mapped draft and ask for fewer units of them. It can only ever REDUCE: a row
+#                 not named is left out, a named row cannot exceed what ERPNext mapped, and no row is added
 #   sources       (convert only) {source doctype: {method, source_docstatus, linked_by}}: the document
 #                 types a new document may be made from, ERPNext's mapping method for each, the state
 #                 the source must be in, and how to find documents already made from it
@@ -133,6 +136,7 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
                 "roles": _roles("Sales User", "Sales Manager"),
                 "confirm_always": True,
                 "identity_slot": "quotation",
+                "partial_rows": {"table": "items", "match_on": "item_code", "qty_field": "qty", "slot": "items"},
                 "sources": {
                     "Quotation": {
                         "method": "erpnext.selling.doctype.quotation.quotation.make_sales_order",
@@ -189,6 +193,7 @@ WRITE_REGISTRY["Delivery Note"] = {
             "roles": _roles("Stock User", "Stock Manager", "Sales User"),
             "confirm_always": True,
             "identity_slot": "sales_order",
+            "partial_rows": {"table": "items", "match_on": "item_code", "qty_field": "qty", "slot": "items"},
             "sources": {
                 "Sales Order": {
                     "method": "erpnext.selling.doctype.sales_order.sales_order.make_delivery_note",
@@ -215,6 +220,7 @@ WRITE_REGISTRY["Purchase Receipt"] = {
             "roles": _roles("Stock User", "Stock Manager", "Purchase User"),
             "confirm_always": True,
             "identity_slot": "purchase_order",
+            "partial_rows": {"table": "items", "match_on": "item_code", "qty_field": "qty", "slot": "items"},
             "sources": {
                 "Purchase Order": {
                     "method": "erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt",
@@ -543,6 +549,43 @@ def get_convert_spec(doctype: Any, source_doctype: Any) -> Optional[Dict[str, An
     return None
 
 
+def get_partial_rows(doctype: Any) -> Optional[Dict[str, str]]:
+    """How a conversion into `doctype` may be limited to some rows, or None when it may not."""
+    op_spec = get_operation_spec(doctype, "convert")
+    raw = op_spec.get("partial_rows") if op_spec else None
+    if isinstance(raw, dict) and all(isinstance(raw.get(k), str) and raw.get(k) for k in ("table", "match_on", "qty_field", "slot")):
+        return {k: raw[k] for k in ("table", "match_on", "qty_field", "slot")}
+    return None
+
+
+def check_partial_rows(doctype: Any, rows: Any) -> WriteDecision:
+    """
+    Validate the rows a user named for a partial conversion: a list of 1 to MAX_ROW_EDITS objects, each
+    with only an item code and a quantity above zero, no item named twice. Whether the item is on the
+    source and whether the quantity is within what is pending is checked against the mapped draft.
+    """
+    spec = get_partial_rows(doctype)
+    if spec is None:
+        return _deny(f"{doctype!r} cannot be converted in part.", "This document cannot be created from only some of the items.")
+    match_on, qty_field = spec["match_on"], spec["qty_field"]
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_ROW_EDITS:
+        return _deny(f"Partial rows must be a list of 1 to {MAX_ROW_EDITS} items.", "Name the items, and how many of each, that should be included.")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) - {match_on, qty_field}:
+            return _deny(f"Each partial row may hold only {match_on} and {qty_field}.", f"Each item needs only an item code and a quantity.")
+        ident = row.get(match_on)
+        if not isinstance(ident, str) or not ident.strip():
+            return _deny(f"A partial row needs a {match_on}.", "Each item needs an item code.")
+        if ident.strip() in seen:
+            return _deny(f"{ident!r} appears twice.", f"{ident.strip()} appears more than once.")
+        seen.add(ident.strip())
+        quantity = to_number(row.get(qty_field))
+        if quantity is None or quantity <= 0:
+            return _deny(f"{qty_field} for {ident!r} must be a number above zero.", f"The quantity for {ident.strip()} must be a number above zero.")
+    return _allow()
+
+
 def get_identity_slot(doctype: Any, operation: Any) -> Optional[str]:
     """The slot that names the target record of an operation, or None when it is "name"."""
     op_spec = get_operation_spec(doctype, operation)
@@ -848,6 +891,10 @@ def check_write(
                 f"No convert source {source!r} registered for {doctype!r}.",
                 f"The assistant cannot create a {str(doctype).strip()} from {label}.",
             )
+        if isinstance(fields, dict) and fields.get("items") is not None:
+            partial = check_partial_rows(doctype, fields["items"])
+            if not partial:
+                return partial
 
     return _allow(f"{operation} on {doctype} permitted.")
 
@@ -923,6 +970,11 @@ def validate_write_skill(skill: Dict[str, Any]) -> List[str]:
         identity = get_identity_slot(doctype, operation)
         if identity and identity not in (skill.get("required_fields") or []):
             problems.append(f"skill '{name}': must require '{identity}', which names the document to convert")
+        partial = get_partial_rows(doctype)
+        allowed_optional = {partial["slot"]} if partial else set()
+        extra = sorted(set(skill.get("optional_fields") or []) - allowed_optional)
+        if extra:
+            problems.append(f"skill '{name}': optional fields {extra} are not allowed on a conversion into {doctype}")
         return problems
 
     if operation in ("create", "update"):

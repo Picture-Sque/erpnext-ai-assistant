@@ -415,6 +415,18 @@ Found by the tests and fixed: the report skill's broad "purchase receipt" keywor
 
 Not verified live: the pending-quantity behaviour for a partly delivered or received order (this instance has none, and creating one needs a submitted delivery note, which posts stock; the mapper's behaviour there is covered by tests with a stand-in only), conversion by a restricted user, and items that need batch or serial numbers.
 
+## 6l. Tier 2, third slice: partial-quantity conversion (21 Nov 2026)
+
+A user can now ask for some of the items, or fewer units, when converting: "deliver only 3 DESK from sales order X". ERPNext's mapper still builds the draft. The conversation can only reduce it. It cannot raise a quantity, add a row or change a price.
+
+The rules live in the registry, so the tool layer, policy and any other caller get the same behaviour. Each convert entry has a `partial_rows` spec (`table`, `match_on`, `qty_field`, `slot`). `check_partial_rows` accepts 1 to 50 objects holding only an item code and a quantity above zero, with no item twice, and `check_write` refuses a bad list before anything is read. In `crud.convert_document(..., items=None)` every named item must match exactly one mapped row. A quantity above the mapped (pending) quantity is refused, and so is an item ERPNext did not map. A row that is not named is dropped, and the source link on the kept rows is untouched. Nothing is posted when any of these fail.
+
+Conversation flow: the three convert skills take an optional `items` slot. The precondition step (Check 3b) tests the request against the source as it was just read, using quantity less what is already delivered or received, and answers in plain words before asking anything. The confirmation lists only the requested rows ("3x DESK (of 10.0 on the Sales Order)"), drops the source total because it no longer applies, and says only the listed items are included. After saving, the created draft's items and quantities are compared with the request. A request without `items` behaves exactly as before.
+
+Tests: `tests/test_convert_partial.py` at the registry and tool layers, plus new cases in `agent/tests/test_convert_flow.py` and `test_convert_stock_flow.py` for the flow and end to end. Two older tests that pinned "an `items` value in the conversation is ignored" now pin that a request without items converts everything. Both suites: 1081 and 823 passed, plus the 1 known failure.
+
+Not yet verified live: that ERPNext recalculates amount, stock quantity and totals when a mapped row's quantity is lowered before the draft is saved (it did for a full-row PUT, section 6e, but this is a create), and a partly delivered order. To run on throwaway records with tracked cleanup, after asking.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

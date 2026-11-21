@@ -157,7 +157,7 @@ class TestNodes:
     # ---- execution and what follows ----------------------------------------------------------------
     @pytest.mark.parametrize("skill,slot,name,target,source", [(DN_SKILL, "sales_order", SO, "Delivery Note", "Sales Order"), (PR_SKILL, "purchase_order", PO, "Purchase Receipt", "Purchase Order")])
     def test_the_tool_gets_only_the_target_the_source_and_the_order_id(self, skill, slot, name, target, source):
-        state = {"detected_intent": skill, "collected_fields": {slot: name, "items": [{"item_code": "X", "qty": 999}], "customer": "Evil", "docstatus": 1}}
+        state = {"detected_intent": skill, "collected_fields": {slot: name, "customer": "Evil", "docstatus": 1}}
         with patch.object(graph, "convert_document", return_value=ok()) as conv, patch.object(graph, "create_document") as create:
             graph.call_generic_tool_node(state)
         conv.assert_called_once_with(target, source, name)
@@ -193,6 +193,10 @@ class StockConvertERP(FakeERP):
     SPEC = {"Delivery Note": ("Sales Order", "delivered_qty", "against_sales_order"), "Purchase Receipt": ("Purchase Order", "received_qty", "purchase_order")}
 
     def get_list(self, doctype, filters=None, fields=None, limit=None, parent_doctype=None, **kw):
+        if doctype == "Item":  # item codes are exact here, so an item named in a partial conversion resolves to itself
+            code = next((f[2] for f in (filters or []) if f[0] == "item_code"), None)
+            if code in ("DESK", "CHAIR"):
+                return _res("success", [{"name": code, "item_code": code, "item_name": code, "item_group": "Products"}])
         if doctype in ("Delivery Note Item", "Purchase Receipt Item"):
             self.calls.append(("get_list", doctype, filters))
             target = parent_doctype
@@ -202,9 +206,9 @@ class StockConvertERP(FakeERP):
             return _res("success" if rows else "empty", rows)
         return super().get_list(doctype, filters, fields, limit)
 
-    def convert_document(self, target, source_doctype, source_name):
+    def convert_document(self, target, source_doctype, source_name, items=None):
         """ERPNext's mapper: only what is still pending goes on the new document."""
-        self.calls.append(("convert_document", target, source_doctype, source_name))
+        self.calls.append(("convert_document", target, source_doctype, source_name) + ((items,) if items is not None else ()))
         source, done_field, link = self.SPEC[target]
         if source != source_doctype:
             return _res("permission_denied", error="not registered")
@@ -214,6 +218,9 @@ class StockConvertERP(FakeERP):
         rows = [dict(item_code=i["item_code"], qty=i["qty"] - i.get(done_field, 0), rate=i["rate"], **{link: source_name}) for i in src["items"] if i["qty"] - i.get(done_field, 0) > 0]
         if not rows:
             return _res("system_error", error=f"Nothing is left to convert from {source} {source_name}.")
+        if items is not None:
+            wanted = {w["item_code"]: w["qty"] for w in items}
+            rows = [dict(r, qty=wanted[r["item_code"]]) for r in rows if r["item_code"] in wanted]
         self.next += 1
         doc = {"name": f"MAT-{self.next:05d}", "docstatus": 0, "status": "Draft", "items": rows, "company": "Acme Ltd"}
         self.db[target].append(doc)
@@ -330,7 +337,7 @@ def test_e2e_the_wrong_roles_cannot_make_either_document(env):
 def test_e2e_what_is_typed_does_not_change_what_is_made(env):
     msg = f"create a delivery note from sales order {SO} with 999 DESK for Evil Corp"
     env.llm.classify[msg] = {"intent": DN_SKILL, "is_compound": False}
-    env.llm.extract[msg] = {"sales_order": SO, "items": [{"item_code": "DESK", "qty": 999}], "customer": "Evil Corp"}
+    env.llm.extract[msg] = {"sales_order": SO, "customer": "Evil Corp", "grand_total": 1}
     env.text(msg, roles=STOCK)
     env.text("yes", roles=STOCK)
     (dn,) = env.erp.db["Delivery Note"]
@@ -348,3 +355,33 @@ def test_e2e_a_no_creates_nothing_and_an_edit_between_question_and_yes_is_refuse
     out = env.text("yes", roles=STOCK, conversation_id="conv-2")
     assert f"Sales Order '{SO}' was changed after you were asked to confirm" in out
     assert env.erp.converts() == []
+
+
+def test_e2e_a_partial_delivery_note_holds_only_the_named_item_and_quantity(env):
+    msg = f"create a delivery note from sales order {SO} with only 3 DESK"
+    env.llm.classify[msg] = {"intent": DN_SKILL, "is_compound": False}
+    env.llm.extract[msg] = {"sales_order": SO, "items": [{"item_code": "DESK", "qty": 3}]}
+    out = env.text(msg, roles=STOCK)
+    assert "- 3x DESK (of 10.0 on the Sales Order)" in out and "CHAIR" not in out
+    env.text("yes", roles=STOCK)
+    (dn,) = env.erp.db["Delivery Note"]
+    assert [(i["item_code"], i["qty"]) for i in dn["items"]] == [("DESK", 3)]
+
+
+def test_e2e_a_partly_delivered_order_cannot_be_asked_for_more_than_is_pending(env):
+    msg = f"create a delivery note from sales order {SO_PART} with 8 DESK"
+    env.llm.classify[msg] = {"intent": DN_SKILL, "is_compound": False}
+    env.llm.extract[msg] = {"sales_order": SO_PART, "items": [{"item_code": "DESK", "qty": 8}]}
+    out = env.text(msg, roles=STOCK)
+    assert "only 6 is left to convert" in out
+    assert env.erp.converts() == [] and env.erp.db["Delivery Note"] == []
+
+
+def test_e2e_a_partial_purchase_receipt_holds_only_the_named_quantity(env):
+    msg = f"create a purchase receipt from purchase order {PO} with 4 DESK"
+    env.llm.classify[msg] = {"intent": PR_SKILL, "is_compound": False}
+    env.llm.extract[msg] = {"purchase_order": PO, "items": [{"item_code": "DESK", "qty": 4}]}
+    env.text(msg, roles=["Purchase User"])
+    env.text("yes", roles=["Purchase User"])
+    (pr,) = env.erp.db["Purchase Receipt"]
+    assert [(i["item_code"], i["qty"]) for i in pr["items"]] == [("DESK", 4)]

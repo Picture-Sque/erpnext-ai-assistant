@@ -13,11 +13,15 @@ doctype: Sales Order
 source_doctype: Quotation
 required_fields:
   - quotation
-optional_fields: []
+optional_fields:
+  - items
+field_hints:
+  items: "only if the user wants some of the items or fewer units: a list of the item code and the quantity wanted of each. Leave it out to convert everything that is left"
 payload_structure:
   fixed: {}
   field_mappings:
     quotation: quotation
+    items: items
   child_defaults: {}
 defaults: []
 validation_rules: []
@@ -36,6 +40,7 @@ keywords:
 response_template: "Successfully created Sales Order: {name} from Quotation '{quotation}'!"
 error_template: "Failed to create a sales order from the quotation: {error}"
 examples:
+  - "Create a sales order from quotation QTN-2026-00012 with only 2 units of ITEM-A"
   - "Convert quotation SAL-QTN-2026-00007 to a sales order"
   - "Create a sales order from quotation SAL-QTN-2026-00008"
   - "Turn quotation SAL-QTN-2026-00009 into a sales order"
@@ -54,6 +59,9 @@ Trigger this skill when the user wants to turn an existing Quotation into a Sale
 
 ## Required information
 - **quotation**: the ID of the Quotation to convert, as the user gave it (for example SAL-QTN-2026-00007). Never guess one.
+
+## Optional: only some of the items
+- **items**: when the user wants only some of the items, or fewer units than are left, collect a list of the item code and the quantity wanted of each. It can only reduce: a quantity above what is left, or an item that is not on the quotation, is refused. Leave it out to convert everything that is left.
 
 ## What happens
 - The quotation must be submitted. A draft or cancelled quotation cannot be converted.

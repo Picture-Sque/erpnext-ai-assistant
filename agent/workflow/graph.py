@@ -67,6 +67,7 @@ except ImportError:
 
 from mcp_erpnext.crud import is_conflict_error
 from mcp_erpnext.write_registry import (
+    check_partial_rows,
     check_row_edits,
     get_bulk_max_records,
     get_confirm_fields,
@@ -77,6 +78,7 @@ from mcp_erpnext.write_registry import (
     get_duplicate_slot,
     get_identity_slot,
     get_operation_roles,
+    get_partial_rows,
     get_row_edits,
     get_row_sync,
     get_similar_by,
@@ -367,6 +369,34 @@ def _check_write_slots(skill: Dict[str, Any], collected: dict) -> Tuple[dict, Li
         else:
             out.pop(key)
             problems.append(decision.public_message or key.replace("_", " "))
+
+    if operation == "convert":
+        partial = get_partial_rows(doctype)
+        if partial:
+            slot = partial["slot"]
+            if not _has_value(out.get(slot)):
+                out.pop(slot, None)
+            else:
+                rows = out[slot]
+                if isinstance(rows, dict):
+                    rows = [rows]
+                tidy = []
+                for entry in rows if isinstance(rows, list) else []:
+                    if isinstance(entry, dict):
+                        row = {k: v for k, v in entry.items() if k in (partial["match_on"], partial["qty_field"]) and _has_value(v)}
+                        if isinstance(row.get(partial["match_on"]), str):
+                            row[partial["match_on"]] = row[partial["match_on"]].strip()
+                        if to_number(row.get(partial["qty_field"])) is not None:
+                            row[partial["qty_field"]] = to_number(row[partial["qty_field"]])
+                        tidy.append(row)
+                    else:
+                        tidy.append(entry)
+                decision = check_partial_rows(doctype, tidy)
+                if decision:
+                    out[slot] = tidy
+                else:
+                    out.pop(slot)
+                    problems.append(decision.public_message or "which items, and how many of each")
 
     any_of = skill.get("require_any_of") or []
     if any_of and not any(_has_value(out.get(f)) for f in any_of):
@@ -2122,6 +2152,22 @@ def precondition_validation_node(state: AgentState):
         logger.info("[Step 5.5] Check 3 PASS: all required fields present.")
 
     # -------------------------------------------------------------------------
+    # Check 3b: a partial conversion may only ask for what is still there to convert
+    # -------------------------------------------------------------------------
+    if operation == "convert" and get_partial_rows(doctype):
+        requested_rows = collected.get(get_partial_rows(doctype)["slot"])
+        if requested_rows:
+            problem = _partial_rows_problem(skill, requested_rows, fresh_snapshot)
+            if problem:
+                logger.warning(f"[Step 5.5] Check 3b FAIL: {problem}")
+                return {
+                    "preconditions_validated": False,
+                    "last_read_snapshot": fresh_snapshot,
+                    "failure_classification": "validation_error",
+                    "final_response": problem,
+                }
+
+    # -------------------------------------------------------------------------
     # Check 4: Concurrency / staleness (update operations with a prior snapshot)
     # -------------------------------------------------------------------------
     if operation == "update" and fresh_snapshot is not None and last_read_snapshot is not None and not is_bulk:
@@ -2448,7 +2494,7 @@ def confirmation_node(state: AgentState):
             snapshot = state.get("last_read_snapshot")
             if not (isinstance(snapshot, dict) and str(snapshot.get("name")) == str(record_id)):
                 snapshot = None
-            scope_desc = _describe_convert_scope(skill, record_id, snapshot)
+            scope_desc = _describe_convert_scope(skill, record_id, snapshot, collected.get((get_partial_rows(doctype) or {}).get('slot', '')))
         else:
             target_info = next(
                 (v for v in resolved_entities.values() if isinstance(v, dict) and v.get("name") == record_id),
@@ -2619,7 +2665,45 @@ def _existing_conversions(skill: Dict[str, Any], source_name: str) -> List[str]:
     return names
 
 
-def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: Optional[dict]) -> str:
+def _pending_quantity(row: dict, spec: dict) -> Optional[float]:
+    """Quantity of a source row still to convert: ordered less what is already delivered/received."""
+    qty = to_number(row.get("qty"))
+    if qty is None:
+        return None
+    done_field = spec.get("done_qty_field")
+    done = to_number(row.get(done_field)) if done_field else None
+    return qty - (done or 0)
+
+
+def _partial_rows_problem(skill: Dict[str, Any], requested: Any, snapshot: Optional[dict]) -> Optional[str]:
+    """
+    Check the items a user asked for against the source as it was just read: each must be on it exactly
+    once, with a quantity no larger than what is still pending. Returns a plain message or None.
+    """
+    target, source = skill.get("doctype", ""), skill.get("source_doctype", "")
+    partial = get_partial_rows(target)
+    if not partial or not requested:
+        return None
+    spec = get_convert_spec(target, source) or {}
+    doc = snapshot if isinstance(snapshot, dict) else {}
+    rows = [r for r in (doc.get(partial["table"]) or []) if isinstance(r, dict)]
+    for want in requested:
+        code = str(want.get(partial["match_on"]) or "").strip()
+        hits = [r for r in rows if str(r.get(partial["match_on"]) or "").strip() == code]
+        if not hits:
+            return f"{code} is not on {source} {doc.get('name', '')}".strip() + ". Check the item code and try again."
+        if len(hits) > 1:
+            return f"{code} is on more than one row of {source} {doc.get('name', '')}, so the quantity is ambiguous. Convert the whole document instead.".replace("  ", " ")
+        pending = _pending_quantity(hits[0], spec)
+        quantity = to_number(want.get(partial["qty_field"]))
+        if pending is not None and quantity is not None and quantity > pending + 1e-9:
+            if pending <= 0:
+                return f"{code} has nothing left to convert on {source} {doc.get('name', '')}.".replace("  ", " ")
+            return f"{code}: you asked for {quantity:g} but only {pending:g} is left to convert on {source} {doc.get('name', '')}.".replace("  ", " ")
+    return None
+
+
+def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: Optional[dict], requested: Any = None) -> str:
     """
     The question for a conversion: what will be created, from which document, what it will contain,
     and any documents already made from the same source. The contents come from the source as it was
@@ -2637,6 +2721,8 @@ def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: O
     done_field = spec.get("done_qty_field")
     rows = doc.get("items")
     partly_done = False
+    partial = get_partial_rows(target) if requested else None
+    wanted = {str(w.get(partial["match_on"])).strip(): to_number(w.get(partial["qty_field"])) for w in (requested or [])} if partial else {}
     if isinstance(rows, list) and rows:
         item_lines = []
         for row in rows:
@@ -2645,7 +2731,13 @@ def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: O
             rate = row.get("rate")
             qty = row.get("qty")
             done = to_number(row.get(done_field)) if done_field else None
-            if done and to_number(qty) is not None:
+            if partial:
+                code = str(row.get(partial["match_on"]) or "").strip()
+                if code not in wanted:
+                    continue
+                partly_done = True  # not the whole document, so the source total does not apply
+                shown = f"{wanted[code]:g}x {row.get('item_code', 'Unknown')} (of {qty} on the {source})"
+            elif done and to_number(qty) is not None:
                 # Part of this row is already done (delivered, received): the new document carries only
                 # what is still pending, so say that, and leave out a row with nothing pending.
                 pending = to_number(qty) - done
@@ -2661,6 +2753,9 @@ def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: O
             lines.append("Items:")
             lines.extend(item_lines)
     total = doc.get("grand_total") if doc.get("grand_total") is not None else doc.get("total")
+    if partial:
+        lines.append("")
+        lines.append(f"Only the items listed are included. The rest of the {source} is left out.")
     if total and not partly_done:  # the source total covers the whole order, not just what is pending
         lines.append("")
         lines.append(f"Total: {total}")
@@ -3052,8 +3147,12 @@ def call_generic_tool_node(state: AgentState):
                 tool_res = submit_document(doctype_name, record_id, **concurrency)
             elif tool == "convert_document":
                 # ERPNext builds the draft from the source document, as the user. Nothing in it comes
-                # from the conversation except which document to start from.
-                tool_res = convert_document(doctype_name, (skill or {}).get("source_doctype", ""), record_id)
+                # from the conversation except which document to start from and, for a partial conversion,
+                # which rows to keep and how many units of each (it can only reduce, never add).
+                partial_spec = get_partial_rows(doctype_name)
+                picked = collected.get(partial_spec["slot"]) if partial_spec else None
+                extra_args = {"items": picked} if picked else {}
+                tool_res = convert_document(doctype_name, (skill or {}).get("source_doctype", ""), record_id, **extra_args)
             else:
                 tool_res = {"success": False, "error": f"Unknown tool: {tool}"}
         except Exception as e:
@@ -3179,7 +3278,19 @@ def result_validation_node(state: AgentState):
             if isinstance(data, dict) and data.get("name"):
                 is_ambiguous = False
                 write_verified = True
-                
+                # A partial conversion: the saved draft must hold exactly the requested items and quantities.
+                partial_spec = get_partial_rows(doctype) if operation == "convert" else None
+                asked = collected.get(partial_spec["slot"]) if partial_spec else None
+                if asked:
+                    got = {str(r.get(partial_spec["match_on"])).strip(): to_number(r.get(partial_spec["qty_field"]))
+                           for r in (data.get(partial_spec["table"]) or []) if isinstance(r, dict)}
+                    wanted_map = {str(w[partial_spec["match_on"]]).strip(): to_number(w[partial_spec["qty_field"]]) for w in asked}
+                    if set(got) != set(wanted_map) or any(got[k] is None or wanted_map[k] is None or abs(got[k] - wanted_map[k]) > 1e-6 for k in wanted_map if k in got):
+                        write_verified = False
+                        failure_classification = "conflict_stale_data"
+                        failure_msg = (f"The {doctype} {data.get('name')} was created, but its items do not match the request "
+                                       f"(asked for {wanted_map}, saved {got}). Please check the draft before using it.")
+
         if is_ambiguous and record_id:
             logger.info(f"[Step 8] Re-reading {doctype} '{record_id}' for write verification.")
             with write_verification_scope():

@@ -58,7 +58,7 @@ class TestNodes:
     def test_the_skill_asks_for_a_quotation_and_nothing_else(self):
         s = skill()
         assert s["tool"] == "convert_document" and s["doctype"] == "Sales Order" and s["source_doctype"] == "Quotation"
-        assert s["required_fields"] == ["quotation"] and s["optional_fields"] == []
+        assert s["required_fields"] == ["quotation"] and s["optional_fields"] == ["items"]
         assert graph._record_doctype(s) == "Quotation"
         assert graph._record_doctype(graph._get_skill_for_intent("create-sales-order")) == "Sales Order"
 
@@ -176,11 +176,18 @@ class TestNodes:
     # ---- execution --------------------------------------------------------------------------
     def test_the_tool_gets_only_the_target_the_source_type_and_the_quotation_id(self):
         state = {"detected_intent": "convert-quotation-to-sales-order",
-                 "collected_fields": {"quotation": Q, "customer": "Someone Else", "items": [{"item_code": "X", "qty": 99}], "grand_total": 1, "docstatus": 1}}
+                 "collected_fields": {"quotation": Q, "customer": "Someone Else", "grand_total": 1, "docstatus": 1}}
         with patch.object(graph, "convert_document", return_value=ok()) as conv, patch.object(graph, "create_document") as create:
             graph.call_generic_tool_node(state)
         conv.assert_called_once_with("Sales Order", "Quotation", Q)
         create.assert_not_called()
+
+    def test_a_partial_request_passes_the_items_to_the_tool(self):
+        rows = [{"item_code": "DESK", "qty": 2.0}]
+        state = {"detected_intent": "convert-quotation-to-sales-order", "collected_fields": {"quotation": Q, "items": rows}}
+        with patch.object(graph, "convert_document", return_value=ok()) as conv:
+            graph.call_generic_tool_node(state)
+        conv.assert_called_once_with("Sales Order", "Quotation", Q, items=rows)
 
     def test_a_successful_conversion_is_verified_without_a_reread_and_remembers_the_new_order(self):
         state = {"detected_intent": "convert-quotation-to-sales-order", "write_rbac_operation": "convert", "target_doctype": "Sales Order",
@@ -232,6 +239,10 @@ class ConvertERP(FakeERP):
         self.next = 200
 
     def get_list(self, doctype, filters=None, fields=None, limit=None, parent_doctype=None, **kw):
+        if doctype == "Item":  # item codes are exact here, so an item named in a partial conversion resolves to itself
+            code = next((f[2] for f in (filters or []) if f[0] == "item_code"), None)
+            if code in ("DESK", "CHAIR"):
+                return _res("success", [{"name": code, "item_code": code, "item_name": code, "item_group": "Products"}])
         if doctype == "Sales Order Item":
             self.calls.append(("get_list", doctype, filters))
             quotation = next(f[2] for f in filters if f[0] == "prevdoc_docname")
@@ -239,8 +250,8 @@ class ConvertERP(FakeERP):
             return _res("success" if rows else "empty", rows)
         return super().get_list(doctype, filters, fields, limit)
 
-    def convert_document(self, target_doctype, source_doctype, source_name):
-        self.calls.append(("convert_document", target_doctype, source_doctype, source_name))
+    def convert_document(self, target_doctype, source_doctype, source_name, items=None):
+        self.calls.append(("convert_document", target_doctype, source_doctype, source_name) + ((items,) if items is not None else ()))
         src = next((r for r in self.db[source_doctype] if r["name"] == source_name), None)
         if src is None:
             return _res("not_found", error=f"{source_doctype} {source_name} not found")
@@ -249,6 +260,9 @@ class ConvertERP(FakeERP):
         self.next += 1
         order = {"name": f"SAL-ORD-2026-{self.next:05d}", "docstatus": 0, "status": "Draft", "customer": src["party_name"], "company": "Acme Ltd",
                  "items": [dict(i, prevdoc_docname=source_name) for i in src["items"]], "modified": "2026-11-20 12:00:00.000001"}
+        if items is not None:  # what the real tool does: keep the named rows, set their quantities
+            wanted = {w["item_code"]: w["qty"] for w in items}
+            order["items"] = [dict(i, qty=wanted[i["item_code"]]) for i in order["items"] if i["item_code"] in wanted]
         self.db[target_doctype].append(order)
         return _res("success", copy.deepcopy(order))
 
@@ -365,7 +379,7 @@ def test_e2e_purchasing_stock_and_accounts_roles_cannot_convert(env):
 def test_e2e_what_the_quotation_says_is_all_that_is_used_not_what_was_typed(env):
     msg = f"convert quotation {Q} to a sales order for Evil Corp with 999 DESK at 1"
     env.llm.classify[msg] = {"intent": "convert-quotation-to-sales-order", "is_compound": False}
-    env.llm.extract[msg] = {"quotation": Q, "customer": "Evil Corp", "items": [{"item_code": "DESK", "qty": 999, "rate": 1}], "grand_total": 1}
+    env.llm.extract[msg] = {"quotation": Q, "customer": "Evil Corp", "rate": 1, "grand_total": 1}
     out = env.text(msg, roles=SALES)
     assert "For: Acme Corp" in out and "Evil Corp" not in out
     env.text("yes", roles=SALES)
@@ -403,3 +417,35 @@ def test_e2e_a_failed_conversion_is_not_retried(env, monkeypatch):
     out = env.text("yes", roles=SALES)
     assert "HTTP 502" in out and "not retried automatically" in out
     assert len(calls) == 1
+
+
+def test_e2e_a_partial_conversion_shows_only_the_named_items_and_creates_only_those(env):
+    msg = f"create a sales order from quotation {Q} with only 2 DESK"
+    env.llm.classify[msg] = {"intent": "convert-quotation-to-sales-order", "is_compound": False}
+    env.llm.extract[msg] = {"quotation": Q, "items": [{"item_code": "DESK", "qty": 2}]}
+    out = env.text(msg, roles=SALES)
+    assert "- 2x DESK (of 4.0 on the Quotation)" in out and "CHAIR" not in out and "Total:" not in out
+    assert "Only the items listed are included" in out
+    env.text("yes", roles=SALES)
+    (order,) = env.erp.orders()
+    assert [(i["item_code"], i["qty"]) for i in order["items"]] == [("DESK", 2)]
+    assert env.erp.converts() == [("convert_document", "Sales Order", "Quotation", Q, [{"item_code": "DESK", "qty": 2}])]
+
+
+def test_e2e_asking_for_more_than_the_quotation_has_is_refused_before_asking(env):
+    msg = f"create a sales order from quotation {Q} with 999 DESK"
+    env.llm.classify[msg] = {"intent": "convert-quotation-to-sales-order", "is_compound": False}
+    env.llm.extract[msg] = {"quotation": Q, "items": [{"item_code": "DESK", "qty": 999}]}
+    out = env.text(msg, roles=SALES)
+    assert "999" in out and "only 4" in out
+    assert env.erp.converts() == [] and env.erp.orders() == []
+
+
+def test_e2e_an_item_that_is_not_on_the_quotation_is_refused(env):
+    env.erp.db["Quotation"][0]["items"] = [i for i in env.erp.db["Quotation"][0]["items"] if i["item_code"] != "CHAIR"]
+    msg = f"create a sales order from quotation {Q} with 1 CHAIR"
+    env.llm.classify[msg] = {"intent": "convert-quotation-to-sales-order", "is_compound": False}
+    env.llm.extract[msg] = {"quotation": Q, "items": [{"item_code": "CHAIR", "qty": 1}]}
+    out = env.text(msg, roles=SALES)
+    assert "CHAIR is not on Quotation" in out
+    assert env.erp.converts() == []
