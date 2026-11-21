@@ -88,7 +88,7 @@ class TestRegistry:
         # Delivery Note and Purchase Receipt are convertible, but only from a Sales Order and a Purchase Order.
         assert not wr.check_write("convert", target, {"source_doctype": "Quotation"}, ctx=user("System Manager"))
 
-    @pytest.mark.parametrize("target", ["Quotation", "Purchase Order", "Customer", "Supplier", "Item", "Bin", "Sales Invoice", "Purchase Invoice", "Stock Entry"])
+    @pytest.mark.parametrize("target", ["Quotation", "Purchase Order", "Customer", "Supplier", "Item", "Bin", "Stock Entry"])
     def test_nothing_else_can_be_converted_into_yet(self, target):
         for source in ("Quotation", "Sales Order", "Purchase Order", "Delivery Note", "Purchase Receipt"):
             assert not wr.check_write("convert", target, {"source_doctype": source}, ctx=user("System Manager")), (target, source)

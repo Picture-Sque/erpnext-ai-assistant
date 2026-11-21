@@ -42,11 +42,14 @@ keywords:
   - convert purchase order into purchase receipt
   - convert purchase order into a purchase receipt
   - purchase order to purchase receipt
-  - convert purchase order
   - create purchase receipt
   - create a purchase receipt
   - make purchase receipt
   - make a purchase receipt
+  - to a purchase receipt
+  - into a purchase receipt
+  - to purchase receipt
+  - into purchase receipt
 response_template: "Successfully created Purchase Receipt: {name} from Purchase Order '{purchase_order}'!"
 error_template: "Failed to create a purchase receipt from the purchase order: {error}"
 examples:

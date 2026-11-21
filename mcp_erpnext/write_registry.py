@@ -240,6 +240,60 @@ WRITE_REGISTRY["Purchase Receipt"] = {
     },
 }
 
+WRITE_REGISTRY["Sales Invoice"] = {
+    # Only created from a Sales Order, as a Draft. Submitting an invoice posts to accounts, so submit and
+    # cancel are NOT registered: who may do that from chat is a segregation-of-duties decision for the
+    # owners of that control (compliance review). Amounts come from the order through ERPNext's mapper.
+    "operations": {
+        "convert": {
+            "roles": _roles("Accounts User", "Accounts Manager", "Sales User"),
+            "confirm_always": True,
+            "identity_slot": "sales_order",
+            "partial_rows": {"table": "items", "match_on": "item_code", "qty_field": "qty", "slot": "items"},
+            "sources": {
+                "Sales Order": {
+                    "method": "erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice",
+                    "source_docstatus": 1,
+                    "linked_by": {"child_doctype": "Sales Invoice Item", "parent_doctype": "Sales Invoice", "field": "sales_order"},
+                    "done_percent_field": "per_billed",
+                    "done_label": "billed",
+                    "note": "Nothing is posted to accounts until the Sales Invoice is submitted.",
+                    "existing_note": (
+                        "Note: Sales Invoice records already exist for this Sales Order: {names}. A draft does not reduce "
+                        "what is still to bill, so creating another would repeat it."
+                    ),
+                },
+            },
+        },
+    },
+}
+
+WRITE_REGISTRY["Purchase Invoice"] = {
+    # Only created from a Purchase Order, as a Draft; see Sales Invoice for the reasoning.
+    "operations": {
+        "convert": {
+            "roles": _roles("Accounts User", "Accounts Manager", "Purchase User"),
+            "confirm_always": True,
+            "identity_slot": "purchase_order",
+            "partial_rows": {"table": "items", "match_on": "item_code", "qty_field": "qty", "slot": "items"},
+            "sources": {
+                "Purchase Order": {
+                    "method": "erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_invoice",
+                    "source_docstatus": 1,
+                    "linked_by": {"child_doctype": "Purchase Invoice Item", "parent_doctype": "Purchase Invoice", "field": "purchase_order"},
+                    "done_percent_field": "per_billed",
+                    "done_label": "billed",
+                    "note": "Nothing is posted to accounts until the Purchase Invoice is submitted.",
+                    "existing_note": (
+                        "Note: Purchase Invoice records already exist for this Purchase Order: {names}. A draft does not reduce "
+                        "what is still to bill, so creating another would repeat it."
+                    ),
+                },
+            },
+        },
+    },
+}
+
 WRITE_REGISTRY["Quotation"] = {
     # The customer is stored in party_name (with quotation_to = "Customer"), but the skill asks
     # the user for the "customer", so the duplicate check reads that slot.

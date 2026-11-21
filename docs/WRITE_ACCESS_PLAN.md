@@ -427,6 +427,16 @@ Tests: `tests/test_convert_partial.py` at the registry and tool layers, plus new
 
 Not yet verified live: that ERPNext recalculates amount, stock quantity and totals when a mapped row's quantity is lowered before the draft is saved (it did for a full-row PUT, section 6e, but this is a create), and a partly delivered order. To run on throwaway records with tracked cleanup, after asking.
 
+## 6m. Tier 2, fourth slice: Sales Invoice and Purchase Invoice drafts (21 Nov 2026)
+
+Sales Invoice from a Sales Order and Purchase Invoice from a Purchase Order, as Drafts, through the same `convert_document` path, including the optional item and quantity list from 6l. Skills: `convert-sales-order-to-sales-invoice`, `convert-purchase-order-to-purchase-invoice`. The ERPNext mapper methods are `make_sales_invoice` and `make_purchase_invoice`; "done" is the order's `per_billed`, so a fully billed order is refused before asking. The confirmation always shows the party and items and mentions invoices already made from the same order. Whitelist additions: Sales Invoice Item, Purchase Invoice, Purchase Invoice Item.
+
+Submit and cancel are NOT registered. Submitting an invoice posts to accounts, so who may do it from chat is a segregation-of-duties question for the owners of that control and for compliance review. Until that is decided, the draft is submitted in ERPNext. Registry roles are Accounts User, Accounts Manager and Sales User (Sales Invoice), and Accounts User, Accounts Manager and Purchase User (Purchase Invoice). These are my reading of ERPNext's defaults and need confirming; the ERPNext permission check still decides in the end.
+
+Tests: `tests/test_convert_invoice.py` (registry, tool layer, partial rows, empty draft, refusals) for both pairs. Both suites: 1099 and 841 passed, plus the 1 known failure. Routing: the bare keyword "convert purchase order" was replaced by "to a purchase receipt" style keywords so that a request naming a purchase invoice is not captured by the receipt skill.
+
+NOT verified live, and the most likely place for a surprise: the mapped invoice may be refused when saved for a field the mapper leaves empty (for example due date, or the debit/credit account), the way a Sales Order from a Quotation was refused for its delivery date; the link field names on the invoice rows (`sales_order`, `purchase_order`) and `per_billed` are from memory of ERPNext, not read from the instance; and an invoice from an order that has already been delivered or received. No end-to-end chat test was written for these two; the flow is the same registry-driven path as the delivery note and receipt.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

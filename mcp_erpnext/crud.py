@@ -50,6 +50,9 @@ DEFAULT_WHITELIST = [
     "Delivery Note Item",    # delivery-status-tracking child table filter
     "Purchase Receipt",      # purchase-receipt-report
     "Purchase Receipt Item", # purchase-receipt-report child table filter
+    "Sales Invoice Item",    # convert: invoices already made from an order
+    "Purchase Invoice",      # convert: Purchase Invoice draft from a Purchase Order
+    "Purchase Invoice Item", # convert: invoices already made from an order
     "Stock Ledger Entry",    # stock-movement-analysis
 ]
 
@@ -739,6 +742,7 @@ SEARCH_FIELDS_MAP = {
     "Company": ["name", "company_name"],
     "Delivery Note": ["name"],
     "Purchase Receipt": ["name"],
+    "Purchase Invoice": ["name"],
 }
 DISPLAY_FIELDS_MAP = {
     "Customer": ["name", "customer_name", "customer_group", "territory"],
@@ -755,6 +759,7 @@ DISPLAY_FIELDS_MAP = {
     "Company": ["name", "company_name"],
     "Delivery Note": ["name", "customer", "status"],
     "Purchase Receipt": ["name", "supplier", "status"],
+    "Purchase Invoice": ["name", "supplier", "status"],
 }
 
 # Rows fetched per search so they can be ranked before the best ones are returned.
