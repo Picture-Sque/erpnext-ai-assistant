@@ -61,6 +61,8 @@ app = FastAPI(
 def on_startup():
     chat_store.init_db()
     init_audit_db()
+    from mcp_erpnext.protected import validate_configuration
+    validate_configuration()  # refuse to start if protected ERPNext scripts/settings are made reachable
     resolve_backend()
     if os.getenv("ALLOW_DEV_MOCK_AUTH", "false").lower() in ("true", "1"):
         base_url = os.getenv("ERPNEXT_BASE_URL") or os.getenv("ERPNEXT_URL") or "http://localhost:8080"

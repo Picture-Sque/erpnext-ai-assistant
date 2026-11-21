@@ -80,7 +80,7 @@ def test_readonly_transport_allows_allowlisted_post_and_denies_traversals(monkey
     # Monkeypatch the allowlist with a read endpoint
     monkeypatch.setattr(
         "mcp_erpnext.client.READ_ONLY_POST_ALLOWLIST",
-        {"/api/method/frappe.client.get_list"},
+        {"/api/method/frappe.client.get_count"},
     )
 
     with set_request_context(ctx_ro):
@@ -88,21 +88,21 @@ def test_readonly_transport_allows_allowlisted_post_and_denies_traversals(monkey
         with patch("httpx.Client") as mock_httpx:
             mock_inst = mock_httpx.return_value.__enter__.return_value
             mock_inst.post.return_value = MagicMock(status_code=200, is_success=True)
-            client.post("/api/method/frappe.client.get_list", json={"doctype": "Item"})
+            client.post("/api/method/frappe.client.get_count", json={"doctype": "Item"})
             assert mock_httpx.called
 
         # 2. Path with trailing slash normalizes and succeeds
         with patch("httpx.Client") as mock_httpx:
             mock_inst = mock_httpx.return_value.__enter__.return_value
             mock_inst.post.return_value = MagicMock(status_code=200, is_success=True)
-            client.post("/api/method/frappe.client.get_list/", json={"doctype": "Item"})
+            client.post("/api/method/frappe.client.get_count/", json={"doctype": "Item"})
             assert mock_httpx.called
 
         # 3. Traversal variants are denied before httpx call
         traversal_attempts = [
-            "/api/method/frappe.client.get_list//",
-            "/api/method/frappe.client.get_list/..",
-            "/api/method/../frappe.client.get_list",
+            "/api/method/frappe.client.get_count//",
+            "/api/method/frappe.client.get_count/..",
+            "/api/method/../frappe.client.get_count",
             "/api/method/frappe.client%2fget_list",
             "/api/method/frappe.client%2Fget_list",
             "/api/method/frappe.client%2eget_list",

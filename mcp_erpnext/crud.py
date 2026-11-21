@@ -12,6 +12,7 @@ from mcp_erpnext.aggregation import AGGREGATION_FUNCTIONS, aggregate_rows, group
 from mcp_erpnext.client import ERPNextClient
 from mcp_erpnext.defaults import get_default_company, get_default_warehouse
 from mcp_erpnext.errors import ERPNextError, extract_erpnext_error
+from mcp_erpnext.protected import is_protected_doctype
 from mcp_erpnext.write_registry import (
     check_write,
     get_child_fields,
@@ -68,6 +69,8 @@ def get_allowed_doctypes() -> List[str]:
 
 def is_doctype_allowed(doctype_name: str) -> bool:
     if not doctype_name:
+        return False
+    if is_protected_doctype(doctype_name):  # scripts, settings and logic are never reachable, whatever the whitelist says
         return False
     allowed = get_allowed_doctypes()
     allowed_lower = {dt.lower() for dt in allowed}

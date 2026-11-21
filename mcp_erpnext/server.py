@@ -720,6 +720,14 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    from mcp_erpnext.protected import ProtectedResourceError, validate_configuration
+
+    try:
+        validate_configuration()  # never start with ERPNext scripts or settings made reachable
+    except ProtectedResourceError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
     # Determine read_only flag
     if args.read_only is not None:
         read_only = args.read_only

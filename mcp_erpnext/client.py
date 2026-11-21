@@ -163,6 +163,11 @@ class ERPNextClient:
             else:
                 raise ReadOnlySessionError()
 
+        # Last line of defence, before any credentials are used or any request is made and with no way to switch it off: never touch ERPNext's
+        # scripts, settings or logic, and never call a server method the agent is not built to call.
+        from mcp_erpnext.protected import check_request
+        check_request(method_upper, path)
+
         creds = self.get_credentials()
         url = f"{creds.base_url}/{path.lstrip('/')}"
         req_headers = headers if headers is not None else creds.get_headers()
