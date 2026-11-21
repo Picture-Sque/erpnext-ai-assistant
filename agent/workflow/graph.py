@@ -2045,6 +2045,17 @@ def precondition_validation_node(state: AgentState):
                     f"{record_doctype} '{record_id}' is {status_name}. Only a submitted {record_doctype} "
                     f"can be converted into a {doctype}."
                 )
+            else:
+                # An order that is already fully delivered or received has nothing left to convert. The
+                # mapper would answer with an empty draft, so say it before asking the user anything.
+                convert_spec = get_convert_spec(doctype, record_doctype) or {}
+                done_percent = to_number(fresh_snapshot.get(convert_spec["done_percent_field"])) if convert_spec.get("done_percent_field") else None
+                if done_percent is not None and done_percent >= 100:
+                    incompatible = True
+                    reason = (
+                        f"{record_doctype} '{record_id}' is already fully {convert_spec.get('done_label') or 'done'}, "
+                        f"so there is nothing left to put on a {doctype}."
+                    )
         elif operation == "delete":
             if docstatus == _DOCSTATUS_SUBMITTED:
                 incompatible = True
@@ -2622,25 +2633,49 @@ def _describe_convert_scope(skill: Dict[str, Any], source_name: str, snapshot: O
     party = next((doc.get(k) for k in ("customer_name", "party_name", "customer", "supplier_name", "supplier") if doc.get(k)), None)
     if party:
         lines.append(f"For: {party}")
+    spec = get_convert_spec(target, source) or {}
+    done_field = spec.get("done_qty_field")
     rows = doc.get("items")
+    partly_done = False
     if isinstance(rows, list) and rows:
-        lines.append("")
-        lines.append("Items:")
+        item_lines = []
         for row in rows:
-            if isinstance(row, dict):
-                rate = row.get("rate")
-                lines.append(f"- {row.get('qty')}x {row.get('item_code', 'Unknown')}" + (f" @ {rate}" if rate is not None else ""))
+            if not isinstance(row, dict):
+                continue
+            rate = row.get("rate")
+            qty = row.get("qty")
+            done = to_number(row.get(done_field)) if done_field else None
+            if done and to_number(qty) is not None:
+                # Part of this row is already done (delivered, received): the new document carries only
+                # what is still pending, so say that, and leave out a row with nothing pending.
+                pending = to_number(qty) - done
+                if pending <= 0:
+                    continue
+                partly_done = True
+                shown = f"{float(pending)}x {row.get('item_code', 'Unknown')} (of {qty}, {float(done)} already {spec.get('done_label') or 'done'})"
+            else:
+                shown = f"{qty}x {row.get('item_code', 'Unknown')}"
+            item_lines.append(f"- {shown}" + (f" @ {rate}" if rate is not None else ""))
+        if item_lines:
+            lines.append("")
+            lines.append("Items:")
+            lines.extend(item_lines)
     total = doc.get("grand_total") if doc.get("grand_total") is not None else doc.get("total")
-    if total:
+    if total and not partly_done:  # the source total covers the whole order, not just what is pending
         lines.append("")
         lines.append(f"Total: {total}")
+    if spec.get("note"):
+        lines.append("")
+        lines.append(spec["note"])
     existing = _existing_conversions(skill, source_name)
     if existing:
         lines.append("")
-        lines.append(
-            f"Note: {target} records were already made from this {source}: {', '.join(existing[:5])}. "
-            f"Converting again creates another one."
-        )
+        names = ", ".join(existing[:5])
+        template = spec.get("existing_note")
+        if template:
+            lines.append(template.format(names=names, target=target, source=source))
+        else:
+            lines.append(f"Note: {target} records were already made from this {source}: {names}. Converting again creates another one.")
     return "\n".join(lines)
 
 

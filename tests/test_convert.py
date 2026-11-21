@@ -83,9 +83,15 @@ class TestRegistry:
         assert not wr.check_write("convert", "Sales Order", {}, ctx=user())
         assert not wr.check_write("convert", "Sales Order", "Quotation", ctx=user())
 
-    @pytest.mark.parametrize("target", ["Quotation", "Purchase Order", "Customer", "Supplier", "Item", "Bin", "Delivery Note"])
-    def test_no_other_document_can_be_converted_into_yet(self, target):
+    @pytest.mark.parametrize("target", ["Quotation", "Purchase Order", "Customer", "Supplier", "Item", "Bin", "Delivery Note", "Purchase Receipt"])
+    def test_a_quotation_can_only_become_a_sales_order(self, target):
+        # Delivery Note and Purchase Receipt are convertible, but only from a Sales Order and a Purchase Order.
         assert not wr.check_write("convert", target, {"source_doctype": "Quotation"}, ctx=user("System Manager"))
+
+    @pytest.mark.parametrize("target", ["Quotation", "Purchase Order", "Customer", "Supplier", "Item", "Bin", "Sales Invoice", "Purchase Invoice", "Stock Entry"])
+    def test_nothing_else_can_be_converted_into_yet(self, target):
+        for source in ("Quotation", "Sales Order", "Purchase Order", "Delivery Note", "Purchase Receipt"):
+            assert not wr.check_write("convert", target, {"source_doctype": source}, ctx=user("System Manager")), (target, source)
 
     def test_a_read_only_session_cannot_convert(self):
         d = wr.check_write("convert", "Sales Order", {"source_doctype": "Quotation"}, ctx=user("System Manager", read_only=True))

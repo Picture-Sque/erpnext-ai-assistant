@@ -386,6 +386,35 @@ Bugs found by the tests and fixed in this slice: filling the order dates changed
 
 Not covered here, in the order I would do them: converting only part of a quotation (all pending quantities are converted); Sales Order to Delivery Note and Purchase Order to Purchase Receipt (draft creation first, with submit as a separate, manager-only step because it posts to stock); then the two invoices, whose submit posts to accounts and needs a decision on who may submit what (segregation of duties, for the people who own those rules to review). Conversion by a restricted user was not exercised live; the permission check and the registry gate are covered by tests, and ERPNext enforces its own rules on the save.
 
+## 6k. Tier 2, second slice: Delivery Note and Purchase Receipt drafts (21 Nov 2026)
+
+Two more conversions on the mechanism from 6j: `convert-sales-order-to-delivery-note` and `convert-purchase-order-to-purchase-receipt`. The new document is a Draft, built by ERPNext's mapper as the signed-in user, and always asked about first. Submitting it is deliberately not offered (see below).
+
+| Conversion | Roles allowed | ERPNext mapping method |
+|---|---|---|
+| Sales Order to Delivery Note | Stock User, Stock Manager, Sales User (and admins) | `make_delivery_note` |
+| Purchase Order to Purchase Receipt | Stock User, Stock Manager, Purchase User (and admins) | `make_purchase_receipt` |
+
+The roles are the ones ERPNext itself grants to create these documents, read from the live doctype definitions (ERPNext also grants Delivery User and Delivery Manager on a Delivery Note; those are not used elsewhere in this project and were left out). Purchasing and accounts roles cannot make a delivery note, and sales and accounts roles cannot make a purchase receipt. Creating, updating, submitting, cancelling or deleting either document directly is not registered, and each can only come from its one source type (a Quotation or the other order type is refused before any call).
+
+What differs from the quotation conversion, all read from the live instance:
+
+- ERPNext maps only what is still pending. An order that is already fully delivered or received maps to a draft with no items, not to an error. The assistant checks the order's delivered or received percentage first and says so before asking ("Sales Order 'X' is already fully delivered, so there is nothing left to put on a Delivery Note."). If it ever reaches the tool anyway, nothing is saved and the user is told nothing is left.
+- For an order that is partly done, the question shows only what is pending, for example "- 6.0x DESK (of 10.0, 4.0 already delivered) @ 100.0", leaves out rows with nothing pending, and drops the order total (which covers the whole order). The pending quantity is computed from the delivered or received quantity on each row.
+- ERPNext maps again with the same pending quantities while an earlier draft exists, because a draft does not count as delivered or received (seen live). So the question lists existing documents for the order (live or draft, not cancelled) with a warning that creating another would repeat it.
+- The new document carries its own posting date, so no date is invented. Only an order needs a delivery date made up.
+- The question states that nothing is posted to stock until the document is submitted.
+
+Submitting is not offered, on purpose. Submitting a Delivery Note or Purchase Receipt posts to stock and inventory valuation and cannot be undone except by cancelling. There is no submit skill for either, so the assistant also does not offer "Submit it now?" after creating the draft (unlike a Quotation or an order). ERPNext itself lets Stock User, Sales User and the Delivery roles submit a Delivery Note and Stock User and Purchase User submit a Purchase Receipt, which is broader than this project's Sales Manager and Purchase Manager rule for submitting orders. Who should be allowed to submit these from chat is a decision for the people who own those controls (inventory and, for the invoices that follow, accounting) and I have not assessed it. The draft is submitted in ERPNext.
+
+Live check, 28 of 28 (throwaway orders created and submitted, the drafts made from them, then everything deleted or cancelled; the cleanup code was self-tested before any record was created): both conversions create a Draft for the right customer or supplier with the order's items, quantities and prices and the link back on each row; a draft posts nothing to stock (the item's bin figures were identical before and after, and identical to the earlier baseline once the throwaway orders were cancelled); a draft does not change the order's delivered or received percentage; the existing-documents lookup finds the draft with the exact filters the assistant sends; a second draft maps the same quantities; a draft order is refused and creates nothing; your existing fully delivered and fully received orders map to nothing and create nothing; the wrong source or role is refused before any call. No probe record remains.
+
+Tests: 18 at the registry and tool layers (`tests/test_convert_stock.py`, run for both pairs) and 22 on the conversation flow and end to end through `/chat` (`agent/tests/test_convert_stock_flow.py`), including a partly delivered order, a fully done order refused before asking, no submit offer for any role, a typed customer and quantity ignored, and an order changed between the question and the Yes. Both suites together: 1045 and 813 passed, plus the 1 known failure.
+
+Found by the tests and fixed: the report skill's broad "purchase receipt" keyword pulled "convert purchase order X to a purchase receipt" away from the conversion, so the conversion has verb-led keywords ("create a purchase receipt", "convert purchase order", and the delivery note equivalents; never a bare "purchase receipt for purchase order", which would catch report questions); and the "already delivered" quantity printed as `4` next to `10.0`.
+
+Not verified live: the pending-quantity behaviour for a partly delivered or received order (this instance has none, and creating one needs a submitted delivery note, which posts stock; the mapper's behaviour there is covered by tests with a stand-in only), conversion by a restricted user, and items that need batch or serial numbers.
+
 ## 7. Verification plan
 
 Unit: for every registry entry, a test per operation for allowed role, denied role, empty roles, bare-string roles, unregistered field, reserved field, child-row field, read-only session. Tests that a doctype on the read whitelist but not in the registry cannot be written. A test that an LLM-injected extra key never reaches the update payload.

@@ -303,6 +303,7 @@ class TestSkillLoading:
             "create-supplier", "update-supplier",
             "create-item", "update-item",
             "convert-quotation-to-sales-order",
+            "convert-sales-order-to-delivery-note", "convert-purchase-order-to-purchase-receipt",
         }
 
 

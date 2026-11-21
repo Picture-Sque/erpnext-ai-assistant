@@ -180,6 +180,60 @@ WRITE_REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 
 
+WRITE_REGISTRY["Delivery Note"] = {
+    # Only created from a Sales Order, as a Draft. Creating, updating, submitting and cancelling a
+    # Delivery Note directly are not registered, and submitting one posts to stock, so that is a
+    # separate decision. ERPNext's own mapper includes only what is still pending on the order.
+    "operations": {
+        "convert": {
+            "roles": _roles("Stock User", "Stock Manager", "Sales User"),
+            "confirm_always": True,
+            "identity_slot": "sales_order",
+            "sources": {
+                "Sales Order": {
+                    "method": "erpnext.selling.doctype.sales_order.sales_order.make_delivery_note",
+                    "source_docstatus": 1,
+                    "linked_by": {"child_doctype": "Delivery Note Item", "parent_doctype": "Delivery Note", "field": "against_sales_order"},
+                    "done_percent_field": "per_delivered",
+                    "done_qty_field": "delivered_qty",
+                    "done_label": "delivered",
+                    "note": "Nothing is posted to stock until the Delivery Note is submitted.",
+                    "existing_note": (
+                        "Note: Delivery Note records already exist for this Sales Order: {names}. A draft does not reduce "
+                        "what is still to deliver, so creating another would repeat it."
+                    ),
+                },
+            },
+        },
+    },
+}
+
+WRITE_REGISTRY["Purchase Receipt"] = {
+    # Only created from a Purchase Order, as a Draft; see Delivery Note for the reasoning.
+    "operations": {
+        "convert": {
+            "roles": _roles("Stock User", "Stock Manager", "Purchase User"),
+            "confirm_always": True,
+            "identity_slot": "purchase_order",
+            "sources": {
+                "Purchase Order": {
+                    "method": "erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt",
+                    "source_docstatus": 1,
+                    "linked_by": {"child_doctype": "Purchase Receipt Item", "parent_doctype": "Purchase Receipt", "field": "purchase_order"},
+                    "done_percent_field": "per_received",
+                    "done_qty_field": "received_qty",
+                    "done_label": "received",
+                    "note": "Nothing is posted to stock until the Purchase Receipt is submitted.",
+                    "existing_note": (
+                        "Note: Purchase Receipt records already exist for this Purchase Order: {names}. A draft does not reduce "
+                        "what is still to receive, so creating another would repeat it."
+                    ),
+                },
+            },
+        },
+    },
+}
+
 WRITE_REGISTRY["Quotation"] = {
     # The customer is stored in party_name (with quotation_to = "Customer"), but the skill asks
     # the user for the "customer", so the duplicate check reads that slot.
@@ -456,10 +510,24 @@ def get_convert_sources(doctype: Any) -> Dict[str, Dict[str, Any]]:
         if not (isinstance(method, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+", method)):
             continue
         linked = spec.get("linked_by")
+
+        def text(key: str) -> Optional[str]:
+            value = spec.get(key)
+            return value if isinstance(value, str) and value.strip() else None
+
         clean[source] = {
             "method": method,
             "source_docstatus": spec.get("source_docstatus") if isinstance(spec.get("source_docstatus"), int) else 1,
             "linked_by": linked if isinstance(linked, dict) and all(isinstance(linked.get(k), str) for k in ("child_doctype", "parent_doctype", "field")) else None,
+            # For a document that is done in parts (delivered, received): the percentage field that
+            # reaches 100 when nothing is left, the per-row quantity already done, and the word for it.
+            "done_percent_field": text("done_percent_field"),
+            "done_qty_field": text("done_qty_field"),
+            "done_label": text("done_label"),
+            # Wording shown in the confirmation: a standing note about the new document, and what to say
+            # about documents already made from the same source.
+            "note": text("note"),
+            "existing_note": text("existing_note"),
         }
     return clean
 
